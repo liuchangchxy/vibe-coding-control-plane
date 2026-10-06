@@ -212,6 +212,9 @@ test("rendered Reviewer prompt waits for same-run checks and enables Auto-merge 
     const prompt = await readFile(path.join(root, ".github/vccp/reviewer-task-prompt.md"), "utf8");
     assert.match(prompt, /same event-triggered run/);
     assert.match(prompt, /terminal/);
+    assert.match(prompt, /If a required check has not appeared yet, treat it as not-yet-terminal and continue waiting/);
+    assert.match(prompt, /remains absent until this run's reasonable waiting deadline or the platform execution limit[\s\S]*report `missing\/timeout`[\s\S]*exit without formal approval/);
+    assert.match(prompt, /After every wait and state re-read, verify the PR's current head SHA is still the captured SHA/);
     assert.match(prompt, /enable native Auto-merge[\s\S]*APPROVE/);
     assert.doesNotMatch(prompt, /check_run\.completed/);
     assert.match(prompt, /never direct merge/i);

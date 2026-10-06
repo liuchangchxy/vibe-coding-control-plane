@@ -18,7 +18,7 @@ EasyExam (`liuchangchxy/easy-exam`) is the production reference read for Control
 
 These artifacts support the happy path, post-cleanup smoke path, exact-SHA formal review, and same-PR repair. They do not establish that a Sidecar/Dispatcher is strictly event-driven. The Control Plane does not claim that it is.
 
-The production Reviewer transport starts on `opened`, `ready_for_review`, and `synchronize`. In each triggered run, Reviewer waits for required CI on that exact head SHA to reach terminal state. On the successful path, Reviewer enables native Auto-merge before issuing exact-SHA `APPROVE`; Reviewer never performs a direct merge. There is no `check_run.completed` Task trigger, separate polling service, Reviewer Wake, marker, or comment wake.
+The production Reviewer transport starts on `opened`, `ready_for_review`, and `synchronize`. In each triggered run, Reviewer waits for required CI on that exact head SHA to reach terminal state. The PR evidence above confirms checks on the reviewed SHA reached success; it does not record whether a particular check was absent on the first read. VCCP's consumer prompt contract treats that initial absence as not-yet-terminal, waits in the same run, and only reports `missing/timeout` at the run deadline/platform limit. On the successful path, Reviewer enables native Auto-merge before issuing exact-SHA `APPROVE`; Reviewer never performs a direct merge. There is no `check_run.completed` Task trigger, separate polling service, Reviewer Wake, marker, or comment wake.
 
 ## What is not universal
 

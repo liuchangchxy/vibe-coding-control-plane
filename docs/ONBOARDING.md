@@ -40,7 +40,7 @@ The optional `.github/PULL_REQUEST_TEMPLATE/vccp.md` is only a reporting aid. If
 
 ## 3. Create a per-repository Reviewer task
 
-In ChatGPT Work, create a GitHub webhook Task specifically for this consumer repository and attach the rendered `.github/vccp/reviewer-task-prompt.md`. This is an external step: local CLI cannot create or verify the Task or claim it exists. The Task starts on `opened`, `ready_for_review`, and `synchronize`; it waits within the same event-triggered run for exact-head required CI checks to reach terminal results. No check-completion trigger or separate polling mechanism is used.
+In ChatGPT Work, create a GitHub webhook Task specifically for this consumer repository and attach the rendered `.github/vccp/reviewer-task-prompt.md`. This is an external step: local CLI cannot create or verify the Task or claim it exists. The Task starts on `opened`, `ready_for_review`, and `synchronize`; within the same event-triggered run it treats both an unobserved check (which may not have been created yet) and a queued/in-progress/pending check as not-yet-terminal and continues waiting. It rechecks the captured head SHA after every wait, and only reports a still-absent check as `missing/timeout` at the run deadline/platform limit. A terminal unaccepted conclusion stops approval. No check-completion trigger or separate polling mechanism is used.
 
 Dispatcher registration is also a pending external step; V1 does not implement a Dispatcher. Branch protection and rulesets are read-only audited and remain an external maintainer step. V1 never replaces these objects.
 
