@@ -1,0 +1,40 @@
+name: Coordination Label Cleanup
+
+on:
+  issues:
+    types: [closed]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  cleanup:
+    name: Remove active coordination labels after Issue close
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Remove active coordination labels and preserve terminal evidence
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const cleanup = require(`${process.env.GITHUB_WORKSPACE}/.github/scripts/cleanup-coordination-labels`);
+            const { data: issue } = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const result = await cleanup(issue, async (name) => {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                name,
+              });
+            });
+            core.info(`Removed active labels: ${result.removed.join(", ") || "none"}`);
+            if (result.preservedTerminalState) {
+              core.info("Terminal coordination label preserved as evidence.");
+            }

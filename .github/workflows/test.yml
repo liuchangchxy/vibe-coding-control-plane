@@ -1,0 +1,20 @@
+name: Control Plane Self Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup-script:
+    name: Coordination Label Cleanup Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: node --test tests/cleanup-coordination-labels.test.js
