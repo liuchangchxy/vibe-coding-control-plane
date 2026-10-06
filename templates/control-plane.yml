@@ -1,4 +1,8 @@
-version: 1
+schema_version: 1
+
+vccp:
+  source: liuchangchxy/vibe-coding-control-plane
+  revision: REPLACE_WITH_FULL_VCCP_COMMIT_SHA
 
 repository:
   base_branch: REPLACE_ME
@@ -22,8 +26,8 @@ reviewer:
     - pull_request.opened
     - pull_request.ready_for_review
     - pull_request.synchronize
-    - check_run.completed
   exact_head_sha_required: true
+  required_checks_completion: same_run_wait_until_terminal
   required_checks:
     # Consumer-owned: list this repository's actual branch protection checks.
     # Each result is accepted only for the current PR head SHA.
@@ -33,6 +37,10 @@ reviewer:
 
 merge:
   native_auto_merge: true
+  enable_native_auto_merge_by: reviewer
   method: REPLACE_ME # merge, squash, or rebase according to repository policy
   direct_merge_forbidden: true
   admin_bypass_forbidden_in_normal_flow: true
+
+reporting:
+  pull_request_template: false

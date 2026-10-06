@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "VCCP Fresh Consumer Onboarding Input",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["vccp", "repository", "reviewer", "merge"],
+  "properties": {
+    "vccp": { "type": "object", "additionalProperties": false, "required": ["source", "revision"], "properties": { "source": { "const": "liuchangchxy/vibe-coding-control-plane" }, "revision": { "type": "string", "pattern": "^[0-9a-fA-F]{40}$" } } },
+    "repository": { "$ref": "control-plane.schema.json#/properties/repository" },
+    "reviewer": { "type": "object", "additionalProperties": false, "required": ["required_checks"], "properties": { "required_checks": { "$ref": "control-plane.schema.json#/properties/reviewer/properties/required_checks" } } },
+    "merge": { "type": "object", "additionalProperties": false, "required": ["method"], "properties": { "method": { "enum": ["merge", "squash", "rebase"] } } },
+    "reporting": { "type": "object", "additionalProperties": false, "required": ["pull_request_template"], "properties": { "pull_request_template": { "type": "boolean" } } }
+  }
+}

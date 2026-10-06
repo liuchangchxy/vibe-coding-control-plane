@@ -1,0 +1,30 @@
+name: VCCP Coordination Label Cleanup
+description: Remove active coordination labels after Issue close while preserving terminal labels.
+inputs:
+  github-token:
+    description: Token with permission to remove Issue labels.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Clean up active coordination labels
+      uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const cleanup = require(`${process.env.GITHUB_ACTION_PATH}/cleanup.js`);
+          const { data: issue } = await github.rest.issues.get({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+          });
+          const result = await cleanup(issue, async (name) => {
+            await github.rest.issues.removeLabel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              name,
+            });
+          });
+          core.info(`Removed active labels: ${result.removed.join(", ") || "none"}`);
+          if (result.preservedTerminalState) core.info("Terminal coordination label preserved as evidence.");

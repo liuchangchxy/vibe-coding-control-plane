@@ -1,29 +1,55 @@
 # Consumer Onboarding
 
-This guide connects one GitHub repository to the shared Control Plane contract. Every consumer owns its application CI and its own Reviewer task instance.
+This guide connects one GitHub repository to the shared Control Plane contract. Every consumer owns its application CI and its own Reviewer Task instance. Run the CLI from a local clone of VCCP and the target consumer checkout; it does not copy the VCCP source tree into the consumer.
 
 ## 1. Configure the consumer
 
-Copy `templates/control-plane.yml` into the consumer repository (for example `.github/control-plane.yml`). Replace every `REPLACE_ME`; set `required_checks` to that repository's actual branch-protection check names and accepted success conclusions. Do not copy EasyExam check names unless they independently apply to that project.
+Create a fresh onboarding JSON input containing VCCP's canonical source and full commit SHA, the consumer base branch and Implementer authors, this repo's real required checks and accepted conclusions, and the chosen merge method. Required checks are consumer-defined and cannot be empty or placeholders. See `schemas/onboarding-input.schema.json`.
 
-Protect the configured base branch. Require the configured checks and an authorized approval, enable native Auto-merge, and prevent normal Implementer identities from direct merge and admin bypass. Configure the desired native merge method.
+Example input:
 
-Create the five coordination labels with the names and meanings in the manifest. Treat `frozen-spec` as a separate classification label. An executing Issue may have only one coordination label. Do not create labels that duplicate native PR, review, check, or merge state.
+```json
+{
+  "vccp": {
+    "source": "liuchangchxy/vibe-coding-control-plane",
+    "revision": "<the full 40-character VCCP commit SHA>"
+  },
+  "repository": {
+    "base_branch": "main",
+    "implementer_authors": ["my-builder[bot]"]
+  },
+  "reviewer": {
+    "required_checks": [
+      { "name": "Unit Tests", "accepted_conclusions": ["success"] }
+    ]
+  },
+  "merge": { "method": "squash" },
+  "reporting": { "pull_request_template": false }
+}
+```
+
+First run PLAN and inspect `current`, `desired`, diffs, warnings, and external steps. PLAN does not mutate local files or GitHub. Save its JSON output. APPLY accepts that saved PLAN only and rejects it if the checkout or observed GitHub/file state changed. Run AUDIT at any time to observe compliance and drift. The consumer manifest is consumer-owned; VCCP will not replace it except an explicitly proposed revision update that patches only `vccp.revision`.
+
+APPLY creates only missing standard label identities. Existing labels are never renamed, edited, or deleted; differing colors/descriptions are audit warnings. Treat `frozen-spec` as a separate classification label. An executing Issue may have only one coordination label.
 
 ## 2. Install completion cleanup
 
-Copy `templates/coordination-label-cleanup.yml` to the consumer's `.github/workflows/` directory and `scripts/cleanup-coordination-labels.js` to `.github/scripts/`. Review the workflow permissions and keep its token scoped to reading repository contents and editing Issue labels. The workflow runs on Issue close; it removes active labels and leaves `infra-blocked` or `needs-human` in place.
+APPLY installs a thin workflow adapter referencing VCCP's central cleanup Action at the exact full source commit SHA in the manifest. The adapter needs `issues: write`; the Action removes active labels and preserves terminal labels. Its implementation remains central and is versioned with VCCP.
 
-Copy and customize `templates/pull_request_template.md` so each PR identifies its one linked Frozen Issue, reports scope, and records actual check results. The template is a reporting aid; GitHub state remains authoritative.
+The optional `.github/PULL_REQUEST_TEMPLATE/vccp.md` is only a reporting aid. If the consumer already has a default PR template, onboarding leaves it untouched and does not force a second template. The Reviewer contract itself enforces exactly one linked Frozen Issue and current PR state.
 
 ## 3. Create a per-repository Reviewer task
 
-In ChatGPT Work, create a GitHub webhook task specifically for this consumer repository. Use `templates/reviewer-task-prompt.md` as the canonical instructions and fill in the repository-specific manifest values. Do not create one central task that listens across repositories.
+In ChatGPT Work, create a GitHub webhook Task specifically for this consumer repository and attach the rendered `.github/vccp/reviewer-task-prompt.md`. This is an external step: local CLI cannot create or verify the Task or claim it exists. The Task starts on `opened`, `ready_for_review`, and `synchronize`; it waits within the same event-triggered run for exact-head required CI checks to reach terminal results. No check-completion trigger or separate polling mechanism is used.
 
-Configure native GitHub events that start a fresh run for relevant PR activity, commit updates, and required-check completion. The task should exit without a formal review when prerequisites are pending; it must not poll. Verify the chosen Work webhook integration actually delivers these events for this repository before relying on it. This repository specifies the contract, not a proof that a particular event integration or Dispatcher is reliable.
+Dispatcher registration is also a pending external step; V1 does not implement a Dispatcher. Branch protection and rulesets are read-only audited and remain an external maintainer step. V1 never replaces these objects.
 
 ## 4. Operational boundary
 
-On every run, Reviewer reloads the Issue, PR, labels, checks, reviews, and merge state from GitHub. It does not rely on previous run memory. Formal reviews must bind to the exact current head SHA. CI passing alone is not approval. Repairs update the same PR and stop after three formal `REQUEST_CHANGES` rounds; a further rejection moves the Issue to `needs-human`.
+For example, from a clean VCCP checkout, obtain its source revision with `git rev-parse HEAD` and place that exact SHA into `onboarding.json`. Then run `node scripts/onboard-consumer.mjs plan --repo OWNER/REPO --path /path/to/consumer --input onboarding.json > /tmp/vccp-plan.json`, inspect the file, and run `node scripts/onboard-consumer.mjs apply --repo OWNER/REPO --path /path/to/consumer --plan /tmp/vccp-plan.json`. `node scripts/audit-consumer.mjs --repo OWNER/REPO --path /path/to/consumer` emits a machine-readable audit report. The CLI verifies its runtime checkout matches the desired VCCP revision so generated files and central Action references cannot claim a different source revision. No command commits, pushes, creates a PR, or modifies a consumer outside the selected checkout.
+
+Machine-readable overall states and process exit codes are stable: `repository_changes_planned` (0), `repository_ready_external_pending` (0), `repository_blocked` (2), `command_failed` (3), and `stale_plan` (4). A zero from PLAN means planning completed successfully; inspect `overall_status` and `items` to see whether APPLY changes remain. `repository_ready_external_pending` means repository-side state is compliant while Reviewer Task, Dispatcher, and/or protection verification still needs an external actor. It never means operationally ready.
+
+For future new projects, `vibe-coding-starter` calls this same CLI/API after creating the repository. It must not implement a second onboarding path.
 
 `vibe-coding-control-plane` is the canonical source for these automation contracts and templates. `vibe-coding-starter` is a consumer/bootstrapper that may automate future onboarding. Existing projects such as EasyExam, DaySpark, and Zhanghui can migrate through this guide. Control Plane does not depend on the starter.

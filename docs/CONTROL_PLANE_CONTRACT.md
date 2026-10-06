@@ -1,4 +1,4 @@
-# Control Plane Contract v0
+# Control Plane Contract v0 with Consumer Onboarding v1
 
 This document defines the cross-repository automation contract. GitHub Issues, Pull Requests, labels, check runs, reviews, and merge state are the durable source of truth. Chat transcripts and a task's prior runs are never authoritative.
 
@@ -7,7 +7,7 @@ This document defines the cross-repository automation contract. GitHub Issues, P
 - **Human** freezes the Issue specification, resolves terminal stops, and owns decisions beyond the frozen scope.
 - **Dispatcher/Sidecar** claims eligible Issues and routes initial or repair work. It does not define requirements or review code.
 - **Implementer** works only within the Frozen Spec, opens a PR, reports actual checks honestly, and repairs the existing PR after a formal request. It cannot approve or merge its own work or clear terminal labels.
-- **Reviewer** evaluates only the Frozen Spec and the current PR head. It submits a native GitHub `APPROVE` or `REQUEST_CHANGES` review. It does not expand scope or merge.
+- **Reviewer** evaluates only the Frozen Spec and the current PR head. It submits a native GitHub `APPROVE` or `REQUEST_CHANGES` review and enables native Auto-merge on the successful path. It never direct-merges or expands scope.
 - **GitHub** owns PR state, checks, formal reviews, branch protection, and the merge performed by native Auto-merge.
 
 ## Issue coordination states
@@ -23,8 +23,8 @@ Initial work moves `agent-ready` → `agent-working`. A formal Reviewer rejectio
 3. Implementer opens a PR linked to exactly one Frozen Issue. The PR author must be allow-listed by that consumer's manifest.
 4. The consumer's configured required checks run against the PR head. These are consumer-defined; this contract defines no application check names or commands.
 5. A per-repository ChatGPT Work Reviewer webhook task runs for a GitHub event. On every run it reconstructs state from GitHub, identifies the one current head SHA, and makes at most one decision. A run must not rely on a prior run's memory.
-6. Reviewer returns without a formal review if any prerequisite is missing, any configured check is pending/failed, or the head changed during evaluation. A later GitHub event can start a fresh run. There is no Reviewer polling loop.
-7. If the Frozen Spec is met, Reviewer submits native `APPROVE` bound to that exact current head SHA. If it is not met, Reviewer submits native `REQUEST_CHANGES` bound to that SHA and sets the Issue state to `changes-requested`.
+6. In that same event-triggered run, Reviewer waits for all configured required checks on the exact current head SHA to reach terminal results. If a required check is missing, fails, is ambiguous, or the head changes, it exits without review. There is no separate polling service, scheduled polling, Reviewer Wake, marker, comment wake, or check-run Task trigger.
+7. If Frozen Spec criteria fail, Reviewer submits native `REQUEST_CHANGES` bound to the exact current head SHA and sets the Issue state to `changes-requested`. On the successful path, Reviewer enables native Auto-merge with the configured method, then submits `APPROVE` bound to the same exact SHA. If enabling Auto-merge fails, it does not approve.
 8. GitHub native Auto-merge merges once repository branch protection, approval, and required checks are satisfied.
 
 CI passing is necessary when configured, but never implies Reviewer approval. Old checks or reviews for a prior SHA cannot authorize the current head.
@@ -42,7 +42,7 @@ Before formal review, verify all of the following from current GitHub state:
 - Every configured required check has a successful result for that exact head SHA. The consumer defines accepted success conclusions in its manifest.
 - The formal review is submitted against the exact current head SHA.
 
-If check status is pending or unavailable, exit without review; do not wait by polling. Native event delivery must start another run when relevant state changes. Whether a consumer's Dispatcher/Sidecar is strictly event-driven must be established independently; this contract does not claim that property is proven.
+Wait within the triggering Reviewer run while exact-head checks are pending. Do not use a separate polling service or rely on a future check-completion event to wake a Task. Reviewer events are `pull_request.opened`, `pull_request.ready_for_review`, and `pull_request.synchronize`; commit updates can be opt-in through the webhook configuration. Whether a consumer's Dispatcher/Sidecar is strictly event-driven must be established independently; this contract does not claim that property is proven.
 
 ## Same-PR repair and round limit
 
@@ -52,7 +52,7 @@ After the third formal `REQUEST_CHANGES`, set `needs-human` and stop. Never auto
 
 ## Merge and prohibited mechanisms
 
-Use GitHub native `APPROVE`, `REQUEST_CHANGES`, branch protection, and Auto-merge. Normal Implementer flow forbids direct merge and admin bypass. Do not use comment text as authorization, marker comments as wake signals, a Reviewer Wake job, a polling Reviewer, a custom merge controller, paid inference/API dependencies, reverse proxies, cookies, browser-session workarounds, or `gh-aw` as a v1 dependency.
+Use GitHub native `APPROVE`, `REQUEST_CHANGES`, branch protection, and Auto-merge. Reviewer enables native Auto-merge after confirming Frozen Spec and checks, and before approving. Reviewer never direct-merges. Normal flow forbids admin bypass. Do not use comment text as authorization, marker comments as wake signals, a Reviewer Wake job, a separate polling service, a custom merge controller, paid inference/API dependencies, reverse proxies, cookies, browser-session workarounds, or `gh-aw` as a v1 dependency.
 
 ## Consumer-owned configuration
 

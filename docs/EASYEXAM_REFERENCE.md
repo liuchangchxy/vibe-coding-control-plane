@@ -18,6 +18,8 @@ EasyExam (`liuchangchxy/easy-exam`) is the production reference read for Control
 
 These artifacts support the happy path, post-cleanup smoke path, exact-SHA formal review, and same-PR repair. They do not establish that a Sidecar/Dispatcher is strictly event-driven. The Control Plane does not claim that it is.
 
+The production Reviewer transport starts on `opened`, `ready_for_review`, and `synchronize`. In each triggered run, Reviewer waits for required CI on that exact head SHA to reach terminal state. On the successful path, Reviewer enables native Auto-merge before issuing exact-SHA `APPROVE`; Reviewer never performs a direct merge. There is no `check_run.completed` Task trigger, separate polling service, Reviewer Wake, marker, or comment wake.
+
 ## What is not universal
 
 EasyExam's five required CI jobs are its own gates: Whitespace & Guard Checks; Backend & Packaging Tests; Frontend Unit & Build Tests; Browser E2E Tests; Mobile Interaction E2E. Consumers define their own required checks. No EasyExam Python, FPK, Vue, Playwright, fnOS, or job-name requirement is copied into the Control Plane contract.

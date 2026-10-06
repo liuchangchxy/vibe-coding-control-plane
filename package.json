@@ -1,0 +1,12 @@
+{
+  "name": "vibe-coding-control-plane",
+  "private": true,
+  "description": "GitHub-native AI development control plane and consumer onboarding tools",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node --test tests/cleanup-coordination-labels.test.js tests/onboarding/*.test.mjs"
+  },
+  "dependencies": {
+    "yaml": "2.8.3"
+  }
+}

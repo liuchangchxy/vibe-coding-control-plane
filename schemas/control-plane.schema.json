@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/liuchangchxy/vibe-coding-control-plane/schemas/control-plane.schema.json",
+  "title": "VCCP Consumer Desired State",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "vccp", "repository", "issue_contract", "reviewer", "merge", "reporting"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "vccp": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source", "revision"],
+      "properties": {
+        "source": { "const": "liuchangchxy/vibe-coding-control-plane" },
+        "revision": { "type": "string", "pattern": "^[0-9a-fA-F]{40}$" }
+      }
+    },
+    "repository": {
+      "type": "object", "additionalProperties": false,
+      "required": ["base_branch", "implementer_authors"],
+      "properties": {
+        "base_branch": { "type": "string", "minLength": 1, "pattern": "^(?!.*REPLACE_ME).+$" },
+        "implementer_authors": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1, "pattern": "^(?!.*REPLACE_ME).+$" } }
+      }
+    },
+    "issue_contract": {
+      "type": "object", "additionalProperties": false,
+      "required": ["frozen_spec_label", "active_coordination_labels", "terminal_coordination_labels", "max_request_changes_rounds"],
+      "properties": {
+        "frozen_spec_label": { "const": "frozen-spec" },
+        "active_coordination_labels": { "const": ["agent-ready", "agent-working", "changes-requested"] },
+        "terminal_coordination_labels": { "const": ["infra-blocked", "needs-human"] },
+        "max_request_changes_rounds": { "const": 3 }
+      }
+    },
+    "reviewer": {
+      "type": "object", "additionalProperties": false,
+      "required": ["transport", "events", "exact_head_sha_required", "required_checks_completion", "required_checks"],
+      "properties": {
+        "transport": { "const": "chatgpt-work-github-webhook-task" },
+        "events": { "const": ["pull_request.opened", "pull_request.ready_for_review", "pull_request.synchronize"] },
+        "exact_head_sha_required": { "const": true },
+        "required_checks_completion": { "const": "same_run_wait_until_terminal" },
+        "required_checks": {
+          "type": "array", "minItems": 1,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["name", "accepted_conclusions"],
+            "properties": {
+              "name": { "type": "string", "minLength": 1, "pattern": "^(?!.*REPLACE_ME).+$" },
+              "accepted_conclusions": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } }
+            }
+          }
+        }
+      }
+    },
+    "merge": {
+      "type": "object", "additionalProperties": false,
+      "required": ["native_auto_merge", "enable_native_auto_merge_by", "method", "direct_merge_forbidden", "admin_bypass_forbidden_in_normal_flow"],
+      "properties": {
+        "native_auto_merge": { "const": true },
+        "enable_native_auto_merge_by": { "const": "reviewer" },
+        "method": { "enum": ["merge", "squash", "rebase"] },
+        "direct_merge_forbidden": { "const": true },
+        "admin_bypass_forbidden_in_normal_flow": { "const": true }
+      }
+    },
+    "reporting": {
+      "type": "object", "additionalProperties": false,
+      "required": ["pull_request_template"],
+      "properties": { "pull_request_template": { "type": "boolean" } }
+    }
+  }
+}

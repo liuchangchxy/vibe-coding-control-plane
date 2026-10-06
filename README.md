@@ -20,7 +20,7 @@ Formal `REQUEST_CHANGES` reopens work on the same PR. After at most three formal
 
 ## Use this repository
 
-Start with [the consumer onboarding specification](docs/ONBOARDING.md), copy and fill in [the manifest](templates/control-plane.yml), then create a separate ChatGPT Work GitHub webhook task for that repository using [the canonical reviewer prompt](templates/reviewer-task-prompt.md). The task is per repository; it must rebuild its decision from GitHub durable state on every run.
+Start with [consumer onboarding](docs/ONBOARDING.md). The Node CLI produces a read-only JSON PLAN, applies only explicitly safe changes from a saved plan, and audits committed consumer state. It never creates ChatGPT Work Tasks or writes branch protection.
 
 `vibe-coding-control-plane` is the automation/control-plane canonical source. `vibe-coding-starter` is the consumer/bootstrapper. Future projects can be connected by the starter; existing projects such as EasyExam, DaySpark, and Zhanghui onboard through migration. This repository does not depend on the starter.
 
@@ -32,4 +32,4 @@ EasyExam is documented as reference evidence in [EASYEXAM_REFERENCE.md](docs/EAS
 - [Onboarding](docs/ONBOARDING.md)
 - [EasyExam reference evidence](docs/EASYEXAM_REFERENCE.md)
 - `templates/` — consumer manifest, Reviewer task prompt, PR template, and cleanup workflow
-- `scripts/` and `tests/` — reusable coordination-label cleanup and its focused tests
+- `scripts/`, `lib/onboarding/`, `schemas/`, and `tests/` — onboarding CLI, shared planner, schemas, and focused tests
