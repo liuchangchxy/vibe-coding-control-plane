@@ -141,20 +141,29 @@ class GitHubWorkflowAdapter:
         linked_numbers = sorted(linked_numbers) if relationship_valid else []
         linked_prs = [self.api.get(f"/repos/{repo}/pulls/{pr_number}") for pr_number in linked_numbers]
         open_linked = [p for p in linked_prs if p.get("state") == "open"]
-        pr = open_linked[0] if len(linked_numbers) == 1 and len(open_linked) == 1 else None
+        pr = linked_prs[0] if len(linked_numbers) == 1 and len(linked_prs) == 1 else None
         reviews = self.api.get(f"/repos/{repo}/pulls/{pr['number']}/reviews?per_page=100") if pr else None
+        reviews_complete = isinstance(reviews, list) and len(reviews) < 100
         head = pr.get("head", {}) if pr else {}
         current_sha = head.get("sha")
         current_review = None
-        if pr and len(linked_numbers) == 1 and len(open_linked) == 1 and pr.get("base", {}).get("ref") == self.base_branch and \
+        check_runs = ()
+        if pr and pr.get("state") == "open" and current_sha:
+            payload = self.api.get(f"/repos/{repo}/commits/{current_sha}/check-runs?per_page=100")
+            runs = payload.get("check_runs") if isinstance(payload, dict) else None
+            if not isinstance(runs, list) or payload.get("total_count", len(runs)) > len(runs):
+                raise RuntimeError("required check run response is incomplete")
+            check_runs = tuple(run for run in runs if isinstance(run, dict)
+                               and str(run.get("head_sha", "")).casefold() == current_sha.casefold())
+        if reviews_complete and pr and pr.get("state") == "open" and len(linked_numbers) == 1 and len(open_linked) == 1 and pr.get("base", {}).get("ref") == self.base_branch and \
                 pr.get("user", {}).get("login", "").casefold() in self.authors:
             current_head_reviews = [r for r in reviews or []
-                                    if r.get("commit_id", "").casefold() == (current_sha or "").casefold()]
+                                    if r.get("commit_id", "").casefold() == (current_sha or "").casefold()
+                                    and r.get("state") in {"APPROVED", "CHANGES_REQUESTED"}]
             if current_head_reviews:
-                latest = max(current_head_reviews, key=lambda r: r.get("submitted_at", ""))
-                if latest.get("state") == "CHANGES_REQUESTED":
-                    current_review = latest
-        valid_pr = bool(pr and len(linked_numbers) == 1 and len(open_linked) == 1
+                latest = max(current_head_reviews, key=lambda r: (r.get("submitted_at", ""), int(r.get("id", 0))))
+                current_review = latest
+        valid_pr = bool(pr and len(linked_numbers) == 1 and len(linked_prs) == 1
                         and pr.get("base", {}).get("ref") == self.base_branch
                         and pr.get("user", {}).get("login", "").casefold() in self.authors)
         return WorkflowSnapshot(
@@ -170,6 +179,10 @@ class GitHubWorkflowAdapter:
             formal_review_head_sha=current_review.get("commit_id") if current_review else None,
             canonical_relationship_valid=relationship_valid,
             canonical_link_count=len(linked_numbers),
+            pr_state=pr.get("state") if valid_pr else None,
+            pr_merged=bool(valid_pr and pr.get("merged") is True),
+            check_runs=check_runs if valid_pr else (),
+            active_labels=tuple(label for label in self.policy["active_coordination_labels"] if label in labels),
         )
 
     def observe(self, repo, issue_number):
@@ -212,6 +225,18 @@ class GitHubWorkflowAdapter:
         )
         return after.issue_open and not after.canceled and target_verified
 
+    def clear_active_coordination_labels(self, repo, issue_number):
+        """Remove active labels after a proven native merge; preserve terminal labels."""
+        before = self._facts(repo, issue_number)
+        active = list(before.active_labels)
+        if not active:
+            return before.coordination_state != "invalid"
+        if not self.writer.replace_labels(repo, issue_number, active, []):
+            return False
+        after = self._facts(repo, issue_number)
+        return after.coordination_state != "invalid" and \
+            after.coordination_state not in self.policy["active_coordination_labels"]
+
 
 def generic_prompt(request: LaunchRequest, workspace: str, policy: dict,
                    app_gh: str, app_git_push: str) -> str:
@@ -223,9 +248,12 @@ def generic_prompt(request: LaunchRequest, workspace: str, policy: dict,
               "is forbidden; use only the configured controlled push wrapper. Do not persist or request GitHub "
               "tokens.\n")
     if request.attempt_kind == "repair":
+        cause_guidance = ("This repair was admitted for an exact-head CI failure; inspect the configured required "
+                          "checks on the supplied head and address the explicitly attributed implementation failure. "
+                          if request.repair_cause_type == "implementation_failure" else "")
         return common + (f"Repair the existing PR #{request.pr_number} on existing branch {request.branch}. "
                          f"The exact supplied baseline is {request.expected_head_sha}; repair ordinal "
-                         f"{request.repair_ordinal} is authoritative. Do not create another PR/branch, "
+                         f"{request.repair_ordinal} is authoritative. {cause_guidance}Do not create another PR/branch, "
                          "count reviews, or calculate repair budget.\n")
     return common + (f"Implement on a non-base branch and open one PR linked to this Frozen Issue, "
                      f"using base branch {policy['repository']['base_branch']}.\n")
@@ -415,6 +443,7 @@ class RuntimeAdapters:
     core: RuntimeCore
     workflow: GitHubWorkflowAdapter
     implementer: AntiGravityImplementer
+    lifecycle: object
 
 
 def build_runtime(manifest: dict, local_config: dict, api=None, writer=None, runner=subprocess.run):
@@ -434,4 +463,6 @@ def build_runtime(manifest: dict, local_config: dict, api=None, writer=None, run
     implementer._policy = manifest
     core = RuntimeCore(local_config["database_path"], manifest, workflow, implementer,
                        recovery_timeout_seconds=local_config.get("recovery_timeout_seconds", 900))
-    return RuntimeAdapters(core, workflow, implementer)
+    from .lifecycle import LifecycleDriver
+    lifecycle = LifecycleDriver(core, manifest, local_config.get("lifecycle_timeouts", {}))
+    return RuntimeAdapters(core, workflow, implementer, lifecycle)

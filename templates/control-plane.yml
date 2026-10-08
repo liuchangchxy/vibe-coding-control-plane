@@ -34,6 +34,9 @@ reviewer:
     - name: REPLACE_ME
       accepted_conclusions:
         - success
+      # Optional, consumer-specific attribution. Unlisted failures need human triage.
+      # implementation_failure_conclusions: [failure]
+      # infrastructure_failure_conclusions: [timed_out, startup_failure]
 
 merge:
   native_auto_merge: true

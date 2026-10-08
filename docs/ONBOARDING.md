@@ -20,7 +20,12 @@ Example input:
   },
   "reviewer": {
     "required_checks": [
-      { "name": "Unit Tests", "accepted_conclusions": ["success"] }
+      {
+        "name": "Unit Tests",
+        "accepted_conclusions": ["success"],
+        "implementation_failure_conclusions": ["failure"],
+        "infrastructure_failure_conclusions": ["timed_out", "startup_failure"]
+      }
     ]
   },
   "merge": { "method": "squash" },
@@ -54,4 +59,4 @@ For future new projects, `vibe-coding-starter` calls this same CLI/API after cre
 
 `vibe-coding-control-plane` is the canonical source for these automation contracts and templates. `vibe-coding-starter` is a consumer/bootstrapper that may automate future onboarding. Existing projects such as EasyExam, DaySpark, and Zhanghui can migrate through this guide. Control Plane does not depend on the starter.
 
-Node tooling owns PLAN, APPLY, AUDIT, manifest generation/validation, and Reviewer contract installation. The future Python runtime owns claim/ownership, dispatch, repair admission, durable execution state, reconciliation, and watchdog. Both use the consumer manifest and VCCP contract; neither duplicates the other's responsibilities.
+Node tooling owns PLAN, APPLY, AUDIT, manifest generation/validation, and Reviewer contract installation. The Python runtime owns claim/ownership, dispatch, repair admission, durable execution state, reconciliation, watchdog, and one-shot exact-head CI / Review / native-merge observation. Both use the consumer manifest and VCCP contract; neither duplicates the other's responsibilities.
