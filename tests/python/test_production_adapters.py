@@ -29,9 +29,14 @@ class FakeAPI:
         self.pr = None
         self.reviews = []
         self.reads = []
+        self.discovery = {"agent-working": [], "changes-requested": []}
 
     def get(self, path):
         self.reads.append(path)
+        if "/issues?" in path:
+            if "agent-working" in path: return self.discovery["agent-working"]
+            if "changes-requested" in path: return self.discovery["changes-requested"]
+            return []
         if path.endswith("/reviews?per_page=100"): return self.reviews
         if "/pulls/" in path: return self.pr
         return self.issue
@@ -185,6 +190,42 @@ class AdapterTests(unittest.TestCase):
         call_count = len(writer.calls)
         self.assertFalse(adapter.transition_coordination_state("o/r", 1, "needs-human", "agent-ready", terminal.revision))
         self.assertEqual(len(writer.calls), call_count)
+
+        infra_api = FakeAPI()
+        infra_api.issue["labels"] = [{"name": "agent-working"}, {"name": "frozen-spec"}]
+        infra_adapter = GitHubWorkflowAdapter(infra_api, MutatingWriter(infra_api), MANIFEST)
+        self.assertTrue(infra_adapter.transition_coordination_state("o/r", 1, "agent-working", "infra-blocked", "r1"))
+        self.assertEqual(infra_adapter.observe("o/r", 1).terminal_labels, ("infra-blocked",))
+
+    def test_recovery_discovery_queries_only_active_states(self):
+        api = FakeAPI()
+        api.discovery["agent-working"] = [{"number": 8}, {"number": 9, "pull_request": {}}]
+        api.discovery["changes-requested"] = [{"number": 10}]
+        adapter = GitHubWorkflowAdapter(api, FakeWriter(), MANIFEST)
+        self.assertEqual(adapter.discover_active("o/r"), [8, 10])
+        self.assertTrue(all("agent-ready" not in path for path in api.reads))
+        self.assertEqual(len(api.reads), 2)
+
+    def test_real_core_recovery_uses_app_writer_for_infra_blocked(self):
+        with tempfile.TemporaryDirectory() as temp:
+            api = FakeAPI()
+            api.issue["labels"] = [{"name": "agent-working"}, {"name": "frozen-spec"}]
+            api.discovery["agent-working"] = [{"number": 1}]
+            commands = FakeProductionCommands(api)
+            workspace = init_git_repo(Path(temp) / "repo")
+            local = {"database_path": str(Path(temp) / "runtime.sqlite"), "workspace": str(workspace),
+                     "owner_id": "owner", "antigravity_executable": "language_server.exe",
+                     "app_gh_executable": "controlled-app-gh.exe",
+                     "app_git_push_executable": "controlled-app-git-push.exe",
+                     "github_read_token_env": "TOKEN", "recovery_timeout_seconds": 60}
+            runtime = build_runtime(MANIFEST, local, api=api, runner=commands)
+            result = runtime.core.reconcile_once("o/r", "owner")
+            self.assertEqual(result["items"][0]["status"], "orphan_without_pr")
+            self.assertEqual(runtime.workflow.observe("o/r", 1).coordination_state, "infra-blocked")
+            self.assertEqual(len(commands.app_edits), 1)
+            self.assertIn("--add-label", commands.app_edits[0])
+            self.assertIn("infra-blocked", commands.app_edits[0])
+            self.assertFalse(commands.agent_launches)
 
     def test_app_gh_writer_uses_native_issue_edit_arguments(self):
         seen = []
