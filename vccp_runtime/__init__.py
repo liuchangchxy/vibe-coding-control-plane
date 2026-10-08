@@ -10,6 +10,7 @@ from .core import (
     WorkflowSnapshot,
     compute_repair_key,
 )
+from .lifecycle import LifecycleDriver
 
 __all__ = [
     "MAX_AUTOMATED_REPAIRS",
@@ -20,4 +21,5 @@ __all__ = [
     "RuntimeCore",
     "WorkflowSnapshot",
     "compute_repair_key",
+    "LifecycleDriver",
 ]

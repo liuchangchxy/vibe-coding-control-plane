@@ -215,6 +215,15 @@ test("empty checks and placeholder identities cannot produce a ready plan", asyn
   });
 });
 
+test("optional exact CI failure attribution fields remain schema-v2 compatible", async () => {
+  const input = validInput();
+  input.reviewer.required_checks[0].implementation_failure_conclusions = ["failure"];
+  input.reviewer.required_checks[0].infrastructure_failure_conclusions = ["timed_out"];
+  assert.deepEqual(validateManifest(createManifest(input)), []);
+  input.reviewer.required_checks[0].implementation_failure_conclusions = [""];
+  assert.throws(() => createManifest(input), /implementation_failure_conclusions/);
+});
+
 test("revision changes only through an explicit proposal and lock-confirmed upgrade", async () => {
   await withRepo(async (root) => {
     const github = new FakeGitHub();

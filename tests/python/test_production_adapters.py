@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from vccp_runtime.adapters import (AntiGravityImplementer, GitHubAPI, GitHubAppWriter, GitHubWorkflowAdapter,
                                    WorkspaceWriteGuard, build_runtime, generic_prompt)
 from vccp_runtime.core import LaunchDisposition, LaunchRequest, RepairCandidate
+from vccp_runtime.lifecycle import LifecycleDriver
 
 
 SHA = "a" * 40
@@ -17,7 +18,8 @@ CONVERSATION_ID = "e13f972a-83b8-4f8a-9a6f-8c7d3b2a1f05"
 MANIFEST = {"schema_version": 2, "issue_contract": {"max_automated_repairs": 3,
     "frozen_spec_label": "frozen-spec", "active_coordination_labels": ["agent-ready", "agent-working", "changes-requested"],
     "terminal_coordination_labels": ["infra-blocked", "needs-human"]},
-    "repository": {"base_branch": "main", "implementer_authors": ["agent"]}}
+    "repository": {"base_branch": "main", "implementer_authors": ["agent"]},
+    "reviewer": {"required_checks": [{"name": "Unit Tests", "accepted_conclusions": ["success"]}]}}
 
 
 class FakeAPI:
@@ -28,6 +30,7 @@ class FakeAPI:
         self.has_next_page = False
         self.pr = None
         self.reviews = []
+        self.check_runs = []
         self.reads = []
         self.discovery = {"agent-working": [], "changes-requested": []}
 
@@ -38,6 +41,8 @@ class FakeAPI:
             if "changes-requested" in path: return self.discovery["changes-requested"]
             return []
         if path.endswith("/reviews?per_page=100"): return self.reviews
+        if "/check-runs?per_page=100" in path:
+            return {"total_count": len(self.check_runs), "check_runs": self.check_runs}
         if "/pulls/" in path: return self.pr
         return self.issue
 
@@ -131,9 +136,39 @@ class AdapterTests(unittest.TestCase):
         self.assertIsNone(GitHubWorkflowAdapter(api, FakeWriter(), MANIFEST).observe("o/r", 1).formal_review_id)
         api.reviews = [{"id": 4, "state": "CHANGES_REQUESTED", "commit_id": SHA, "submitted_at": "1"},
                        {"id": 5, "state": "APPROVED", "commit_id": SHA, "submitted_at": "2"}]
-        self.assertIsNone(GitHubWorkflowAdapter(api, FakeWriter(), MANIFEST).observe("o/r", 1).formal_review_id)
+        latest = GitHubWorkflowAdapter(api, FakeWriter(), MANIFEST).observe("o/r", 1)
+        self.assertEqual((latest.formal_review_state, latest.formal_review_id), ("APPROVED", "5"))
         api.canonical_events = []
         self.assertIsNone(GitHubWorkflowAdapter(api, FakeWriter(), MANIFEST).observe("o/r", 1).pr_number)
+
+    def test_snapshot_exposes_only_exact_head_checks_and_native_merged_fact(self):
+        api = linked_api(review=False)
+        api.check_runs = [
+            {"name": "Unit", "head_sha": "b" * 40, "status": "completed", "conclusion": "success"},
+            {"name": "Unit", "head_sha": SHA, "status": "completed", "conclusion": "failure"},
+        ]
+        adapter = GitHubWorkflowAdapter(api, FakeWriter(), MANIFEST)
+        snapshot = adapter.observe("o/r", 1)
+        self.assertEqual([run["head_sha"] for run in snapshot.check_runs], [SHA])
+        api.pr.update(state="closed", merged=True)
+        api.issue["state"] = "closed"
+        merged = adapter.observe("o/r", 1)
+        self.assertTrue(merged.pr_merged)
+        self.assertEqual(merged.pr_state, "closed")
+        self.assertFalse(merged.issue_open)
+
+    def test_merged_label_cleanup_removes_active_and_preserves_terminal_labels(self):
+        api = linked_api(review=False)
+        api.pr.update(state="closed", merged=True)
+        api.issue["state"] = "closed"
+        api.issue["labels"].append({"name": "needs-human"})
+        writer = MutatingWriter(api)
+        adapter = GitHubWorkflowAdapter(api, writer, MANIFEST)
+        self.assertTrue(adapter.clear_active_coordination_labels("o/r", 1))
+        labels = {item["name"] for item in api.issue["labels"]}
+        self.assertNotIn("changes-requested", labels)
+        self.assertIn("needs-human", labels)
+        self.assertEqual(writer.calls[0][2:], (["changes-requested"], []))
 
     def test_ambiguous_wrong_base_and_author_fail_closed(self):
         for mutate in (lambda a: a.canonical_events.append({"willCloseTarget": True,
@@ -353,6 +388,7 @@ class AdapterTests(unittest.TestCase):
                      "antigravity_executable": "language_server.exe", "app_gh_executable": "app-gh.exe",
                      "app_git_push_executable": "app-git-push.exe", "github_read_token_env": "TOKEN"}
             wired = build_runtime(MANIFEST, local, api=api, writer=MutatingWriter(api), runner=runner)
+            self.assertIsInstance(wired.lifecycle, LifecycleDriver)
             result = wired.core.dispatch_initial("o/r", 1, "owner")
             self.assertEqual(result["phase"], "LAUNCH_CONFIRMED")
             self.assertEqual(len(launches), 1)

@@ -24,7 +24,7 @@ One logical Issue/PR flow has `MAX_AUTOMATED_REPAIRS = 3`, shared by implementat
 
 Dispatcher admits a candidate only when the workflow is valid, its cause is recognized, the exact current SHA matches the cause, that logical head has not already consumed a repair, budget remains, and no terminal/cancellation blocker exists. Logical repair identity is `repair:<repo>:pr:<pr_number>:head:<failed_or_rejected_head_sha>`. Replayed observations for a head cannot create duplicate logical repairs. Repairs continue on the same linked PR and implementation branch. Stale CI failures and reviews cannot authorize work against a newer SHA. Exceeding the budget transitions to `needs-human`.
 
-Only positively attributed implementation failures within the Frozen Spec may be candidates for automatic CI repair. Confirmed infrastructure failure is `infra-blocked`; ambiguous or insufficient evidence is `needs-human`. A generic GitHub `failure` conclusion does not establish implementation causation. Detailed classification belongs to later runtime work.
+Only positively attributed implementation failures within the Frozen Spec may be candidates for automatic CI repair. Confirmed infrastructure failure is `infra-blocked`; ambiguous or insufficient evidence is `needs-human`. A generic GitHub `failure` conclusion does not establish implementation causation. Schema-v2 consumers may explicitly list `implementation_failure_conclusions` and `infrastructure_failure_conclusions` per required check; omitted or conflicting attribution fails closed.
 
 Each consumer has one authorized production Dispatcher owner. This is a deployment invariant, not a guarantee of distributed election, cross-machine locking, or consensus. Machine-local SQLite can provide only local exclusion. Ownership ambiguity fails closed.
 
@@ -64,13 +64,13 @@ The implementer must update the same PR and linked Issue; opening a replacement 
 
 New desired manifests use `schema_version: 2` and `issue_contract.max_automated_repairs: 3`. The value is the maximum number of automated repair attempts admitted by Dispatcher across implementation-attributable CI failures and Reviewer `REQUEST_CHANGES`.
 
-Node tooling owns PLAN, APPLY, AUDIT, manifest generation/validation, and Reviewer contract installation. Python generic runtime owns claim/ownership, dispatch, repair admission, durable execution state, reconciliation, and watchdog. They share the consumer manifest and this contract; Node tooling must not grow a runtime state machine, and Python runtime must not duplicate onboarding.
+Node tooling owns PLAN, APPLY, AUDIT, manifest generation/validation, and Reviewer contract installation. Python generic runtime owns claim/ownership, dispatch, repair admission, durable execution state, reconciliation, watchdog, and one-shot exact-head CI / Review / native-merge observation. They share the consumer manifest and this contract; Node tooling must not grow a runtime state machine, and Python runtime must not duplicate onboarding.
 
 Current Node tooling recognizes schema v1 as legacy and returns a structured upgrade-required result; it need not reproduce every historical v1 compliance rule or silently rewrite an existing consumer. Existing pinned-revision safeguards remain in force. Future generic runtime execution supports v2 only: schema v1 is unsupported and must not be interpreted under either repair model. No general automatic v1-to-v2 migration engine is required.
 
 ## CI repair classification
 
-Confirmed implementation failure may be eligible for automated repair. Confirmed infrastructure failure maps to `infra-blocked`. Ambiguous or insufficient evidence maps to `needs-human`. A generic failure conclusion alone is insufficient evidence of implementation causation; detailed classification is a later runtime concern.
+For each required check, the lifecycle driver uses the current PR head SHA only. A terminal conclusion listed under `accepted_conclusions` is accepted. A nonaccepted conclusion listed under `implementation_failure_conclusions` can create an exact-head CI repair candidate through `RuntimeCore.dispatch_repair()`. A conclusion listed under `infrastructure_failure_conclusions` maps to `infra-blocked`. Unlisted, conflicting, or insufficient attribution maps to `needs-human`; `failure` has no implicit implementation meaning. The two classification lists are optional for schema-v2 compatibility.
 
 ## Merge and prohibited mechanisms
 

@@ -63,6 +63,10 @@ class WorkflowSnapshot:
     formal_review_head_sha: str | None = None
     canonical_relationship_valid: bool = True
     canonical_link_count: int = 0
+    pr_state: str | None = None
+    pr_merged: bool = False
+    check_runs: tuple[dict, ...] = ()
+    active_labels: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -154,6 +158,16 @@ class _Store:
                     owner_id TEXT NOT NULL,
                     token TEXT NOT NULL,
                     expires_at REAL NOT NULL,
+                    PRIMARY KEY (repo, issue_number)
+                );
+                CREATE TABLE IF NOT EXISTS lifecycle (
+                    repo TEXT NOT NULL,
+                    issue_number INTEGER NOT NULL,
+                    phase TEXT NOT NULL,
+                    head_sha TEXT NOT NULL,
+                    deadline_at REAL NOT NULL,
+                    outcome TEXT,
+                    updated_at REAL NOT NULL,
                     PRIMARY KEY (repo, issue_number)
                 );
                 CREATE TABLE IF NOT EXISTS attempts (
@@ -549,6 +563,64 @@ class _Store:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def lifecycle_for_repo(self, repo: str):
+        with closing(self._connect()) as connection:
+            rows = connection.execute("SELECT * FROM lifecycle WHERE repo=? ORDER BY issue_number",
+                                      (_repo_key(repo),)).fetchall()
+            return [dict(row) for row in rows]
+
+    def lifecycle_state(self, repo: str, issue: int):
+        with closing(self._connect()) as connection:
+            row = connection.execute("SELECT * FROM lifecycle WHERE repo=? AND issue_number=?",
+                                     (_repo_key(repo), issue)).fetchone()
+            return dict(row) if row else None
+
+    def set_lifecycle(self, repo: str, issue: int, phase: str, head_sha: str, now: float,
+                      timeout: float, outcome: str | None = None):
+        connection = self.transaction()
+        try:
+            prior = connection.execute("SELECT phase,head_sha,deadline_at FROM lifecycle "
+                                       "WHERE repo=? AND issue_number=?",
+                                       (_repo_key(repo), issue)).fetchone()
+            if prior and prior["phase"] == phase and prior["head_sha"] == head_sha:
+                deadline = prior["deadline_at"]
+            else:
+                deadline = now + timeout
+            connection.execute("INSERT INTO lifecycle(repo,issue_number,phase,head_sha,deadline_at,outcome,updated_at) "
+                               "VALUES(?,?,?,?,?,?,?) ON CONFLICT(repo,issue_number) DO UPDATE SET "
+                               "phase=excluded.phase,head_sha=excluded.head_sha,deadline_at=excluded.deadline_at,"
+                               "outcome=excluded.outcome,updated_at=excluded.updated_at",
+                               (_repo_key(repo), issue, phase, head_sha.lower(), deadline, outcome, now))
+            connection.commit()
+            return deadline
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def complete_flow(self, repo: str, issue: int, now: float):
+        connection = self.transaction()
+        try:
+            tokens = connection.execute("SELECT DISTINCT lease_token FROM attempts WHERE repo=? AND issue_number=? "
+                                        "AND phase IN ('PR_BOUND','LAUNCH_CONFIRMED') AND lease_token!=''",
+                                        (_repo_key(repo), issue)).fetchall()
+            connection.execute("UPDATE flows SET trusted=0,initial_confirmed=0 WHERE repo=? AND issue_number=?",
+                               (_repo_key(repo), issue))
+            connection.execute("UPDATE attempts SET phase='MERGED_SUCCESS',updated_at=?,phase_entered_at=?,"
+                               "deadline_at=NULL WHERE repo=? AND issue_number=? AND phase IN "
+                               "('PR_BOUND','LAUNCH_CONFIRMED')",
+                               (now, now, _repo_key(repo), issue))
+            for token in tokens:
+                connection.execute("DELETE FROM leases WHERE repo=? AND issue_number=? AND token=?",
+                                   (_repo_key(repo), issue, token["lease_token"]))
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
 class RuntimeCore:
     def __init__(
         self,
@@ -785,6 +857,9 @@ class RuntimeCore:
                 output.append({"issue": issue, "status": "workflow_unavailable", "detail": str(error)})
                 continue
             rows = [row for row in attempts if row["issue_number"] == issue]
+            if any(row["phase"] == "MERGED_SUCCESS" for row in rows):
+                output.append({"issue": issue, "status": "merged_success"})
+                continue
             active_rows = [row for row in rows if row["phase"] in active_phases]
             latest = active_rows[-1] if active_rows else None
             local_fence_attempts = [row for row in rows
