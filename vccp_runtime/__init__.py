@@ -11,6 +11,7 @@ from .core import (
     compute_repair_key,
 )
 from .lifecycle import LifecycleDriver
+from .orchestrator import run_once
 
 __all__ = [
     "MAX_AUTOMATED_REPAIRS",
@@ -22,4 +23,5 @@ __all__ = [
     "WorkflowSnapshot",
     "compute_repair_key",
     "LifecycleDriver",
+    "run_once",
 ]
