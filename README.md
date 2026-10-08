@@ -31,6 +31,12 @@ EasyExam is documented as reference evidence in [EASYEXAM_REFERENCE.md](docs/EAS
 - [Control Plane contract](docs/CONTROL_PLANE_CONTRACT.md)
 - [Onboarding](docs/ONBOARDING.md)
 - [EasyExam reference evidence](docs/EASYEXAM_REFERENCE.md)
-- `vccp_runtime/` — fake-driven, production-independent Python execution core
+- `vccp_runtime/` — SQLite execution core plus production adapters with fake-driven tests
 - `templates/` — consumer manifest, Reviewer task prompt, PR template, and cleanup workflow
 - `scripts/`, `lib/onboarding/`, `schemas/`, and `tests/` — onboarding CLI, shared planner, schemas, and regression tests
+
+## Non-daemon runtime wiring
+
+`vccp_runtime.adapters.build_runtime(manifest, local_config)` wires a schema-v2 consumer manifest to the existing `RuntimeCore`. Keep local settings outside `.github/control-plane.yml`; provide `database_path`, `workspace`, `owner_id`, `antigravity_executable`, `write_guard_executable`, `github_read_token_env`, and `github_app_writer_executable` in machine-local configuration. The read token is resolved from the named environment variable and is never persisted by the runtime.
+
+The configured GitHub App writer accepts `replace-coordination-labels` with a JSON request on stdin. The workspace guard must support `prepare <workspace>` and `run <workspace> <antigravity-executable> launch --json`; the latter owns the child process and enforces the controlled Git/GitHub write boundary. Launch uncertainty is recorded by `RuntimeCore` using its existing tri-state. This wiring constructs adapters only; it does not start a poller or daemon.
