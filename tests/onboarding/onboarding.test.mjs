@@ -139,6 +139,36 @@ test("schema v1 parses as legacy, preserves stale-plan protection, and never rew
     assert.equal(applied.overall_status, "repository_upgrade_required");
     assert.deepEqual(applied.applied, []);
 
+    let auditOutput = "";
+    let auditErrors = "";
+    const auditCode = await runOnboardingCli(["audit", "--repo", REPO, "--path", root], {
+      stdout: { write: (text) => { auditOutput += text; } },
+      stderr: { write: (text) => { auditErrors += text; } },
+      githubFactory: () => github,
+      runtimeRevision: REV_B,
+    });
+    assert.equal(auditCode, 0);
+    assert.equal(auditErrors, "");
+    assert.equal(JSON.parse(auditOutput).overall_status, "repository_upgrade_required");
+    assert.equal((await readFile(target, "utf8")), source);
+
+    const planPath = path.join(root, "legacy-plan.json");
+    await writeFile(planPath, JSON.stringify(plan));
+    let applyOutput = "";
+    let applyErrors = "";
+    const applyCode = await runOnboardingCli(["apply", "--repo", REPO, "--path", root, "--plan", planPath], {
+      stdout: { write: (text) => { applyOutput += text; } },
+      stderr: { write: (text) => { applyErrors += text; } },
+      githubFactory: () => github,
+      runtimeRevision: REV_B,
+    });
+    assert.equal(applyCode, 0);
+    assert.equal(applyErrors, "");
+    assert.equal(JSON.parse(applyOutput).overall_status, "repository_upgrade_required");
+    assert.deepEqual(JSON.parse(applyOutput).applied, []);
+    assert.equal((await readFile(target, "utf8")), source);
+    assert.equal(github.labelCreates.length, 0);
+
     const changedSource = source.replace(REV_A, REV_B);
     await writeFile(target, changedSource);
     const stale = await applyOnboardingPlan({ plan, root, github });
