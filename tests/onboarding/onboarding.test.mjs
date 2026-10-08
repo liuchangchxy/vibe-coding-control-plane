@@ -105,7 +105,7 @@ test("EasyExam-shaped terminal-preserving issues.closed cleanup blocks plan, app
     await mkdir(workflowDir, { recursive: true });
     await mkdir(scriptDir, { recursive: true });
     const priorPlan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
-    await writeFile(path.join(workflowDir, "coordination-label-cleanup.yml"), `name: Coordination Label Cleanup\non:\n  issues:\n    types: [closed]\njobs:\n  cleanup:\n    steps:\n      - run: node .github/scripts/cleanup-coordination-labels.js\n      - run: node \"\${process.env.GITHUB_WORKSPACE}/.github/scripts/cleanup-coordination-labels.js\"\n`);
+    await writeFile(path.join(workflowDir, "coordination-label-cleanup.yml"), `name: Coordination Label Cleanup\non:\n  issues:\n    types: [closed]\njobs:\n  cleanup:\n    steps:\n      - run: node \"\${process.env.GITHUB_WORKSPACE}/.github/scripts/cleanup-coordination-labels.js\"\n`);
     await writeFile(path.join(scriptDir, "cleanup-coordination-labels.js"), `const ACTIVE_LABELS = ["agent-ready", "agent-working", "changes-requested"];\nconst TERMINAL_LABELS = ["infra-blocked", "needs-human"];\nasync function cleanup(issue, removeLabel) {\n  const labels = new Set(issue.labels.map(({ name }) => name));\n  if (TERMINAL_LABELS.some((name) => labels.has(name))) return { preservedTerminalState: true, removed: [] };\n  for (const name of ACTIVE_LABELS) if (labels.has(name)) await removeLabel(name);\n}\n`);
 
     const staleApply = await applyOnboardingPlan({ plan: priorPlan, root, github });
@@ -132,6 +132,22 @@ test("EasyExam-shaped terminal-preserving issues.closed cleanup blocks plan, app
     const audit = await auditConsumer({ repo: REPO, root, github });
     assert.equal(audit.overall_status, "repository_blocked");
     assert.ok(audit.items.some((entry) => entry.id === "capability:coordination-label-cleanup" && entry.status === "conflict"));
+  });
+});
+
+test("direct-only repository-relative cleanup reference blocks an incompatible issues.closed handler", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const workflowDir = path.join(root, ".github/workflows");
+    const scriptDir = path.join(root, ".github/scripts");
+    await mkdir(workflowDir, { recursive: true });
+    await mkdir(scriptDir, { recursive: true });
+    await writeFile(path.join(workflowDir, "coordination-label-cleanup.yml"), `name: Coordination Label Cleanup\non:\n  issues:\n    types: [closed]\njobs:\n  cleanup:\n    steps:\n      - run: node .github/scripts/cleanup-coordination-labels.js\n`);
+    await writeFile(path.join(scriptDir, "cleanup-coordination-labels.js"), `const ACTIVE_LABELS = ["agent-ready", "agent-working", "changes-requested"];\nconst TERMINAL_LABELS = ["infra-blocked", "needs-human"];\nasync function cleanup(issue, removeLabel) {\n  const labels = new Set(issue.labels.map(({ name }) => name));\n  if (TERMINAL_LABELS.some((name) => labels.has(name))) return { preservedTerminalState: true, removed: [] };\n  for (const name of ACTIVE_LABELS) if (labels.has(name)) await removeLabel(name);\n}\n`);
+
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
+    assert.equal(plan.overall_status, "repository_blocked");
+    assert.equal(plan.items.find((entry) => entry.id === "capability:coordination-label-cleanup").path, ".github/workflows/coordination-label-cleanup.yml");
   });
 });
 
