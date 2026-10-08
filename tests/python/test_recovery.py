@@ -120,14 +120,53 @@ class RecoveryTests(unittest.TestCase):
         result = core.reconcile_once("acme/alpha", "owner")
         self.assertEqual(result["items"][0]["status"], "pr_bound")
         row = core.store.attempts_for_repo("acme/alpha")[-1]
-        self.assertEqual((row["pr_number"], row["branch"], row["expected_head_sha"]), (44, BRANCH, new_head))
+        self.assertEqual((row["pr_number"], row["branch"], row["expected_head_sha"],
+                          row["resulting_head_sha"], row["phase"]),
+                         (44, BRANCH, SHA, new_head, "PR_BOUND"))
         self.assertEqual(len(self.implementer.requests), 2)
+
+    def test_existing_database_migrates_without_losing_repair_baseline(self):
+        self._start_repair()
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("ALTER TABLE attempts DROP COLUMN resulting_head_sha")
+            conn.commit()
+        migrated = RuntimeCore(self.db, MANIFEST, self.workflow, self.implementer, recovery_timeout_seconds=60)
+        row = migrated.store.attempts_for_repo("acme/alpha")[-1]
+        self.assertEqual(row["expected_head_sha"], SHA)
+        self.assertIsNone(row["resulting_head_sha"])
+        self.add_pr(head="b" * 40)
+        migrated.reconcile_once("acme/alpha", "owner")
+        row = migrated.store.attempts_for_repo("acme/alpha")[-1]
+        self.assertEqual((row["expected_head_sha"], row["resulting_head_sha"]), (SHA, "b" * 40))
 
     def test_unknown_with_canonical_pr_binds_without_relaunch(self):
         self.assertEqual(self.start(LaunchDisposition.UNKNOWN)["phase"], "LAUNCH_UNKNOWN")
         self.add_pr()
         restarted = RuntimeCore(self.db, MANIFEST, self.workflow, self.implementer)
         self.assertEqual(restarted.reconcile_once("acme/alpha", "owner")["items"][0]["status"], "pr_bound")
+        self.assertEqual(len(self.implementer.requests), 1)
+
+    def test_unknown_agent_ready_is_never_retry_eligible(self):
+        self.start(LaunchDisposition.UNKNOWN)
+        self.set_snapshot(replace(self.workflow.observe("acme/alpha", 7),
+                                  coordination_state="agent-ready", revision="ready-after-unknown"))
+        result = self.core.reconcile_once("acme/alpha", "owner")
+        row = self.core.store.attempts_for_repo("acme/alpha")[-1]
+        self.assertEqual(result["items"][0]["status"], "unresolved_claim_contradiction")
+        self.assertEqual(row["phase"], "LAUNCH_UNKNOWN")
+        self.assertEqual(self.core.dispatch_initial("acme/alpha", 7, "owner")["status"],
+                         "initial_attempt_already_recorded")
+        self.assertEqual(len(self.implementer.requests), 1)
+
+    def test_confirmed_agent_ready_is_never_retry_eligible(self):
+        self.start(LaunchDisposition.CONFIRMED)
+        self.set_snapshot(replace(self.workflow.observe("acme/alpha", 7),
+                                  coordination_state="agent-ready", revision="ready-after-confirmed"))
+        result = self.core.reconcile_once("acme/alpha", "owner")
+        row = self.core.store.attempts_for_repo("acme/alpha")[-1]
+        self.assertEqual(result["items"][0]["status"], "unresolved_claim_contradiction")
+        self.assertEqual(row["phase"], "LAUNCH_CONFIRMED")
+        self.assertEqual(self.core.dispatch_initial("acme/alpha", 7, "owner")["status"], "flow_already_started")
         self.assertEqual(len(self.implementer.requests), 1)
 
     def test_unknown_without_evidence_before_deadline_stays_unresolved(self):
@@ -340,6 +379,58 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(bound["phase"], "PR_BOUND")
         self.assertEqual(bound["phase_entered_at"], now)
         self.assertGreater(bound["phase_entered_at"], old)
+
+    def _bind_initial_pr(self):
+        self.start(LaunchDisposition.UNKNOWN)
+        self.add_pr()
+        result = self.core.reconcile_once("acme/alpha", "owner")
+        self.assertEqual(result["items"][0]["status"], "pr_bound")
+        row = self.core.store.attempts_for_repo("acme/alpha")[-1]
+        self.assertEqual(row["phase"], "PR_BOUND")
+        return row
+
+    def _assert_pr_bound_cancelled(self):
+        row = self.core.store.attempts_for_repo("acme/alpha")[-1]
+        self.assertEqual(row["phase"], "STOPPED_CANCELLED")
+        self.assertFalse(self.core.store.flow("acme/alpha", 7)["trusted"])
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertIsNone(conn.execute("SELECT 1 FROM leases WHERE repo='acme/alpha' AND issue_number=7").fetchone())
+        self.assertEqual(len(self.implementer.requests), 1)
+
+    def test_pr_bound_issue_closed_is_fenced_and_lease_released(self):
+        self._bind_initial_pr()
+        self.set_snapshot(replace(self.workflow.observe("acme/alpha", 7), issue_open=False))
+        self.core.reconcile_once("acme/alpha", "owner")
+        self._assert_pr_bound_cancelled()
+
+    def test_pr_bound_frozen_spec_removed_is_fenced_and_lease_released(self):
+        self._bind_initial_pr()
+        self.set_snapshot(replace(self.workflow.observe("acme/alpha", 7), frozen_spec=False))
+        self.core.reconcile_once("acme/alpha", "owner")
+        self._assert_pr_bound_cancelled()
+
+    def test_pr_bound_terminal_label_is_preserved_and_flow_stopped(self):
+        self._bind_initial_pr()
+        self.set_snapshot(replace(self.workflow.observe("acme/alpha", 7), coordination_state="needs-human",
+                                  terminal_labels=("needs-human",)))
+        transitions = list(self.workflow.transitions)
+        self.core.reconcile_once("acme/alpha", "owner")
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).terminal_labels, ("needs-human",))
+        self.assertEqual(self.workflow.transitions, transitions)
+        self._assert_pr_bound_cancelled()
+
+    def test_stale_event_after_pr_bound_cancellation_does_not_restore_trust_or_phase(self):
+        self._bind_initial_pr()
+        self.set_snapshot(replace(self.workflow.observe("acme/alpha", 7), issue_open=False))
+        self.core.reconcile_once("acme/alpha", "owner")
+        self.set_snapshot(replace(snap(state="agent-working"), pr_number=44, pr_open=True, pr_linked_issue=7,
+                                  pr_head_sha=SHA, pr_branch=BRANCH, open_linked_pr_count=1,
+                                  canonical_link_count=1))
+        result = self.core.reconcile_once("acme/alpha", "owner")
+        self.assertEqual(result["items"][0]["status"], "stopped_terminal")
+        self.assertEqual(self.core.store.attempts_for_repo("acme/alpha")[-1]["phase"], "STOPPED_CANCELLED")
+        self.assertFalse(self.core.store.flow("acme/alpha", 7)["trusted"])
+        self.assertEqual(len(self.implementer.requests), 1)
 
     def test_stale_authorization_during_recovery_cannot_bind_pr(self):
         self.start(LaunchDisposition.UNKNOWN)

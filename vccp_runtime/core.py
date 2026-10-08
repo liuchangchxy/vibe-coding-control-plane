@@ -168,6 +168,7 @@ class _Store:
                     repair_key TEXT UNIQUE,
                     repair_ordinal INTEGER,
                     expected_head_sha TEXT,
+                    resulting_head_sha TEXT,
                     pr_number INTEGER,
                     branch TEXT,
                     phase TEXT NOT NULL,
@@ -187,7 +188,20 @@ class _Store:
                 connection.execute("ALTER TABLE attempts ADD COLUMN phase_entered_at REAL")
             if "deadline_at" not in columns:
                 connection.execute("ALTER TABLE attempts ADD COLUMN deadline_at REAL")
+            migrating_bound_head = "resulting_head_sha" not in columns
+            if migrating_bound_head:
+                connection.execute("ALTER TABLE attempts ADD COLUMN resulting_head_sha TEXT")
             connection.execute("UPDATE attempts SET phase_entered_at=created_at WHERE phase_entered_at IS NULL")
+            if migrating_bound_head:
+                # Older P2-D1 code stored the bound head in expected_head_sha.
+                # Preserve it as resulting evidence and invalidate any lost repair baseline.
+                connection.execute("UPDATE attempts SET resulting_head_sha=expected_head_sha "
+                                   "WHERE phase='PR_BOUND' AND expected_head_sha IS NOT NULL")
+                connection.execute("UPDATE attempts SET expected_head_sha=NULL WHERE phase='PR_BOUND'")
+                connection.execute("UPDATE flows SET trusted=0,initial_confirmed=0 WHERE EXISTS "
+                                   "(SELECT 1 FROM attempts WHERE attempts.repo=flows.repo "
+                                   "AND attempts.issue_number=flows.issue_number AND attempts.kind='repair' "
+                                   "AND attempts.phase='PR_BOUND')")
             flow_columns = {row[1] for row in connection.execute("PRAGMA table_info(flows)")}
             if "repair_count" not in flow_columns:
                 connection.execute("ALTER TABLE flows ADD COLUMN repair_count INTEGER NOT NULL DEFAULT 0")
@@ -460,7 +474,7 @@ class _Store:
             if row["kind"] == "initial_dispatch":
                 connection.execute("UPDATE flows SET trusted=1,initial_confirmed=1 WHERE repo=? AND issue_number=?",
                                    (row["repo"], row["issue_number"]))
-            connection.execute("UPDATE attempts SET phase='PR_BOUND',pr_number=?,branch=?,expected_head_sha=?,"
+            connection.execute("UPDATE attempts SET phase='PR_BOUND',pr_number=?,branch=?,resulting_head_sha=?,"
                                "phase_entered_at=?,deadline_at=NULL,updated_at=? WHERE attempt_id=?",
                                (pr_number, branch, head_sha.lower(), now, now, attempt_id))
             connection.commit()
@@ -499,7 +513,7 @@ class _Store:
                                    "VALUES(?,?,0,0,?,?)", (_repo_key(repo), issue, pr_number, branch))
             attempt_id = str(uuid4())
             connection.execute("INSERT INTO attempts(attempt_id,repo,issue_number,owner_id,lease_token,kind,"
-                               "phase,expected_head_sha,pr_number,branch,created_at,updated_at,phase_entered_at) "
+                               "phase,resulting_head_sha,pr_number,branch,created_at,updated_at,phase_entered_at) "
                                "VALUES(?,?,?,?,'','adopted','PR_BOUND',?,?,?,?,?,?)",
                                (attempt_id, _repo_key(repo), issue, owner, head_sha.lower(), pr_number,
                                 branch, now, now, now))
@@ -773,23 +787,30 @@ class RuntimeCore:
             rows = [row for row in attempts if row["issue_number"] == issue]
             active_rows = [row for row in rows if row["phase"] in active_phases]
             latest = active_rows[-1] if active_rows else None
+            local_fence_attempts = [row for row in rows
+                                    if row["phase"] in active_phases | {"PR_BOUND"}]
             if snapshot.canceled or not snapshot.issue_open or not snapshot.frozen_spec or snapshot.terminal_labels:
-                if latest:
+                if local_fence_attempts:
                     try:
                         fresh = self.workflow.observe(repo_key, issue)
                         if fresh.revision == snapshot.revision and (fresh.canceled or not fresh.issue_open
                                 or not fresh.frozen_spec or fresh.terminal_labels):
-                            self.store.local_terminal(latest["attempt_id"], "STOPPED_CANCELLED", current_time)
+                            for row in local_fence_attempts:
+                                self.store.local_terminal(row["attempt_id"], "STOPPED_CANCELLED", current_time)
                     except Exception:
                         pass
                 output.append({"issue": issue, "status": "cancelled_or_terminal"})
                 continue
             if snapshot.coordination_state not in {"agent-working", "changes-requested"}:
                 if latest and snapshot.coordination_state == "agent-ready":
-                    if (snapshot.canonical_relationship_valid and snapshot.canonical_link_count == 0
-                            and snapshot.open_linked_pr_count == 0):
+                    if latest["phase"] == "CLAIM_INTENT" and snapshot.canonical_relationship_valid \
+                            and snapshot.canonical_link_count == 0 and snapshot.open_linked_pr_count == 0:
                         self.store.mark_phase(latest["attempt_id"], "RETRY_ELIGIBLE")
                         output.append({"issue": issue, "status": "retry_eligible"})
+                    elif latest["phase"] in {"LAUNCH_UNKNOWN", "LAUNCH_CONFIRMED"} \
+                            and snapshot.canonical_relationship_valid and snapshot.canonical_link_count == 0 \
+                            and snapshot.open_linked_pr_count == 0:
+                        output.append({"issue": issue, "status": "unresolved_claim_contradiction"})
                     else:
                         self._recovery_terminal(repo_key, issue, snapshot, "needs-human")
                         self.store.local_terminal(latest["attempt_id"], "TERMINAL_UNRESOLVED", current_time)
@@ -803,8 +824,8 @@ class RuntimeCore:
             if snapshot.coordination_state == "changes-requested" and (
                     not flow or not flow.get("trusted") or not has_repair_history):
                 self._recovery_terminal(repo_key, issue, snapshot, "needs-human")
-                if latest:
-                    self.store.local_terminal(latest["attempt_id"], "TERMINAL_UNRESOLVED", current_time)
+                for row in local_fence_attempts:
+                    self.store.local_terminal(row["attempt_id"], "TERMINAL_UNRESOLVED", current_time)
                 output.append({"issue": issue, "status": "untrusted_repair_history"})
                 continue
             if not latest and rows:
