@@ -5,13 +5,18 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 from typing import Callable
-from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from .core import (LaunchDisposition, LaunchRequest, LaunchResult, RuntimeCore,
                    WorkflowSnapshot)
+
+
+_CONVERSATION_UUID = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 
 class GitHubAPI:
@@ -29,9 +34,22 @@ class GitHubAPI:
         with self.opener(request, timeout=30) as response:
             return json.loads(response.read().decode("utf-8"))
 
+    def graphql(self, query: str, variables: dict):
+        request = Request(self.api_url.rsplit("/", 1)[0] + "/graphql",
+                          data=json.dumps({"query": query, "variables": variables}).encode("utf-8"),
+                          headers={"Authorization": f"Bearer {self.token}",
+                                   "Accept": "application/vnd.github+json",
+                                   "Content-Type": "application/json",
+                                   "X-GitHub-Api-Version": "2022-11-28"}, method="POST")
+        with self.opener(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if payload.get("errors"):
+            raise RuntimeError("GitHub GraphQL relationship read failed")
+        return payload["data"]
+
 
 class GitHubAppWriter:
-    """Controlled writer executable receives a single JSON operation on stdin."""
+    """Use the configured controlled app-gh drop-in for the supported label edit."""
     def __init__(self, executable: str, runner: Callable = subprocess.run):
         if not executable:
             raise ValueError("controlled GitHub App writer executable is required")
@@ -40,13 +58,33 @@ class GitHubAppWriter:
         self.executable, self.runner = executable, runner
 
     def replace_labels(self, repo: str, issue: int, remove: list[str], add: list[str]):
-        result = self.runner([self.executable, "replace-coordination-labels"],
-                             input=json.dumps({"repo": repo, "issue": issue, "remove": remove, "add": add}),
-                             text=True, capture_output=True, check=False)
+        command = [self.executable, "issue", "edit", str(issue), "--repo", repo]
+        for label in remove:
+            command.extend(("--remove-label", label))
+        for label in add:
+            command.extend(("--add-label", label))
+        result = self.runner(command, text=True, capture_output=True, check=False)
         return result.returncode == 0
 
 
 class GitHubWorkflowAdapter:
+    _CANONICAL_LINKS_QUERY = """
+    query CanonicalClosingPullRequests($owner: String!, $name: String!, $number: Int!) {
+      repository(owner: $owner, name: $name) {
+        issue(number: $number) {
+          timelineItems(first: 100, itemTypes: [CROSS_REFERENCED_EVENT]) {
+            nodes {
+              ... on CrossReferencedEvent {
+                willCloseTarget
+                source { __typename ... on PullRequest { number } }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+
     def __init__(self, api, app_writer, manifest: dict):
         self.api, self.writer, self.manifest = api, app_writer, manifest
         if manifest.get("schema_version") != 2:
@@ -67,22 +105,33 @@ class GitHubWorkflowAdapter:
         frozen = self.policy["frozen_spec_label"] in labels
         terminal = tuple(x for x in self.policy["terminal_coordination_labels"] if x in labels)
         revision = str(issue.get("updated_at", ""))
-        linked = []
-        # GitHub timeline cross-references are the canonical native Issue/PR relationship.
-        for item in self.api.get(f"/repos/{repo}/issues/{number}/timeline?per_page=100"):
-            source = item.get("source", {}).get("issue", {})
-            if item.get("event") == "cross-referenced" and source.get("pull_request"):
-                prnum = source.get("number")
-                if prnum and all(p.get("number") != prnum for p in linked):
-                    linked.append(source)
-        linked_prs = [self.api.get(f"/repos/{repo}/pulls/{p['number']}") for p in linked]
+        owner, name = repo.split("/", 1)
+        data = self.api.graphql(self._CANONICAL_LINKS_QUERY,
+                                {"owner": owner, "name": name, "number": number})
+        issue_node = (data.get("repository") or {}).get("issue") or {}
+        events = ((issue_node.get("timelineItems") or {}).get("nodes") or [])
+        linked_numbers = set()
+        relationship_valid = True
+        for event in events:
+            if not isinstance(event, dict):
+                relationship_valid = False
+                continue
+            if event.get("willCloseTarget") is True:
+                source = event.get("source")
+                if not isinstance(source, dict) or source.get("__typename") != "PullRequest" \
+                        or not isinstance(source.get("number"), int):
+                    relationship_valid = False
+                else:
+                    linked_numbers.add(source["number"])
+        linked_numbers = sorted(linked_numbers) if relationship_valid else []
+        linked_prs = [self.api.get(f"/repos/{repo}/pulls/{pr_number}") for pr_number in linked_numbers]
         open_linked = [p for p in linked_prs if p.get("state") == "open"]
-        pr = open_linked[0] if len(open_linked) == 1 else None
+        pr = open_linked[0] if len(linked_numbers) == 1 and len(open_linked) == 1 else None
         reviews = self.api.get(f"/repos/{repo}/pulls/{pr['number']}/reviews?per_page=100") if pr else None
         head = pr.get("head", {}) if pr else {}
         current_sha = head.get("sha")
         current_review = None
-        if pr and len(open_linked) == 1 and pr.get("base", {}).get("ref") == self.base_branch and \
+        if pr and len(linked_numbers) == 1 and len(open_linked) == 1 and pr.get("base", {}).get("ref") == self.base_branch and \
                 pr.get("user", {}).get("login", "").casefold() in self.authors:
             current_head_reviews = [r for r in reviews or []
                                     if r.get("commit_id", "").casefold() == (current_sha or "").casefold()]
@@ -90,7 +139,7 @@ class GitHubWorkflowAdapter:
                 latest = max(current_head_reviews, key=lambda r: r.get("submitted_at", ""))
                 if latest.get("state") == "CHANGES_REQUESTED":
                     current_review = latest
-        valid_pr = bool(pr and len(open_linked) == 1
+        valid_pr = bool(pr and len(linked_numbers) == 1 and len(open_linked) == 1
                         and pr.get("base", {}).get("ref") == self.base_branch
                         and pr.get("user", {}).get("login", "").casefold() in self.authors)
         return WorkflowSnapshot(
@@ -125,12 +174,15 @@ class GitHubWorkflowAdapter:
                 and after.coordination_state == new_state)
 
 
-def generic_prompt(request: LaunchRequest, workspace: str, policy: dict) -> str:
+def generic_prompt(request: LaunchRequest, workspace: str, policy: dict,
+                   app_gh: str, app_git_push: str) -> str:
     common = (f"Repository: {request.repo}\nFrozen Issue: #{request.issue_number}\nWorkspace: {workspace}\n"
               "Read the Frozen Issue from GitHub and treat it as the sole task specification. "
-              "Do not expand scope or merge. Report tests actually run. Use configured controlled GitHub App "
-              "wrappers for GitHub writes and git push; never use host-human credentials. Do not persist or "
-              "request GitHub tokens.\n")
+              f"Controlled GitHub writer: {app_gh}\nControlled git push wrapper: {app_git_push}\n"
+              "Do not expand scope or merge. Report tests actually run. Ordinary host-human gh writes are "
+              "forbidden; use only the configured controlled App writer for GitHub writes. Ordinary git push "
+              "is forbidden; use only the configured controlled push wrapper. Do not persist or request GitHub "
+              "tokens.\n")
     if request.attempt_kind == "repair":
         return common + (f"Repair the existing PR #{request.pr_number} on existing branch {request.branch}. "
                          f"The exact supplied baseline is {request.expected_head_sha}; repair ordinal "
@@ -141,46 +193,67 @@ def generic_prompt(request: LaunchRequest, workspace: str, policy: dict) -> str:
 
 
 class AntiGravityImplementer:
-    def __init__(self, executable: str, workspace: str, write_guard: str,
+    def __init__(self, executable: str, workspace: str, app_gh: str, app_git_push: str,
                  runner: Callable = subprocess.run, timeout: int = 60, environ=None):
-        self.executable, self.workspace, self.write_guard = executable, workspace, write_guard
+        self.executable, self.workspace = executable, workspace
+        self.app_gh, self.app_git_push = app_gh, app_git_push
         self.runner, self.timeout = runner, timeout
         self.environ = os.environ if environ is None else environ
-        if not executable or not workspace or not write_guard:
-            raise ValueError("AntiGravity executable, workspace, and write guard are required")
+        if not executable or not workspace or not app_gh or not app_git_push:
+            raise ValueError("language server, workspace, app-gh, and app-git-push are required")
 
     def launch(self, request):
-        # The guard validates first, then owns the child process and its Git/GitHub credential boundary.
-        try:
-            guarded = self.runner([self.write_guard, "prepare", self.workspace], text=True,
-                                  capture_output=True, check=False, timeout=self.timeout)
-        except Exception:
-            return LaunchResult(LaunchDisposition.DEFINITELY_NOT_STARTED)
-        if guarded.returncode != 0:
-            return LaunchResult(LaunchDisposition.DEFINITELY_NOT_STARTED)
         env = dict(self.environ)
         for key in list(env):
             if key.upper() in {"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_APP_PRIVATE_KEY"}:
                 env.pop(key)
-        prompt = generic_prompt(request, self.workspace, self._policy)
+        env["VCCP_APP_GH"] = self.app_gh
+        env["VCCP_APP_GIT_PUSH"] = self.app_git_push
+        prompt = generic_prompt(request, self.workspace, self._policy, self.app_gh, self.app_git_push)
         try:
-            result = self.runner([self.write_guard, "run", self.workspace, self.executable, "launch", "--json"], env=env,
-                                 input=prompt, text=True, capture_output=True, check=False,
+            result = self.runner([self.executable, "agentapi", "new-conversation", prompt],
+                                 cwd=self.workspace, env=env, text=True, capture_output=True, check=False,
                                  timeout=self.timeout)
+        except (FileNotFoundError, PermissionError):
+            # CreateProcess failure proves AgentAPI was never invoked.
+            return LaunchResult(LaunchDisposition.DEFINITELY_NOT_STARTED)
         except Exception:
             return LaunchResult(LaunchDisposition.UNKNOWN)
-        try:
-            payload = json.loads(result.stdout)
-            for _ in range(2):
-                if isinstance(payload, str):
-                    payload = json.loads(payload)
-            identity = payload.get("conversation_id") or payload.get("conversationId") or payload.get("id")
-            if result.returncode == 0 and isinstance(identity, str) and identity.strip() and \
-                    len(identity.strip()) <= 200 and all(c.isalnum() or c in "_-" for c in identity.strip()):
-                return LaunchResult(LaunchDisposition.CONFIRMED, identity.strip())
-        except Exception:
-            pass
+        if result.returncode == 0:
+            identity = self._conversation_id(result.stdout)
+            if identity:
+                return LaunchResult(LaunchDisposition.CONFIRMED, identity)
         return LaunchResult(LaunchDisposition.UNKNOWN)
+
+    @staticmethod
+    def _conversation_id(stdout):
+        try:
+            payload = json.loads(stdout)
+            for _ in range(2):
+                if not isinstance(payload, str):
+                    break
+                payload = json.loads(payload)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict) or payload.get("error"):
+            return None
+        response = payload.get("response")
+        if isinstance(response, str):
+            try:
+                response = json.loads(response)
+            except (TypeError, ValueError):
+                return None
+        candidates = [payload.get("conversation_id"), payload.get("conversationId")]
+        if isinstance(response, dict):
+            new_conversation = response.get("newConversation")
+            if isinstance(new_conversation, dict):
+                candidates.append(new_conversation.get("conversationId"))
+                candidates.append(new_conversation.get("conversation_id"))
+            candidates.extend((response.get("conversation_id"), response.get("conversationId")))
+        for candidate in candidates:
+            if isinstance(candidate, str) and _CONVERSATION_UUID.fullmatch(candidate):
+                return candidate.lower()
+        return None
 
     _policy = {"repository": {"base_branch": ""}}
 
@@ -197,14 +270,14 @@ def build_runtime(manifest: dict, local_config: dict, api=None, writer=None, run
     if manifest.get("schema_version") != 2:
         raise ValueError("runtime wiring requires schema_version 2")
     required = ("database_path", "workspace", "owner_id", "antigravity_executable",
-                "write_guard_executable", "github_read_token_env", "github_app_writer_executable")
+                "app_gh_executable", "app_git_push_executable", "github_read_token_env")
     if any(not local_config.get(k) for k in required):
         raise ValueError("incomplete machine-local runtime configuration")
     api = api or GitHubAPI(os.environ.get(local_config["github_read_token_env"], ""))
-    writer = writer or GitHubAppWriter(local_config["github_app_writer_executable"], runner)
+    writer = writer or GitHubAppWriter(local_config["app_gh_executable"], runner)
     workflow = GitHubWorkflowAdapter(api, writer, manifest)
     implementer = AntiGravityImplementer(local_config["antigravity_executable"], local_config["workspace"],
-                                        local_config["write_guard_executable"], runner,
+                                        local_config["app_gh_executable"], local_config["app_git_push_executable"], runner,
                                         local_config.get("launch_timeout_seconds", 60))
     implementer._policy = manifest
     core = RuntimeCore(local_config["database_path"], manifest, workflow, implementer)
