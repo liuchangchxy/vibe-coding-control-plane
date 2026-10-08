@@ -84,6 +84,89 @@ test("fresh input creates a read-only plan pinned to a reachable canonical revis
   });
 });
 
+test("clean consumer plans VCCP cleanup creation and an exact managed cleanup is idempotent", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const first = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
+    assert.equal(first.items.find((entry) => entry.path === ".github/workflows/vccp-coordination-label-cleanup.yml").status, "create");
+    await applyOnboardingPlan({ plan: first, root, github });
+
+    const second = await createOnboardingPlan({ repo: REPO, root, github });
+    assert.equal(second.overall_status, "repository_ready");
+    assert.equal(second.items.find((entry) => entry.path === ".github/workflows/vccp-coordination-label-cleanup.yml").status, "satisfied");
+  });
+});
+
+test("EasyExam-shaped terminal-preserving issues.closed cleanup blocks plan, apply, and audit", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const workflowDir = path.join(root, ".github/workflows");
+    const scriptDir = path.join(root, ".github/scripts");
+    await mkdir(workflowDir, { recursive: true });
+    await mkdir(scriptDir, { recursive: true });
+    const priorPlan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
+    await writeFile(path.join(workflowDir, "coordination-label-cleanup.yml"), `name: Coordination Label Cleanup\non:\n  issues:\n    types: [closed]\njobs:\n  cleanup:\n    steps:\n      - run: node \"\${process.env.GITHUB_WORKSPACE}/.github/scripts/cleanup-coordination-labels.js\"\n`);
+    await writeFile(path.join(scriptDir, "cleanup-coordination-labels.js"), `const ACTIVE_LABELS = ["agent-ready", "agent-working", "changes-requested"];\nconst TERMINAL_LABELS = ["infra-blocked", "needs-human"];\nasync function cleanup(issue, removeLabel) {\n  const labels = new Set(issue.labels.map(({ name }) => name));\n  if (TERMINAL_LABELS.some((name) => labels.has(name))) return { preservedTerminalState: true, removed: [] };\n  for (const name of ACTIVE_LABELS) if (labels.has(name)) await removeLabel(name);\n}\n`);
+
+    const staleApply = await applyOnboardingPlan({ plan: priorPlan, root, github });
+    assert.equal(staleApply.overall_status, "stale_plan");
+    assert.deepEqual(staleApply.applied, []);
+    assert.equal(github.labelCreates.length, 0);
+
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
+    assert.equal(plan.overall_status, "repository_blocked");
+    const conflict = plan.items.find((entry) => entry.id === "capability:coordination-label-cleanup");
+    assert.equal(conflict.status, "conflict");
+    assert.equal(conflict.event, "issues.closed");
+    assert.match(conflict.reason, /preserves active coordination labels/);
+    assert.match(conflict.reason, /VCCP requires active labels to be removed after every Issue close/);
+
+    const applied = await applyOnboardingPlan({ plan, root, github });
+    assert.equal(applied.overall_status, "repository_blocked");
+    assert.deepEqual(applied.applied, []);
+    assert.equal(github.labelCreates.length, 0);
+    await assert.rejects(readFile(path.join(root, ".github/control-plane.yml")));
+
+    await mkdir(path.join(root, ".github"), { recursive: true });
+    await writeFile(path.join(root, ".github/control-plane.yml"), stringifyManifest(createManifest(validInput())));
+    const audit = await auditConsumer({ repo: REPO, root, github });
+    assert.equal(audit.overall_status, "repository_blocked");
+    assert.ok(audit.items.some((entry) => entry.id === "capability:coordination-label-cleanup" && entry.status === "conflict"));
+  });
+});
+
+test("direct-only repository-relative cleanup reference blocks an incompatible issues.closed handler", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const workflowDir = path.join(root, ".github/workflows");
+    const scriptDir = path.join(root, ".github/scripts");
+    await mkdir(workflowDir, { recursive: true });
+    await mkdir(scriptDir, { recursive: true });
+    await writeFile(path.join(workflowDir, "coordination-label-cleanup.yml"), `name: Coordination Label Cleanup\non:\n  issues:\n    types: [closed]\njobs:\n  cleanup:\n    steps:\n      - run: node .github/scripts/cleanup-coordination-labels.js\n`);
+    await writeFile(path.join(scriptDir, "cleanup-coordination-labels.js"), `const ACTIVE_LABELS = ["agent-ready", "agent-working", "changes-requested"];\nconst TERMINAL_LABELS = ["infra-blocked", "needs-human"];\nasync function cleanup(issue, removeLabel) {\n  const labels = new Set(issue.labels.map(({ name }) => name));\n  if (TERMINAL_LABELS.some((name) => labels.has(name))) return { preservedTerminalState: true, removed: [] };\n  for (const name of ACTIVE_LABELS) if (labels.has(name)) await removeLabel(name);\n}\n`);
+
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
+    assert.equal(plan.overall_status, "repository_blocked");
+    assert.equal(plan.items.find((entry) => entry.id === "capability:coordination-label-cleanup").path, ".github/workflows/coordination-label-cleanup.yml");
+  });
+});
+
+test("an overlapping cleanup with unproven behavior blocks instead of assuming compatibility", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const workflowDir = path.join(root, ".github/workflows");
+    const scriptDir = path.join(root, ".github/scripts");
+    await mkdir(workflowDir, { recursive: true });
+    await mkdir(scriptDir, { recursive: true });
+    await writeFile(path.join(workflowDir, "issue-close.yml"), `on:\n  issues: [closed]\njobs:\n  cleanup:\n    steps:\n      - run: node \"\${process.env.GITHUB_WORKSPACE}/.github/scripts/cleanup.js\"\n`);
+    await writeFile(path.join(scriptDir, "cleanup.js"), `const ACTIVE_LABELS = ["agent-ready"];\nawait github.rest.issues.removeLabel({ name: ACTIVE_LABELS[0] });\n`);
+
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
+    assert.equal(plan.overall_status, "repository_blocked");
+    assert.match(plan.items.find((entry) => entry.id === "capability:coordination-label-cleanup").reason, /cannot be proven compatible/);
+  });
+});
+
 test("v2 manifest contract accepts only the shared frozen repair budget", () => {
   const manifest = createManifest(validInput());
   assert.deepEqual(validateManifest(manifest), []);
