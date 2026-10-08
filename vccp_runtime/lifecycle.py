@@ -110,10 +110,16 @@ class LifecycleDriver:
         issues = sorted({row["issue_number"] for row in attempts
                          if row["pr_number"] and row["phase"] in {
                              "PR_BOUND", "LAUNCH_CONFIRMED", "MERGED_SUCCESS"}})
+        active_repair_phases = {"CLAIM_INTENT", "CLAIMED", "LAUNCH_INTENT", "LAUNCH_UNKNOWN",
+                                "LAUNCH_CONFIRMED"}
+        issues_with_active_repair = {row["issue_number"] for row in attempts
+                                     if row["kind"] == "repair" and row["phase"] in active_repair_phases}
         merged_results = []
 
         # A merged canonical PR outranks Issue auto-closure/cancellation fencing.
         for issue in issues:
+            if issue in issues_with_active_repair:
+                continue
             try:
                 snapshot = self.core.workflow.observe(repo_key, issue)
             except Exception:
@@ -144,6 +150,14 @@ class LifecycleDriver:
         results = list(merged_results)
         for issue in issues:
             rows = [row for row in attempts if row["issue_number"] == issue]
+            in_flight_repairs = [row for row in rows if row["kind"] == "repair"
+                                 and row["phase"] in active_repair_phases]
+            if in_flight_repairs:
+                latest_repair = in_flight_repairs[-1]
+                results.append({"issue": issue, "status": "waiting_for_repair",
+                                "attempt_id": latest_repair["attempt_id"],
+                                "phase": latest_repair["phase"]})
+                continue
             bound = max(rows, key=lambda row: (row["updated_at"], row["created_at"]))
             state = self.core.store.lifecycle_state(repo_key, issue)
             if state and state["phase"] == "MERGED_SUCCESS":

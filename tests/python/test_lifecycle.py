@@ -143,6 +143,56 @@ class LifecycleTests(unittest.TestCase):
         self.driver().advance_once(self.repo, "owner", 101)
         self.assertEqual(len(self.implementer.launches), 2)
 
+    def test_ci_repair_in_flight_suppresses_old_head_lifecycle_without_deadline_change(self):
+        driver = self.driver()
+        self.assertEqual(driver.advance_once(self.repo, "owner", 100)["items"][0]["status"], "WAITING_CI")
+        self.update(check_runs=self.failure())
+        self.assertEqual(driver.advance_once(self.repo, "owner", 101)["items"][0]["status"], "launched")
+        prior = self.core.store.lifecycle_state(self.repo, self.issue)
+        result = driver.advance_once(self.repo, "owner", 102)
+        self.assertEqual(result["items"][0]["status"], "waiting_for_repair")
+        self.assertEqual(len(self.implementer.launches), 2)
+        after = self.core.store.lifecycle_state(self.repo, self.issue)
+        self.assertEqual((after["phase"], after["deadline_at"]), (prior["phase"], prior["deadline_at"]))
+
+    def test_reviewer_repair_in_flight_does_not_enter_or_reset_review_wait(self):
+        driver = self.driver()
+        self.update(check_runs=self.accepted())
+        first = driver.advance_once(self.repo, "owner", 100)["items"][0]
+        self.assertEqual(first["status"], "WAITING_REVIEW")
+        review_deadline = first["deadline_at"]
+        self.update(coordination_state="changes-requested", formal_review_state="CHANGES_REQUESTED",
+                    formal_review_id="review-6", formal_review_head_sha=SHA)
+        self.assertEqual(driver.advance_once(self.repo, "owner", 101)["items"][0]["status"], "launched")
+        result = driver.advance_once(self.repo, "owner", 102)
+        self.assertEqual(result["items"][0]["status"], "waiting_for_repair")
+        self.assertNotEqual(result["items"][0]["status"], "WAITING_REVIEW")
+        self.assertEqual(len(self.implementer.launches), 2)
+        state = self.core.store.lifecycle_state(self.repo, self.issue)
+        self.assertEqual((state["phase"], state["deadline_at"]), ("WAITING_REVIEW", review_deadline))
+
+    def test_repair_push_binds_same_pr_branch_then_starts_ci_for_new_head_only(self):
+        driver = self.driver()
+        self.update(check_runs=self.failure(SHA))
+        self.assertEqual(driver.advance_once(self.repo, "owner", 100)["items"][0]["status"], "launched")
+        self.update(pr_head_sha=SHA_B, check_runs=self.accepted(SHA),
+                    formal_review_state="APPROVED", formal_review_head_sha=SHA)
+        result = driver.advance_once(self.repo, "owner", 101)
+        self.assertEqual(result["items"][0]["status"], "WAITING_CI")
+        attempts = self.core.store.attempts_for_repo(self.repo)
+        repair = [row for row in attempts if row["kind"] == "repair"][0]
+        self.assertEqual((repair["phase"], repair["pr_number"], repair["branch"]),
+                         ("PR_BOUND", 44, "implement/7"))
+        self.assertEqual(repair["expected_head_sha"], SHA)
+        self.assertEqual(repair["resulting_head_sha"], SHA_B)
+        lifecycle = self.core.store.lifecycle_state(self.repo, self.issue)
+        self.assertEqual((lifecycle["phase"], lifecycle["head_sha"]), ("WAITING_CI", SHA_B))
+        self.assertEqual(len(self.implementer.launches), 2)
+        self.update(check_runs=self.accepted(SHA_B), formal_review_state="APPROVED",
+                    formal_review_head_sha=SHA)
+        self.assertEqual(driver.advance_once(self.repo, "owner", 102)["items"][0]["status"],
+                         "WAITING_REVIEW")
+
     def test_infrastructure_and_ambiguous_ci_failures_fail_closed(self):
         self.update(check_runs=self.failure(conclusion="timed_out"))
         result = self.driver().advance_once(self.repo, "owner", 100)
