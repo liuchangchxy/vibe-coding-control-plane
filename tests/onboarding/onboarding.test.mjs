@@ -108,7 +108,7 @@ test("schema, generated manifest, onboarding guide, contract, and Reviewer promp
   assert.equal(schema.properties.issue_contract.properties.max_automated_repairs.const, 3);
   assert.match(template, /schema_version: 2/);
   assert.match(template, /max_automated_repairs: 3/);
-  assert.match(onboarding, /repository_upgrade_required/);
+  assert.match(onboarding, /`repository_upgrade_required` \(0\)/);
   assert.match(onboarding, /Python runtime owns claim\/ownership, dispatch, repair admission/);
   assert.match(contract, /shared by implementation-attributable CI repairs and Reviewer-caused repairs/);
   assert.match(contract, /Dispatcher admits a candidate/);
@@ -121,7 +121,7 @@ test("schema, generated manifest, onboarding guide, contract, and Reviewer promp
   }
 });
 
-test("schema v1 parses as legacy and plan/audit/apply return upgrade-required without rewriting", async () => {
+test("schema v1 parses as legacy, preserves stale-plan protection, and never rewrites", async () => {
   await withRepo(async (root) => {
     const github = new FakeGitHub();
     const source = `schema_version: 1\nvccp:\n  source: ${SOURCE}\n  revision: ${REV_A}\nrepository:\n  base_branch: main\n  implementer_authors:\n    - builder[bot]\nissue_contract:\n  frozen_spec_label: frozen-spec\n  active_coordination_labels: [agent-ready, agent-working, changes-requested]\n  terminal_coordination_labels: [infra-blocked, needs-human]\n  max_request_changes_rounds: 3\nreviewer:\n  transport: chatgpt-work-github-webhook-task\n  events: [pull_request.opened, pull_request.ready_for_review, pull_request.synchronize]\n  exact_head_sha_required: true\n  required_checks_completion: same_run_wait_until_terminal\n  required_checks:\n    - name: Consumer CI\n      accepted_conclusions: [success]\n    - name: Consumer Security\n      accepted_conclusions: [success]\nmerge:\n  native_auto_merge: true\n  enable_native_auto_merge_by: reviewer\n  method: squash\n  direct_merge_forbidden: true\n  admin_bypass_forbidden_in_normal_flow: true\nreporting:\n  pull_request_template: false\n`;
@@ -138,10 +138,19 @@ test("schema v1 parses as legacy and plan/audit/apply return upgrade-required wi
     const applied = await applyOnboardingPlan({ plan, root, github });
     assert.equal(applied.overall_status, "repository_upgrade_required");
     assert.deepEqual(applied.applied, []);
+
+    const changedSource = source.replace(REV_A, REV_B);
+    await writeFile(target, changedSource);
+    const stale = await applyOnboardingPlan({ plan, root, github });
+    assert.equal(stale.overall_status, "stale_plan");
+    assert.equal(stale.exit_code, 4);
+    assert.deepEqual(stale.applied, []);
+    assert.equal((await readFile(target, "utf8")), changedSource);
+
     const audit = await auditConsumer({ repo: REPO, root, github });
     assert.equal(audit.command, "audit");
     assert.equal(audit.overall_status, "repository_upgrade_required");
-    assert.equal((await readFile(target, "utf8")), source);
+    assert.equal((await readFile(target, "utf8")), changedSource);
     assert.equal(github.labelCreates.length, 0);
   });
 });
