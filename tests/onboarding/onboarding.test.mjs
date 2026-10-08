@@ -398,6 +398,7 @@ test("readiness CLI qualifies the real Python runtime wiring without exposing cr
       const code = await runOnboardingCli(["readiness", "--repo", REPO, "--path", root, "--runtime-config", configPath], {
         stdout: { write: (text) => { output += text; } },
         stderr: { write: () => assert.fail("readiness should emit no stderr") },
+        runtimeRevision: REV_A,
       });
       assert.equal(code, 0);
       const report = JSON.parse(output);
