@@ -7,7 +7,7 @@ import path from "node:path";
 import { createOnboardingPlan } from "../../lib/onboarding/plan.mjs";
 import { applyOnboardingPlan, auditConsumer } from "../../lib/onboarding/apply.mjs";
 import { runOnboardingCli } from "../../lib/onboarding/cli.mjs";
-import { createManifest, parseManifest, validateManifest } from "../../lib/onboarding/manifest.mjs";
+import { createManifest, parseManifest, stringifyManifest, validateManifest } from "../../lib/onboarding/manifest.mjs";
 
 const SOURCE = "liuchangchxy/vibe-coding-control-plane";
 const REV_A = "a".repeat(40);
@@ -77,7 +77,8 @@ test("fresh input creates a read-only plan pinned to a reachable canonical revis
     assert.equal(plan.items.find((item) => item.id === "manifest").status, "create");
     assert.equal(plan.items.find((item) => item.id === "labels").status, "create");
     assert.equal(plan.external_steps.find((item) => item.id === "reviewer-task").status, "external-step");
-    assert.equal(plan.external_steps.find((item) => item.id === "dispatcher").status, "external-step");
+    assert.equal(plan.external_steps.some((item) => item.id === "dispatcher"), false);
+    assert.equal(plan.runtime_activation.status, "unknown");
     assert.equal(github.labelCreates.length, 0);
     await assert.rejects(readFile(path.join(root, ".github/control-plane.yml")));
   });
@@ -109,7 +110,7 @@ test("schema, generated manifest, onboarding guide, contract, and Reviewer promp
   assert.match(template, /schema_version: 2/);
   assert.match(template, /max_automated_repairs: 3/);
   assert.match(onboarding, /`repository_upgrade_required` \(0\)/);
-  assert.match(onboarding, /Python runtime owns claim\/ownership, dispatch, repair admission/);
+  assert.match(onboarding, /Python owns activation qualification and construction of the Generic Runtime, plus claim\/ownership, dispatch, repair admission/);
   assert.match(contract, /shared by implementation-attributable CI repairs and Reviewer-caused repairs/);
   assert.match(contract, /Dispatcher admits a candidate/);
   assert.match(contract, /repair:<repo>:pr:<pr_number>:head:<failed_or_rejected_head_sha>/);
@@ -190,15 +191,15 @@ test("apply writes the consumer state and the second plan/apply is a no-op", asy
     const github = new FakeGitHub();
     const first = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
     const applied = await applyOnboardingPlan({ plan: first, root, github });
-    assert.equal(applied.overall_status, "repository_ready_external_pending");
+    assert.equal(applied.overall_status, "repository_ready");
     assert.equal(applied.exit_code, 0);
     assert.equal(github.labelCreates.length, 6);
 
     const second = await createOnboardingPlan({ repo: REPO, root, github });
-    assert.equal(second.overall_status, "repository_ready_external_pending");
+    assert.equal(second.overall_status, "repository_ready");
     assert.ok(second.items.every((item) => item.status === "satisfied" || item.status === "external-step"));
     const again = await applyOnboardingPlan({ plan: second, root, github });
-    assert.equal(again.overall_status, "repository_ready_external_pending");
+    assert.equal(again.overall_status, "repository_ready");
     assert.equal(github.labelCreates.length, 6);
   });
 });
@@ -297,7 +298,7 @@ test("audit distinguishes compliant artifacts, drift, external setup, and label 
     github.labels[0].description = "custom wording";
 
     const compliant = await auditConsumer({ repo: REPO, root, github });
-    assert.equal(compliant.overall_status, "repository_ready_external_pending");
+    assert.equal(compliant.overall_status, "repository_ready");
     assert.ok(compliant.external_steps.length >= 2);
     assert.ok(compliant.warnings.some((warning) => warning.includes("label metadata")));
 
@@ -360,6 +361,55 @@ test("CLI emits machine-readable plan JSON and routes all GitHub calls through t
     assert.equal(result.overall_status, "repository_changes_planned");
     assert.equal(github.labelCreates.length, 0);
     await assert.rejects(readFile(path.join(root, ".github/control-plane.yml")));
+  });
+});
+
+test("readiness CLI qualifies the real Python runtime wiring without exposing credentials or touching configured SQLite", async () => {
+  await withRepo(async (root) => {
+    const consumerDir = path.join(root, ".github");
+    await mkdir(consumerDir, { recursive: true });
+    await writeFile(path.join(consumerDir, "control-plane.yml"), stringifyManifest(createManifest(validInput())));
+    const stateDir = path.join(root, "local-state");
+    const toolsDir = path.join(root, "tools");
+    await mkdir(stateDir);
+    await mkdir(toolsDir);
+    const executablePaths = [];
+    for (const name of ["language_server.exe", "app-gh.exe", "app-git-push.exe"]) {
+      const executable = path.join(toolsDir, name);
+      await writeFile(executable, "fake");
+      executablePaths.push(executable);
+    }
+    const secret = "readiness-cli-secret-must-not-appear";
+    const prior = process.env.VCCP_ONBOARDING_READ_TOKEN;
+    process.env.VCCP_ONBOARDING_READ_TOKEN = secret;
+    const configPath = path.join(root, "runtime-config.json");
+    const databasePath = path.join(stateDir, "runtime.sqlite");
+    await writeFile(configPath, JSON.stringify({
+      database_path: databasePath,
+      workspace: root,
+      owner_id: "test-owner",
+      antigravity_executable: executablePaths[0],
+      app_gh_executable: executablePaths[1],
+      app_git_push_executable: executablePaths[2],
+      github_read_token_env: "VCCP_ONBOARDING_READ_TOKEN",
+    }));
+    let output = "";
+    try {
+      const code = await runOnboardingCli(["readiness", "--repo", REPO, "--path", root, "--runtime-config", configPath], {
+        stdout: { write: (text) => { output += text; } },
+        stderr: { write: () => assert.fail("readiness should emit no stderr") },
+        runtimeRevision: REV_A,
+      });
+      assert.equal(code, 0);
+      const report = JSON.parse(output);
+      assert.equal(report.overall_status, "machine_activation_ready");
+      assert.equal(report.runtime_activation.credential_source.present, true);
+      assert.doesNotMatch(output, new RegExp(secret));
+      await assert.rejects(readFile(databasePath));
+    } finally {
+      if (prior === undefined) delete process.env.VCCP_ONBOARDING_READ_TOKEN;
+      else process.env.VCCP_ONBOARDING_READ_TOKEN = prior;
+    }
   });
 });
 
