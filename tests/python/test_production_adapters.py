@@ -25,6 +25,7 @@ class FakeAPI:
         self.issue = {"state": "open", "updated_at": "r1", "labels": [
             {"name": "agent-ready"}, {"name": "frozen-spec"}]}
         self.canonical_events = []
+        self.has_next_page = False
         self.pr = None
         self.reviews = []
         self.reads = []
@@ -38,7 +39,8 @@ class FakeAPI:
     def graphql(self, query, variables):
         self.query = query
         self.variables = variables
-        return {"repository": {"issue": {"timelineItems": {"nodes": self.canonical_events}}}}
+        return {"repository": {"issue": {"timelineItems": {
+            "nodes": self.canonical_events, "pageInfo": {"hasNextPage": self.has_next_page}}}}}
 
 
 class FakeWriter:
@@ -204,7 +206,8 @@ class AdapterTests(unittest.TestCase):
                     events.append("guard-installed")
                     return result
             adapter = AntiGravityImplementer("language_server.exe", str(workspace), "app-gh", "app-git-push",
-                                             environ={"GH_TOKEN": "secret", "KEEP": "yes"},
+                                             environ={"GH_TOKEN": "secret", "GITHUB_APP_TOKEN": "app-secret",
+                                                      "KEEP": "yes"},
                                              write_guard=RecordingGuard())
             req = LaunchRequest("o/r", 1, "attempt", "initial_dispatch")
             response = SimpleNamespace(returncode=0, stdout=json.dumps({"response": {
@@ -219,7 +222,9 @@ class AdapterTests(unittest.TestCase):
             self.assertEqual(calls[0][:3], ["language_server.exe", "agentapi", "new-conversation"])
             self.assertIn("Controlled GitHub writer: app-gh", calls[0][-1])
             self.assertIn("Controlled git push wrapper:", calls[0][-1])
-            self.assertNotIn("GH_TOKEN", envs[0]); self.assertEqual(envs[0]["KEEP"], "yes")
+            self.assertNotIn("GH_TOKEN", envs[0])
+            self.assertNotIn("GITHUB_APP_TOKEN", envs[0])
+            self.assertEqual(envs[0]["KEEP"], "yes")
             self.assertEqual(envs[0]["VCCP_APP_GH"], "app-gh")
             self.assertEqual(envs[0]["VCCP_APP_GIT_PUSH_BACKEND"], "app-git-push")
             self.assertTrue(Path(envs[0]["GH_CONFIG_DIR"]).is_dir())
@@ -331,6 +336,21 @@ class AdapterTests(unittest.TestCase):
             api.reviews = [{"id": 9, "state": "CHANGES_REQUESTED", "commit_id": SHA, "submitted_at": "now"}]
             candidate = RepairCandidate("o/r", 1, 12, SHA, "fix/12", "reviewer_rejection", "9", "owner")
             self.assertEqual(wired.core.dispatch_repair(candidate)["status"], "launched")
+            # The first page contains a canonical link, but another page may
+            # contain a second closing PR. Partial results cannot authorize repair.
+            api.pr["head"]["sha"] = "b" * 40
+            api.reviews = [{"id": 10, "state": "CHANGES_REQUESTED", "commit_id": "b" * 40,
+                            "submitted_at": "later"}]
+            api.has_next_page = True
+            partial_candidate = RepairCandidate("o/r", 1, 12, "b" * 40, "fix/12",
+                                                "reviewer_rejection", "10", "owner")
+            snapshot = wired.workflow.observe("o/r", 1)
+            self.assertFalse(snapshot.pr_open)
+            self.assertIsNone(snapshot.pr_number)
+            self.assertEqual(wired.core.dispatch_repair(partial_candidate)["status"],
+                             "stale_or_ineligible_repair")
+            self.assertEqual(len(launches), 2)
+            api.has_next_page = False
             api.canonical_events[0]["willCloseTarget"] = False
             no_canonical_link = RepairCandidate("o/r", 1, 12, "b" * 40, "fix/12", "reviewer_rejection", "10", "owner")
             self.assertEqual(wired.core.dispatch_repair(no_canonical_link)["status"], "stale_or_ineligible_repair")

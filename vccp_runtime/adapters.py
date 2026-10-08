@@ -78,6 +78,7 @@ class GitHubWorkflowAdapter:
       repository(owner: $owner, name: $name) {
         issue(number: $number) {
           timelineItems(first: 100, itemTypes: [CROSS_REFERENCED_EVENT]) {
+            pageInfo { hasNextPage }
             nodes {
               ... on CrossReferencedEvent {
                 willCloseTarget
@@ -119,9 +120,13 @@ class GitHubWorkflowAdapter:
         data = self.api.graphql(self._CANONICAL_LINKS_QUERY,
                                 {"owner": owner, "name": name, "number": number})
         issue_node = (data.get("repository") or {}).get("issue") or {}
-        events = ((issue_node.get("timelineItems") or {}).get("nodes") or [])
+        timeline = issue_node.get("timelineItems") or {}
+        events = timeline.get("nodes") or []
         linked_numbers = set()
-        relationship_valid = True
+        page_info = timeline.get("pageInfo")
+        # Never authorize from a partial relationship list. Missing pagination
+        # metadata is also incomplete and therefore fails closed.
+        relationship_valid = isinstance(page_info, dict) and page_info.get("hasNextPage") is False
         for event in events:
             if not isinstance(event, dict):
                 relationship_valid = False
@@ -221,7 +226,8 @@ class AntiGravityImplementer:
     def launch(self, request):
         env = dict(self.environ)
         for key in list(env):
-            if key.upper() in {"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_APP_PRIVATE_KEY"}:
+            if key.upper() in {"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_APP_TOKEN",
+                               "GITHUB_APP_PRIVATE_KEY"}:
                 env.pop(key)
         try:
             guard = self.write_guard.install(self.workspace, request.attempt_id, self.app_git_push, env)
