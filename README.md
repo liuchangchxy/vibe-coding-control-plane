@@ -31,6 +31,12 @@ EasyExam is documented as reference evidence in [EASYEXAM_REFERENCE.md](docs/EAS
 - [Control Plane contract](docs/CONTROL_PLANE_CONTRACT.md)
 - [Onboarding](docs/ONBOARDING.md)
 - [EasyExam reference evidence](docs/EASYEXAM_REFERENCE.md)
-- `vccp_runtime/` — fake-driven, production-independent Python execution core
+- `vccp_runtime/` — SQLite execution core plus production adapters with fake-driven tests
 - `templates/` — consumer manifest, Reviewer task prompt, PR template, and cleanup workflow
 - `scripts/`, `lib/onboarding/`, `schemas/`, and `tests/` — onboarding CLI, shared planner, schemas, and regression tests
+
+## Non-daemon runtime wiring
+
+`vccp_runtime.adapters.build_runtime(manifest, local_config)` wires a schema-v2 consumer manifest to the existing `RuntimeCore`. Keep local settings outside `.github/control-plane.yml`; provide `database_path`, `workspace`, `owner_id`, `antigravity_executable`, `app_gh_executable`, `app_git_push_executable`, and `github_read_token_env` in machine-local configuration. The read token is resolved from the named environment variable and is never persisted by the runtime.
+
+The configured `app-gh` executable is invoked with native `gh issue edit` label arguments and is rejected if configured as ordinary `gh`. Before AgentAPI starts, `WorkspaceWriteGuard` installs a repo-local pre-push hook in Git metadata; direct `git push` is blocked, while a generated shim invokes the configured `app-git-push` with the controlled hook bypass. The AgentAPI environment uses an empty `GH_CONFIG_DIR` and excludes inherited GitHub tokens, so ordinary `gh` cannot use host credentials. The Implementer receives the configured `app-gh` and guarded push paths in its prompt and `VCCP_APP_GH` / `VCCP_APP_GIT_PUSH` environment variables. AntiGravity launch uses `language_server.exe agentapi new-conversation <prompt>` from the configured workspace; only a UUID conversation ID is accepted as confirmation. Launch uncertainty is recorded by `RuntimeCore` using its existing tri-state. This wiring constructs adapters only; it does not start a poller or daemon.
