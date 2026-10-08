@@ -181,6 +181,27 @@ test("unresolved coordination cleanup behavior fails closed for an issues.closed
   });
 });
 
+test("literal extensionless cleanup script takes priority over the .js fallback", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const workflowDir = path.join(root, ".github/workflows");
+    const scriptDir = path.join(root, ".github/scripts");
+    await mkdir(workflowDir, { recursive: true });
+    await mkdir(scriptDir, { recursive: true });
+    await writeFile(path.join(workflowDir, "coordination-label-cleanup.yml"), `name: Coordination Label Cleanup\non:\n  issues:\n    types: [closed]\njobs:\n  cleanup:\n    steps:\n      - run: node .github/scripts/cleanup-coordination-labels\n`);
+    await writeFile(path.join(scriptDir, "cleanup-coordination-labels"), `const ACTIVE_LABELS = ["agent-ready"];
+const TERMINAL_LABELS = ["needs-human"];
+if (TERMINAL_LABELS.some((name) => labels.has(name))) return { removed: [] };
+for (const name of ACTIVE_LABELS) await removeLabel(name);
+`);
+    await writeFile(path.join(scriptDir, "cleanup-coordination-labels.js"), "module.exports = () => {};\n");
+
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
+    assert.equal(plan.overall_status, "repository_blocked");
+    assert.match(plan.items.find((entry) => entry.id === "capability:coordination-label-cleanup").reason, /preserves active coordination labels/);
+  });
+});
+
 test("an overlapping cleanup with unproven behavior blocks instead of assuming compatibility", async () => {
   await withRepo(async (root) => {
     const github = new FakeGitHub();
