@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 from typing import Callable
 from urllib.request import Request, urlopen
@@ -21,10 +22,14 @@ _CONVERSATION_UUID = re.compile(
 
 class GitHubAPI:
     """Small read transport. The write credential boundary is the separate App writer."""
-    def __init__(self, token: str, api_url: str = "https://api.github.com", opener=urlopen):
+    def __init__(self, token: str, api_url: str = "https://api.github.com",
+                 graphql_url: str | None = None, opener=urlopen):
         if not token:
             raise ValueError("GitHub read token is required")
+        if api_url.rstrip("/") != "https://api.github.com" and not graphql_url:
+            raise ValueError("custom GitHub REST API URLs require an explicit GraphQL endpoint")
         self.token, self.api_url, self.opener = token, api_url.rstrip("/"), opener
+        self.graphql_url = graphql_url or "https://api.github.com/graphql"
 
     def get(self, path: str):
         request = Request(self.api_url + path, headers={
@@ -35,7 +40,7 @@ class GitHubAPI:
             return json.loads(response.read().decode("utf-8"))
 
     def graphql(self, query: str, variables: dict):
-        request = Request(self.api_url.rsplit("/", 1)[0] + "/graphql",
+        request = Request(self.graphql_url,
                           data=json.dumps({"query": query, "variables": variables}).encode("utf-8"),
                           headers={"Authorization": f"Bearer {self.token}",
                                    "Accept": "application/vnd.github+json",
@@ -101,9 +106,14 @@ class GitHubWorkflowAdapter:
         issue = self.api.get(f"/repos/{repo}/issues/{number}")
         labels = self._labels(issue)
         active = [x for x in self.policy["active_coordination_labels"] if x in labels]
-        state = active[0] if len(active) == 1 else "invalid"
-        frozen = self.policy["frozen_spec_label"] in labels
         terminal = tuple(x for x in self.policy["terminal_coordination_labels"] if x in labels)
+        if len(active) == 1 and not terminal:
+            state = active[0]
+        elif not active and len(terminal) == 1:
+            state = terminal[0]
+        else:
+            state = "invalid"
+        frozen = self.policy["frozen_spec_label"] in labels
         revision = str(issue.get("updated_at", ""))
         owner, name = repo.split("/", 1)
         data = self.api.graphql(self._CANONICAL_LINKS_QUERY,
@@ -163,15 +173,20 @@ class GitHubWorkflowAdapter:
         if before.revision != str(expected_revision) or before.coordination_state != expected_state or \
                 before.terminal_labels or before.canceled or not before.issue_open:
             return False
-        if expected_state not in self.policy["active_coordination_labels"] or \
-                new_state not in self.policy["active_coordination_labels"]:
+        allowed_target = new_state in self.policy["active_coordination_labels"] or (
+            new_state == "needs-human" and new_state in self.policy["terminal_coordination_labels"]
+        )
+        if expected_state not in self.policy["active_coordination_labels"] or not allowed_target:
             return False
         remove = [x for x in self.policy["active_coordination_labels"] if x != new_state and x == expected_state]
         if not self.writer.replace_labels(repo, issue_number, remove, [new_state]):
             return False
         after = self._facts(repo, issue_number)
-        return (after.issue_open and not after.terminal_labels and not after.canceled
-                and after.coordination_state == new_state)
+        terminal_target = new_state == "needs-human"
+        target_verified = after.coordination_state == new_state and (
+            after.terminal_labels == ("needs-human",) if terminal_target else not after.terminal_labels
+        )
+        return after.issue_open and not after.canceled and target_verified
 
 
 def generic_prompt(request: LaunchRequest, workspace: str, policy: dict,
@@ -194,11 +209,12 @@ def generic_prompt(request: LaunchRequest, workspace: str, policy: dict,
 
 class AntiGravityImplementer:
     def __init__(self, executable: str, workspace: str, app_gh: str, app_git_push: str,
-                 runner: Callable = subprocess.run, timeout: int = 60, environ=None):
+                 runner: Callable = subprocess.run, timeout: int = 60, environ=None, write_guard=None):
         self.executable, self.workspace = executable, workspace
         self.app_gh, self.app_git_push = app_gh, app_git_push
         self.runner, self.timeout = runner, timeout
         self.environ = os.environ if environ is None else environ
+        self.write_guard = write_guard or WorkspaceWriteGuard()
         if not executable or not workspace or not app_gh or not app_git_push:
             raise ValueError("language server, workspace, app-gh, and app-git-push are required")
 
@@ -207,9 +223,16 @@ class AntiGravityImplementer:
         for key in list(env):
             if key.upper() in {"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_APP_PRIVATE_KEY"}:
                 env.pop(key)
+        try:
+            guard = self.write_guard.install(self.workspace, request.attempt_id, self.app_git_push, env)
+        except Exception:
+            # A missing/failed guard proves the external AgentAPI command was never invoked.
+            return LaunchResult(LaunchDisposition.DEFINITELY_NOT_STARTED)
+        env.update(guard.environment)
         env["VCCP_APP_GH"] = self.app_gh
-        env["VCCP_APP_GIT_PUSH"] = self.app_git_push
-        prompt = generic_prompt(request, self.workspace, self._policy, self.app_gh, self.app_git_push)
+        env["VCCP_APP_GIT_PUSH_BACKEND"] = self.app_git_push
+        env["VCCP_APP_GIT_PUSH"] = guard.git_push_command
+        prompt = generic_prompt(request, self.workspace, self._policy, self.app_gh, guard.git_push_command)
         try:
             result = self.runner([self.executable, "agentapi", "new-conversation", prompt],
                                  cwd=self.workspace, env=env, text=True, capture_output=True, check=False,
@@ -256,6 +279,110 @@ class AntiGravityImplementer:
         return None
 
     _policy = {"repository": {"base_branch": ""}}
+
+
+@dataclass(frozen=True)
+class WorkspaceGuard:
+    git_push_command: str
+    environment: dict[str, str]
+
+
+class WorkspaceWriteGuard:
+    """Install a repo-local pre-push fence and an authorized wrapper under the Git dir."""
+
+    def __init__(self, runner: Callable = subprocess.run):
+        self.runner = runner
+
+    def install(self, workspace: str, attempt_id: str, app_git_push: str,
+                inherited_environment: dict | None = None) -> WorkspaceGuard:
+        result = self.runner(["git", "rev-parse", "--absolute-git-dir"], cwd=workspace,
+                             text=True, capture_output=True, check=False)
+        if result.returncode != 0 or not result.stdout.strip():
+            raise RuntimeError("cannot locate workspace Git directory")
+        git_dir = Path(result.stdout.strip())
+        if not git_dir.is_absolute():
+            git_dir = (Path(workspace) / git_dir).resolve()
+        current_hooks = self.runner(["git", "config", "--get", "core.hooksPath"], cwd=workspace,
+                                    text=True, capture_output=True, check=False)
+        if current_hooks.returncode not in (0, 1):
+            raise RuntimeError("cannot inspect existing Git hook configuration")
+        if current_hooks.returncode == 0:
+            configured_hooks = Path(current_hooks.stdout.strip())
+            if not configured_hooks.is_absolute():
+                configured_hooks = (Path(workspace) / configured_hooks).resolve()
+            managed_root = (git_dir / "vccp-control").resolve()
+            previous_hook = configured_hooks / "pre-push"
+            if not configured_hooks.resolve().is_relative_to(managed_root) or not previous_hook.is_file() \
+                    or "# VCCP fail-closed pre-push guard v1" not in previous_hook.read_text(encoding="utf-8"):
+                raise RuntimeError("existing Git hook configuration cannot be safely composed")
+        safe_id = re.sub(r"[^A-Za-z0-9._-]", "_", attempt_id)
+        if not safe_id or safe_id in {".", ".."}:
+            raise ValueError("invalid launch identity for workspace guard")
+        root = git_dir / "vccp-control" / safe_id
+        root.parent.mkdir(parents=True, exist_ok=True)
+        root.mkdir(exist_ok=False)
+        config_written = False
+        try:
+            hooks = root / "hooks"
+            hooks.mkdir()
+            gh_config = root / "gh-config"
+            gh_config.mkdir()
+            hook = hooks / "pre-push"
+            hook.write_text(
+                '#!/bin/sh\n'
+                '# VCCP fail-closed pre-push guard v1\n'
+                'if [ "${VCCP_CONTROLLED_PUSH:-}" = "1" ]; then exit 0; fi\n'
+                "echo 'Direct git push is disabled; use the configured controlled push wrapper.' >&2\n"
+                "exit 1\n",
+                encoding="utf-8",
+            )
+            wrapper = root / ("app-git-push.cmd" if os.name == "nt" else "app-git-push")
+            if os.name == "nt":
+                if any(c in app_git_push for c in ('"', "%", "\r", "\n")):
+                    raise ValueError("controlled push path cannot be represented safely by the Windows shim")
+                wrapper.write_text(
+                    '@echo off\r\nsetlocal\r\nset "VCCP_CONTROLLED_PUSH=1"\r\n'
+                    f'call "{app_git_push}" %*\r\nexit /b %ERRORLEVEL%\r\n',
+                    encoding="utf-8",
+                )
+            else:
+                wrapper.write_text(
+                    "#!/bin/sh\nVCCP_CONTROLLED_PUSH=1 export VCCP_CONTROLLED_PUSH\n"
+                    f"exec {shlex.quote(app_git_push)} \"$@\"\n",
+                    encoding="utf-8",
+                )
+                wrapper.chmod(0o700)
+                hook.chmod(0o700)
+            configured = self.runner(["git", "config", "--local", "core.hooksPath", str(hooks)],
+                                     cwd=workspace, text=True, capture_output=True, check=False)
+            if configured.returncode != 0:
+                maybe_configured = self.runner(["git", "config", "--local", "--get", "core.hooksPath"],
+                                               cwd=workspace, text=True, capture_output=True, check=False)
+                config_written = (maybe_configured.returncode == 0
+                                  and Path(maybe_configured.stdout.strip()).resolve() == hooks.resolve())
+                raise RuntimeError("cannot persist repo-local fail-closed Git hook")
+            config_written = True
+            verify = self.runner(["git", "config", "--local", "--get", "core.hooksPath"], cwd=workspace,
+                                 text=True, capture_output=True, check=False)
+            if verify.returncode != 0 or Path(verify.stdout.strip()).resolve() != hooks.resolve():
+                raise RuntimeError("repo-local Git hook verification failed")
+            try:
+                config_count = int((inherited_environment or os.environ).get("GIT_CONFIG_COUNT", "0"))
+            except ValueError as error:
+                raise RuntimeError("invalid inherited Git config environment") from error
+            env = {
+                "GIT_CONFIG_COUNT": str(config_count + 1),
+                f"GIT_CONFIG_KEY_{config_count}": "core.hooksPath",
+                f"GIT_CONFIG_VALUE_{config_count}": str(hooks),
+                "GH_CONFIG_DIR": str(gh_config),
+                "GH_PROMPT_DISABLED": "1",
+            }
+            return WorkspaceGuard(str(wrapper), env)
+        except Exception:
+            if not config_written:
+                import shutil
+                shutil.rmtree(root, ignore_errors=True)
+            raise
 
 
 @dataclass(frozen=True)

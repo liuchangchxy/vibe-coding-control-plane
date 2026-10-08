@@ -1,11 +1,14 @@
 import json
+import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from vccp_runtime.adapters import (AntiGravityImplementer, GitHubAPI, GitHubAppWriter, GitHubWorkflowAdapter, build_runtime,
-                                   generic_prompt)
+from vccp_runtime.adapters import (AntiGravityImplementer, GitHubAPI, GitHubAppWriter, GitHubWorkflowAdapter,
+                                   WorkspaceWriteGuard, build_runtime, generic_prompt)
 from vccp_runtime.core import LaunchDisposition, LaunchRequest, RepairCandidate
 
 
@@ -52,6 +55,38 @@ class MutatingWriter(FakeWriter):
             self.api.issue["labels"].extend({"name": x} for x in add)
             self.api.issue["updated_at"] += "+"
         return self.success
+
+
+class FakeProductionCommands:
+    def __init__(self, api):
+        self.api = api
+        self.app_edits = []
+        self.agent_launches = []
+
+    def __call__(self, args, **kwargs):
+        if args[0] == "controlled-app-gh.exe":
+            self.app_edits.append(list(args))
+            remove = [args[i + 1] for i, value in enumerate(args[:-1]) if value == "--remove-label"]
+            add = [args[i + 1] for i, value in enumerate(args[:-1]) if value == "--add-label"]
+            self.api.issue["labels"] = [label for label in self.api.issue["labels"]
+                                         if label["name"] not in remove]
+            self.api.issue["labels"].extend({"name": label} for label in add)
+            self.api.issue["updated_at"] += "+"
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if args[0] == "language_server.exe":
+            self.agent_launches.append(list(args))
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"conversation_id": CONVERSATION_ID}), stderr="")
+        raise AssertionError(f"unexpected production command: {args[0]}")
+
+
+def init_git_repo(path):
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", str(path)], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(path), "-c", "user.name=VCCP Test", "-c",
+                    "user.email=vccp-test@example.invalid", "commit", "--allow-empty", "-m", "baseline"],
+                   check=True, capture_output=True, text=True)
+    return path
 
 
 def linked_api(review=True):
@@ -122,8 +157,14 @@ class AdapterTests(unittest.TestCase):
         api = GitHubAPI("read-token", opener=lambda request, **kwargs: (seen.append(request) or Response()))
         self.assertEqual(api.graphql("query { viewer { login } }", {}), {"ok": True})
         self.assertEqual(seen[0].get_method(), "POST")
-        self.assertTrue(seen[0].full_url.endswith("/graphql"))
+        self.assertEqual(seen[0].full_url, "https://api.github.com/graphql")
         self.assertEqual(seen[0].get_header("Authorization"), "Bearer read-token")
+        with self.assertRaises(ValueError): GitHubAPI("read-token", api_url="https://ghe.example/api/v3")
+        custom = GitHubAPI("read-token", api_url="https://ghe.example/api/v3",
+                           graphql_url="https://ghe.example/api/graphql",
+                           opener=lambda request, **kwargs: (seen.append(request) or Response()))
+        custom.graphql("query { viewer { login } }", {})
+        self.assertEqual(seen[-1].full_url, "https://ghe.example/api/graphql")
 
     def test_transition_checks_revision_uses_app_writer_and_verifies(self):
         api = FakeAPI(); writer = MutatingWriter(api)
@@ -136,6 +177,13 @@ class AdapterTests(unittest.TestCase):
         mismatch = GitHubWorkflowAdapter(mismatch_api, FakeWriter(), MANIFEST)
         self.assertFalse(mismatch.transition_coordination_state("o/r", 1, "agent-ready", "agent-working", "r1"))
 
+        self.assertTrue(adapter.transition_coordination_state("o/r", 1, "agent-working", "needs-human", "r1+"))
+        terminal = adapter.observe("o/r", 1)
+        self.assertEqual((terminal.coordination_state, terminal.terminal_labels), ("needs-human", ("needs-human",)))
+        call_count = len(writer.calls)
+        self.assertFalse(adapter.transition_coordination_state("o/r", 1, "needs-human", "agent-ready", terminal.revision))
+        self.assertEqual(len(writer.calls), call_count)
+
     def test_app_gh_writer_uses_native_issue_edit_arguments(self):
         seen = []
         writer = GitHubAppWriter("C:/controlled/app-gh.exe",
@@ -143,38 +191,96 @@ class AdapterTests(unittest.TestCase):
         self.assertTrue(writer.replace_labels("o/r", 3, ["agent-ready"], ["agent-working"]))
         self.assertEqual(seen[0], ["C:/controlled/app-gh.exe", "issue", "edit", "3", "--repo", "o/r",
                                    "--remove-label", "agent-ready", "--add-label", "agent-working"])
+        with self.assertRaises(ValueError): GitHubAppWriter("gh")
 
     def test_antigravity_tristate_and_secret_stripping(self):
-        calls, envs = [], []
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = init_git_repo(Path(temp) / "repo")
+            calls, envs, events = [], [], []
+            real_guard = WorkspaceWriteGuard()
+            class RecordingGuard:
+                def install(self, *args):
+                    result = real_guard.install(*args)
+                    events.append("guard-installed")
+                    return result
+            adapter = AntiGravityImplementer("language_server.exe", str(workspace), "app-gh", "app-git-push",
+                                             environ={"GH_TOKEN": "secret", "KEEP": "yes"},
+                                             write_guard=RecordingGuard())
+            req = LaunchRequest("o/r", 1, "attempt", "initial_dispatch")
+            response = SimpleNamespace(returncode=0, stdout=json.dumps({"response": {
+                "newConversation": {"conversationId": CONVERSATION_ID}}}))
+            def runner(args, **kwargs):
+                events.append("agentapi")
+                calls.append(args); envs.append(kwargs["env"]); return response
+            adapter.runner = runner
+            result = adapter.launch(req)
+            self.assertEqual((result.disposition, result.execution_id), (LaunchDisposition.CONFIRMED, CONVERSATION_ID))
+            self.assertEqual(events, ["guard-installed", "agentapi"])
+            self.assertEqual(calls[0][:3], ["language_server.exe", "agentapi", "new-conversation"])
+            self.assertIn("Controlled GitHub writer: app-gh", calls[0][-1])
+            self.assertIn("Controlled git push wrapper:", calls[0][-1])
+            self.assertNotIn("GH_TOKEN", envs[0]); self.assertEqual(envs[0]["KEEP"], "yes")
+            self.assertEqual(envs[0]["VCCP_APP_GH"], "app-gh")
+            self.assertEqual(envs[0]["VCCP_APP_GIT_PUSH_BACKEND"], "app-git-push")
+            self.assertTrue(Path(envs[0]["GH_CONFIG_DIR"]).is_dir())
+            self.assertTrue(Path(envs[0]["VCCP_APP_GIT_PUSH"]).is_file())
+            for index, response in enumerate([
+                    SimpleNamespace(returncode=1, stdout=json.dumps({"conversationId": CONVERSATION_ID})),
+                    SimpleNamespace(returncode=0, stdout="{}"),
+                    SimpleNamespace(returncode=0, stdout="not-json"),
+                    SimpleNamespace(returncode=0, stdout=json.dumps({"error": "failed", "response": {
+                        "newConversation": {"conversationId": CONVERSATION_ID}}})),
+                    SimpleNamespace(returncode=0, stdout='{"conversation_id":"conv_123"}'),
+                    SimpleNamespace(returncode=0, stdout='{"conversation_id":"exec-1"}'),
+                    SimpleNamespace(returncode=0, stdout=json.dumps({"id": CONVERSATION_ID}))]):
+                adapter.runner = lambda args, **kw: response
+                req_variant = LaunchRequest("o/r", 1, f"attempt-{index}", "initial_dispatch")
+                self.assertEqual(adapter.launch(req_variant).disposition, LaunchDisposition.UNKNOWN)
+            adapter.runner = lambda *a, **kw: (_ for _ in ()).throw(TimeoutError())
+            self.assertEqual(adapter.launch(LaunchRequest("o/r", 1, "attempt-timeout", "initial_dispatch")).disposition,
+                             LaunchDisposition.UNKNOWN)
+            adapter.runner = lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError())
+            self.assertEqual(adapter.launch(LaunchRequest("o/r", 1, "attempt-missing", "initial_dispatch")).disposition,
+                             LaunchDisposition.DEFINITELY_NOT_STARTED)
+
+    def test_guard_failure_prevents_agentapi_invocation(self):
+        calls = []
+        class FailedGuard:
+            def install(self, *args): raise RuntimeError("cannot install guard")
         adapter = AntiGravityImplementer("language_server.exe", "workspace", "app-gh", "app-git-push",
-                                         environ={"GH_TOKEN": "secret", "KEEP": "yes"})
-        req = LaunchRequest("o/r", 1, "attempt", "initial_dispatch")
-        result_value = SimpleNamespace(returncode=0, stdout=json.dumps({"response": {"newConversation": {"conversationId": CONVERSATION_ID}}}))
-        def runner(args, **kwargs):
-            calls.append(args); envs.append(kwargs["env"]); return result_value
-        adapter.runner = runner
-        result = adapter.launch(req)
-        self.assertEqual((result.disposition, result.execution_id), (LaunchDisposition.CONFIRMED, CONVERSATION_ID))
-        self.assertEqual(calls[0][:3], ["language_server.exe", "agentapi", "new-conversation"])
-        self.assertIn("Controlled GitHub writer: app-gh", calls[0][-1])
-        self.assertIn("Controlled git push wrapper: app-git-push", calls[0][-1])
-        self.assertNotIn("GH_TOKEN", envs[0]); self.assertEqual(envs[0]["KEEP"], "yes")
-        self.assertEqual(envs[0], {"KEEP": "yes", "VCCP_APP_GH": "app-gh",
-                                   "VCCP_APP_GIT_PUSH": "app-git-push"})
-        for response in [SimpleNamespace(returncode=1, stdout=json.dumps({"conversationId": CONVERSATION_ID})),
-                         SimpleNamespace(returncode=0, stdout="{}"),
-                         SimpleNamespace(returncode=0, stdout="not-json"),
-                         SimpleNamespace(returncode=0, stdout=json.dumps({"error": "failed", "response": {
-                             "newConversation": {"conversationId": CONVERSATION_ID}}})),
-                         SimpleNamespace(returncode=0, stdout='{"conversation_id":"conv_123"}'),
-                         SimpleNamespace(returncode=0, stdout='{"conversation_id":"exec-1"}'),
-                         SimpleNamespace(returncode=0, stdout=json.dumps({"id": CONVERSATION_ID}))]:
-            adapter.runner = lambda args, **kw: response
-            self.assertEqual(adapter.launch(req).disposition, LaunchDisposition.UNKNOWN)
-        adapter.runner = lambda *a, **kw: (_ for _ in ()).throw(TimeoutError())
-        self.assertEqual(adapter.launch(req).disposition, LaunchDisposition.UNKNOWN)
-        adapter.runner = lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError())
-        self.assertEqual(adapter.launch(req).disposition, LaunchDisposition.DEFINITELY_NOT_STARTED)
+                                         runner=lambda *a, **kw: calls.append(a), write_guard=FailedGuard())
+        result = adapter.launch(LaunchRequest("o/r", 1, "attempt-failed", "initial_dispatch"))
+        self.assertEqual(result.disposition, LaunchDisposition.DEFINITELY_NOT_STARTED)
+        self.assertEqual(calls, [])
+
+    def test_workspace_guard_blocks_direct_push_without_tracked_changes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = init_git_repo(Path(temp) / "repo")
+            remote = Path(temp) / "remote.git"
+            subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True, text=True)
+            subprocess.run(["git", "-C", str(workspace), "remote", "add", "origin", str(remote)],
+                           check=True, capture_output=True)
+            before = subprocess.run(["git", "status", "--porcelain"], cwd=workspace, capture_output=True, text=True)
+            guard = WorkspaceWriteGuard().install(str(workspace), "guarded-attempt", shutil.which("git"))
+            env = dict(os.environ); env.update(guard.environment)
+            blocked = subprocess.run(["git", "push", "origin", "HEAD"], cwd=workspace,
+                                     capture_output=True, text=True, timeout=10)
+            after = subprocess.run(["git", "status", "--porcelain"], cwd=workspace, capture_output=True, text=True)
+            self.assertNotEqual(blocked.returncode, 0)
+            self.assertIn("Direct git push is disabled", blocked.stderr)
+            self.assertEqual(before.stdout, after.stdout)
+            self.assertTrue(Path(guard.git_push_command).is_file())
+            wrapper = Path(guard.git_push_command).read_text(encoding="utf-8")
+            self.assertIn(Path(shutil.which("git")).name, wrapper)
+            self.assertIn("VCCP_CONTROLLED_PUSH=1", wrapper)
+            self.assertEqual(list(Path(guard.environment["GH_CONFIG_DIR"]).iterdir()), [])
+            if os.name == "nt":
+                controlled_command = ["cmd", "/c", guard.git_push_command, "push", "origin", "HEAD"]
+            else:
+                controlled_command = [guard.git_push_command, "push", "origin", "HEAD"]
+            controlled = subprocess.run(controlled_command, cwd=workspace, env=env,
+                                        capture_output=True, text=True, timeout=10)
+            self.assertEqual(controlled.returncode, 0, controlled.stderr)
 
     def test_prompt_generic_and_repair_is_exact(self):
         prompt = generic_prompt(LaunchRequest("o/r", 3, "a", "repair", repair_ordinal=2,
@@ -192,11 +298,12 @@ class AdapterTests(unittest.TestCase):
     def test_runtime_wiring_real_core_initial_and_schema_guard(self):
         with tempfile.TemporaryDirectory() as temp:
             api = FakeAPI(); launches = []
+            workspace = init_git_repo(Path(temp) / "repo")
             def runner(args, **kwargs):
                 self.assertEqual(args[:2], ["language_server.exe", "agentapi"])
                 launches.append(args[-1])
                 return SimpleNamespace(returncode=0, stdout=json.dumps({"conversation_id": CONVERSATION_ID}))
-            local = {"database_path": str(Path(temp)/"db.sqlite"), "workspace": temp, "owner_id": "owner",
+            local = {"database_path": str(Path(temp)/"db.sqlite"), "workspace": str(workspace), "owner_id": "owner",
                      "antigravity_executable": "language_server.exe", "app_gh_executable": "app-gh.exe",
                      "app_git_push_executable": "app-git-push.exe", "github_read_token_env": "TOKEN"}
             wired = build_runtime(MANIFEST, local, api=api, writer=MutatingWriter(api), runner=runner)
@@ -208,10 +315,11 @@ class AdapterTests(unittest.TestCase):
     def test_exact_head_repair_and_stale_review_launch_counts(self):
         with tempfile.TemporaryDirectory() as temp:
             api = FakeAPI(); writer = FakeWriter(); launches = []
+            workspace = init_git_repo(Path(temp) / "repo")
             def runner(args, **kwargs):
                 self.assertEqual(args[:3], ["language_server.exe", "agentapi", "new-conversation"])
                 launches.append(args[-1]); return SimpleNamespace(returncode=0, stdout=json.dumps({"conversation_id": CONVERSATION_ID}))
-            local = {"database_path": str(Path(temp)/"db.sqlite"), "workspace": temp, "owner_id": "owner",
+            local = {"database_path": str(Path(temp)/"db.sqlite"), "workspace": str(workspace), "owner_id": "owner",
                      "antigravity_executable": "language_server.exe", "app_gh_executable": "app-gh.exe",
                      "app_git_push_executable": "app-git-push.exe", "github_read_token_env": "TOKEN"}
             wired = build_runtime(MANIFEST, local, api, MutatingWriter(api), runner)
@@ -232,6 +340,43 @@ class AdapterTests(unittest.TestCase):
             candidate2 = RepairCandidate("o/r", 1, 12, "c" * 40, "fix/12", "reviewer_rejection", "10", "owner")
             self.assertEqual(wired.core.dispatch_repair(candidate2)["status"], "stale_or_ineligible_repair")
             self.assertEqual(len(launches), 2)
+
+    def test_real_core_exhausted_repair_budget_transitions_through_app_gh(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = init_git_repo(Path(temp) / "repo")
+            api = FakeAPI()
+            commands = FakeProductionCommands(api)
+            local = {"database_path": str(Path(temp) / "runtime.sqlite"), "workspace": str(workspace),
+                     "owner_id": "owner", "antigravity_executable": "language_server.exe",
+                     "app_gh_executable": "controlled-app-gh.exe",
+                     "app_git_push_executable": "controlled-app-git-push.exe",
+                     "github_read_token_env": "TOKEN"}
+            runtime = build_runtime(MANIFEST, local, api=api, runner=commands)
+            initial = runtime.core.dispatch_initial("o/r", 1, "owner")
+            self.assertEqual(initial["status"], "launched")
+            api.canonical_events = [{"willCloseTarget": True,
+                                     "source": {"__typename": "PullRequest", "number": 12}}]
+            api.pr = {"number": 12, "state": "open", "base": {"ref": "main"},
+                      "user": {"login": "agent"}, "head": {"sha": "0" * 40, "ref": "fix/12"}}
+            for ordinal in range(1, 4):
+                head = f"{ordinal:040x}"
+                api.pr["head"]["sha"] = head
+                candidate = RepairCandidate("o/r", 1, 12, head, "fix/12", "implementation_failure",
+                                            f"check-{ordinal}", "owner")
+                self.assertEqual(runtime.core.dispatch_repair(candidate)["status"], "launched")
+            fourth_head = f"{4:040x}"
+            api.pr["head"]["sha"] = fourth_head
+            fourth = RepairCandidate("o/r", 1, 12, fourth_head, "fix/12", "implementation_failure",
+                                     "check-4", "owner")
+            result = runtime.core.dispatch_repair(fourth)
+            self.assertTrue(result["needs_human_transitioned"])
+            self.assertEqual(runtime.workflow.observe("o/r", 1).coordination_state, "needs-human")
+            self.assertEqual(len(commands.agent_launches), 4)
+            self.assertIn("issue", commands.app_edits[-1])
+            self.assertIn("--remove-label", commands.app_edits[-1])
+            self.assertIn("agent-working", commands.app_edits[-1])
+            self.assertIn("--add-label", commands.app_edits[-1])
+            self.assertIn("needs-human", commands.app_edits[-1])
 
 
 if __name__ == "__main__": unittest.main()
