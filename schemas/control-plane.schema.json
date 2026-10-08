@@ -6,7 +6,7 @@
   "additionalProperties": false,
   "required": ["schema_version", "vccp", "repository", "issue_contract", "reviewer", "merge", "reporting"],
   "properties": {
-    "schema_version": { "const": 1 },
+    "schema_version": { "const": 2 },
     "vccp": {
       "type": "object", "additionalProperties": false,
       "required": ["source", "revision"],
@@ -25,12 +25,12 @@
     },
     "issue_contract": {
       "type": "object", "additionalProperties": false,
-      "required": ["frozen_spec_label", "active_coordination_labels", "terminal_coordination_labels", "max_request_changes_rounds"],
+      "required": ["frozen_spec_label", "active_coordination_labels", "terminal_coordination_labels", "max_automated_repairs"],
       "properties": {
         "frozen_spec_label": { "const": "frozen-spec" },
         "active_coordination_labels": { "const": ["agent-ready", "agent-working", "changes-requested"] },
         "terminal_coordination_labels": { "const": ["infra-blocked", "needs-human"] },
-        "max_request_changes_rounds": { "const": 3 }
+        "max_automated_repairs": { "const": 3 }
       }
     },
     "reviewer": {
