@@ -31,5 +31,6 @@ EasyExam is documented as reference evidence in [EASYEXAM_REFERENCE.md](docs/EAS
 - [Control Plane contract](docs/CONTROL_PLANE_CONTRACT.md)
 - [Onboarding](docs/ONBOARDING.md)
 - [EasyExam reference evidence](docs/EASYEXAM_REFERENCE.md)
+- `vccp_runtime/` — fake-driven, production-independent Python execution core
 - `templates/` — consumer manifest, Reviewer task prompt, PR template, and cleanup workflow
-- `scripts/`, `lib/onboarding/`, `schemas/`, and `tests/` — onboarding CLI, shared planner, schemas, and focused tests
+- `scripts/`, `lib/onboarding/`, `schemas/`, and `tests/` — onboarding CLI, shared planner, schemas, and regression tests
