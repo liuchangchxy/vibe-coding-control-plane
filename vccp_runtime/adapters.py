@@ -168,28 +168,47 @@ class GitHubWorkflowAdapter:
             formal_review_state=current_review.get("state") if current_review else None,
             formal_review_id=str(current_review.get("id")) if current_review else None,
             formal_review_head_sha=current_review.get("commit_id") if current_review else None,
+            canonical_relationship_valid=relationship_valid,
+            canonical_link_count=len(linked_numbers),
         )
 
     def observe(self, repo, issue_number):
         return self._facts(repo, issue_number)
+
+    def discover_active(self, repo):
+        """List only already-active recovery candidates; agent-ready is never queried."""
+        import urllib.parse
+        found = set()
+        for label in ("agent-working", "changes-requested"):
+            query = urllib.parse.urlencode({"state": "open", "labels": label, "per_page": 100})
+            result = self.api.get(f"/repos/{repo}/issues?{query}")
+            if not isinstance(result, list):
+                raise RuntimeError("GitHub active recovery discovery returned an invalid response")
+            if len(result) >= 100:
+                raise RuntimeError("GitHub active recovery discovery may be incomplete; refusing partial scan")
+            for issue in result:
+                if isinstance(issue, dict) and "pull_request" not in issue:
+                    number = issue.get("number")
+                    if isinstance(number, int) and number > 0:
+                        found.add(number)
+        return sorted(found)
 
     def transition_coordination_state(self, repo, issue_number, expected_state, new_state, expected_revision):
         before = self._facts(repo, issue_number)
         if before.revision != str(expected_revision) or before.coordination_state != expected_state or \
                 before.terminal_labels or before.canceled or not before.issue_open:
             return False
-        allowed_target = new_state in self.policy["active_coordination_labels"] or (
-            new_state == "needs-human" and new_state in self.policy["terminal_coordination_labels"]
-        )
+        allowed_target = (new_state in self.policy["active_coordination_labels"]
+                          or new_state in self.policy["terminal_coordination_labels"])
         if expected_state not in self.policy["active_coordination_labels"] or not allowed_target:
             return False
         remove = [x for x in self.policy["active_coordination_labels"] if x != new_state and x == expected_state]
         if not self.writer.replace_labels(repo, issue_number, remove, [new_state]):
             return False
         after = self._facts(repo, issue_number)
-        terminal_target = new_state == "needs-human"
+        terminal_target = new_state in self.policy["terminal_coordination_labels"]
         target_verified = after.coordination_state == new_state and (
-            after.terminal_labels == ("needs-human",) if terminal_target else not after.terminal_labels
+            after.terminal_labels == (new_state,) if terminal_target else not after.terminal_labels
         )
         return after.issue_open and not after.canceled and target_verified
 
@@ -413,5 +432,6 @@ def build_runtime(manifest: dict, local_config: dict, api=None, writer=None, run
                                         local_config["app_gh_executable"], local_config["app_git_push_executable"], runner,
                                         local_config.get("launch_timeout_seconds", 60))
     implementer._policy = manifest
-    core = RuntimeCore(local_config["database_path"], manifest, workflow, implementer)
+    core = RuntimeCore(local_config["database_path"], manifest, workflow, implementer,
+                       recovery_timeout_seconds=local_config.get("recovery_timeout_seconds", 900))
     return RuntimeAdapters(core, workflow, implementer)
