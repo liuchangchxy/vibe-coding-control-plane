@@ -64,6 +64,40 @@ async function withRepo(fn) {
   } finally { await rm(root, { recursive: true, force: true }); }
 }
 
+async function writeCleanupWorkflow(root, workflowName, scriptName, script) {
+  const workflowDir = path.join(root, ".github/workflows");
+  const scriptDir = path.join(root, ".github/scripts");
+  await mkdir(workflowDir, { recursive: true });
+  await mkdir(scriptDir, { recursive: true });
+  await writeFile(path.join(workflowDir, workflowName), `on:\n  issues:\n    types: [closed]\njobs:\n  cleanup:\n    steps:\n      - run: node .github/scripts/${scriptName}\n`);
+  await writeFile(path.join(scriptDir, scriptName), script);
+}
+
+function localEnrollment(root) {
+  return {
+    database_path: path.join(root, "local-state", "runtime.sqlite"),
+    workspace: root,
+    target_repository: REPO,
+    enrollment: { authorized_repository: REPO },
+    owner_id: "test-owner",
+    antigravity_executable: path.join(root, "language_server.exe"),
+  };
+}
+
+async function readinessReport(root, github, localConfig = localEnrollment(root)) {
+  const configPath = path.join(root, "runtime-config.json");
+  await writeFile(configPath, JSON.stringify(localConfig));
+  let output = "";
+  const code = await runOnboardingCli(["readiness", "--repo", REPO, "--path", root, "--runtime-config", configPath], {
+    stdout: { write: (text) => { output += text; } },
+    stderr: { write: (text) => assert.fail(text) },
+    githubFactory: () => github,
+    runtimeQualifier: async () => ({ runtime_activation: { status: "ready", blockers: [] } }),
+    runtimeRevision: REV_A,
+  });
+  return { code, report: JSON.parse(output) };
+}
+
 test("fresh input creates a read-only plan pinned to a reachable canonical revision", async () => {
   await withRepo(async (root) => {
     const github = new FakeGitHub();
@@ -79,6 +113,9 @@ test("fresh input creates a read-only plan pinned to a reachable canonical revis
     assert.equal(plan.external_steps.find((item) => item.id === "reviewer-task").status, "external-step");
     assert.equal(plan.external_steps.some((item) => item.id === "dispatcher"), false);
     assert.equal(plan.runtime_activation.status, "unknown");
+    assert.equal(plan.machine_authorization.status, "unknown");
+    assert.equal(plan.machine_activation.status, "unknown");
+    assert.equal(plan.repository_status, "changes_planned");
     assert.equal(github.labelCreates.length, 0);
     await assert.rejects(readFile(path.join(root, ".github/control-plane.yml")));
   });
@@ -94,6 +131,21 @@ test("clean consumer plans VCCP cleanup creation and an exact managed cleanup is
     const second = await createOnboardingPlan({ repo: REPO, root, github });
     assert.equal(second.overall_status, "repository_ready");
     assert.equal(second.items.find((entry) => entry.path === ".github/workflows/vccp-coordination-label-cleanup.yml").status, "satisfied");
+  });
+});
+
+test("consumer-owned equivalent cleanup satisfies the capability without a VCCP adapter", async () => {
+  await withRepo(async (root) => {
+    const workflowDir = path.join(root, ".github/workflows");
+    const scriptDir = path.join(root, ".github/scripts");
+    await mkdir(workflowDir, { recursive: true });
+    await mkdir(scriptDir, { recursive: true });
+    await writeFile(path.join(workflowDir, "close-housekeeping.yml"), "on:\n  issues:\n    types: [closed]\njobs:\n  cleanup:\n    steps:\n      - run: node .github/scripts/prune-coordination.js\n");
+    await writeFile(path.join(scriptDir, "prune-coordination.js"), "const ACTIVE_LABELS = ['agent-ready', 'agent-working', 'changes-requested'];\nconst TERMINAL_LABELS = ['infra-blocked', 'needs-human'];\nfor (const label of ACTIVE_LABELS) await removeLabel(label);\n");
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github: new FakeGitHub() });
+    assert.equal(plan.capabilities["coordination-label-cleanup"].status, "satisfied");
+    assert.equal(plan.capabilities["coordination-label-cleanup"].provider, "consumer");
+    assert.equal(plan.items.some((entry) => entry.path === ".github/workflows/vccp-coordination-label-cleanup.yml"), false);
   });
 });
 
@@ -215,6 +267,40 @@ test("an overlapping cleanup with unproven behavior blocks instead of assuming c
     const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
     assert.equal(plan.overall_status, "repository_blocked");
     assert.match(plan.items.find((entry) => entry.id === "capability:coordination-label-cleanup").reason, /cannot be proven compatible/);
+  });
+});
+
+test("cleanup aggregation returns conflict when a later-sorting workflow conflicts", async () => {
+  await withRepo(async (root) => {
+    const compatible = "const ACTIVE_LABELS = ['agent-ready', 'agent-working', 'changes-requested'];\nconst TERMINAL_LABELS = ['infra-blocked', 'needs-human'];\nfor (const label of ACTIVE_LABELS) await removeLabel(label);\n";
+    const conflict = "const ACTIVE_LABELS = ['agent-ready', 'agent-working', 'changes-requested'];\nconst TERMINAL_LABELS = ['infra-blocked', 'needs-human'];\nif (TERMINAL_LABELS.some((label) => labels.has(label))) return { removed: [] };\nfor (const label of ACTIVE_LABELS) await removeLabel(label);\n";
+    await writeCleanupWorkflow(root, "z-conflict.yml", "conflict.js", conflict);
+    await writeCleanupWorkflow(root, "a-compatible.yml", "compatible.js", compatible);
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github: new FakeGitHub() });
+    assert.equal(plan.capabilities["coordination-label-cleanup"].status, "conflict");
+  });
+});
+
+test("cleanup aggregation returns conflict when a first-sorting workflow conflicts", async () => {
+  await withRepo(async (root) => {
+    const compatible = "const ACTIVE_LABELS = ['agent-ready', 'agent-working', 'changes-requested'];\nconst TERMINAL_LABELS = ['infra-blocked', 'needs-human'];\nfor (const label of ACTIVE_LABELS) await removeLabel(label);\n";
+    const conflict = "const ACTIVE_LABELS = ['agent-ready', 'agent-working', 'changes-requested'];\nconst TERMINAL_LABELS = ['infra-blocked', 'needs-human'];\nif (TERMINAL_LABELS.some((label) => labels.has(label))) return { removed: [] };\nfor (const label of ACTIVE_LABELS) await removeLabel(label);\n";
+    await writeCleanupWorkflow(root, "z-compatible.yml", "compatible.js", compatible);
+    await writeCleanupWorkflow(root, "a-conflict.yml", "conflict.js", conflict);
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github: new FakeGitHub() });
+    assert.equal(plan.capabilities["coordination-label-cleanup"].status, "conflict");
+  });
+});
+
+test("add-only coordination mutation on Issue close conflicts because late cleanup can reactivate work", async () => {
+  await withRepo(async (root) => {
+    await writeCleanupWorkflow(root, "close-reopen.yml", "reopen.js",
+      'await addLabel("agent-working");\n');
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github: new FakeGitHub() });
+    const capability = plan.capabilities["coordination-label-cleanup"];
+    assert.equal(capability.status, "conflict");
+    assert.equal(capability.provider, "consumer");
+    assert.match(capability.reason, /late cleanup must never reactivate work/);
   });
 });
 
@@ -525,13 +611,64 @@ test("readiness CLI blocks an unavailable App credential without exposing secret
     const code = await runOnboardingCli(["readiness", "--repo", REPO, "--path", root, "--runtime-config", configPath], {
       stdout: { write: (text) => { output += text; } },
       stderr: { write: () => assert.fail("readiness should emit no stderr") },
+      githubFactory: () => new FakeGitHub(),
       runtimeRevision: REV_A,
     });
     assert.equal(code, 2);
     const report = JSON.parse(output);
     assert.equal(report.overall_status, "machine_activation_blocked");
+    assert.equal(report.repository_status, "changes_planned");
+    assert.equal(report.machine_authorization.status, "required");
     assert.ok(report.runtime_activation.blockers.some((item) => item.includes("credential source is unavailable")));
     await assert.rejects(readFile(databasePath));
+  });
+});
+
+test("readiness keeps repository cleanup conflicts blocking when machine wiring is ready", async () => {
+  await withRepo(async (root) => {
+    const controlPlane = path.join(root, ".github");
+    await mkdir(controlPlane, { recursive: true });
+    await writeFile(path.join(controlPlane, "control-plane.yml"), stringifyManifest(createManifest(validInput())));
+    await writeCleanupWorkflow(root, "close-cleanup.yml", "cleanup.js",
+      "const ACTIVE_LABELS = ['agent-ready', 'agent-working', 'changes-requested'];\nconst TERMINAL_LABELS = ['infra-blocked', 'needs-human'];\nif (TERMINAL_LABELS.some((label) => labels.has(label))) return { removed: [] };\nfor (const label of ACTIVE_LABELS) await removeLabel(label);\n");
+    const github = new FakeGitHub();
+    const { code, report } = await readinessReport(root, github);
+    assert.equal(code, 2);
+    assert.equal(report.repository_status, "blocked");
+    assert.equal(report.repository_audit.capabilities["coordination-label-cleanup"].status, "conflict");
+    assert.equal(report.machine_authorization.status, "authorized");
+    assert.equal(report.machine_activation.status, "ready");
+    assert.equal(report.overall_status, "machine_activation_blocked");
+    assert.equal(github.labelCreates.length, 0);
+  });
+});
+
+test("readiness does not promote a repository with onboarding changes to ready", async () => {
+  await withRepo(async (root) => {
+    const controlPlane = path.join(root, ".github");
+    await mkdir(controlPlane, { recursive: true });
+    await writeFile(path.join(controlPlane, "control-plane.yml"), stringifyManifest(createManifest(validInput())));
+    const github = new FakeGitHub();
+    const { code, report } = await readinessReport(root, github);
+    assert.equal(code, 2);
+    assert.equal(report.repository_status, "changes_planned");
+    assert.equal(report.machine_activation.status, "ready");
+    assert.equal(report.overall_status, "machine_activation_blocked");
+    assert.equal(github.labelCreates.length, 0);
+  });
+});
+
+test("readiness succeeds when canonical repository audit and machine qualification are ready", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
+    await applyOnboardingPlan({ plan, root, github });
+    const { code, report } = await readinessReport(root, github);
+    assert.equal(code, 0);
+    assert.equal(report.repository_status, "ready");
+    assert.equal(report.machine_authorization.status, "authorized");
+    assert.equal(report.machine_activation.status, "ready");
+    assert.equal(report.overall_status, "machine_activation_ready");
   });
 });
 
