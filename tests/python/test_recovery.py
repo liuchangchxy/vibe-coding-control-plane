@@ -241,35 +241,35 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.workflow.transitions, transitions)
         self.assertEqual(len(self.implementer.requests), 1)
 
-    def test_orphan_agent_working_with_one_pr_is_adopted_untrusted(self):
+    def test_orphan_agent_working_with_one_canonical_pr_recovers_trust(self):
         self.set_snapshot(replace(snap(state="agent-working"), pr_number=44, pr_open=True,
                                   pr_linked_issue=7, pr_head_sha=SHA, pr_branch=BRANCH,
                                   open_linked_pr_count=1, canonical_link_count=1))
         result = self.core.reconcile_once("acme/alpha", "owner")
-        self.assertEqual(result["items"][0]["status"], "orphan_adopted_untrusted")
-        self.assertFalse(self.core.store.flow("acme/alpha", 7)["trusted"])
+        self.assertEqual(result["items"][0]["status"], "orphan_adopted_trusted")
+        self.assertTrue(self.core.store.flow("acme/alpha", 7)["trusted"])
         self.assertFalse(self.implementer.requests)
 
-    def test_missing_attempt_ledger_with_existing_flow_is_downgraded_to_untrusted(self):
+    def test_missing_attempt_ledger_recovers_trust_from_canonical_pr(self):
         self.start()
         with closing(sqlite3.connect(self.db)) as conn:
             conn.execute("DELETE FROM attempts")
             conn.commit()
         self.add_pr()
         result = self.core.reconcile_once("acme/alpha", "owner")
-        self.assertEqual(result["items"][0]["status"], "orphan_adopted_untrusted")
-        self.assertFalse(self.core.store.flow("acme/alpha", 7)["trusted"])
+        self.assertEqual(result["items"][0]["status"], "orphan_adopted_trusted")
+        self.assertTrue(self.core.store.flow("acme/alpha", 7)["trusted"])
         self.assertEqual(self.core.store.attempts_for_repo("acme/alpha")[-1]["kind"], "adopted")
 
-    def test_untrusted_adoption_cannot_authorize_repair(self):
+    def test_canonical_adoption_restores_same_pr_repair_authority(self):
         self.set_snapshot(replace(snap(state="agent-working"), pr_number=44, pr_open=True,
                                   pr_linked_issue=7, pr_head_sha=SHA, pr_branch=BRANCH,
                                   open_linked_pr_count=1, canonical_link_count=1))
         self.core.reconcile_once("acme/alpha", "owner")
         candidate = RepairCandidate("acme/alpha", 7, 44, SHA, BRANCH,
                                     "implementation_failure", "check-1", "owner")
-        self.assertEqual(self.core.dispatch_repair(candidate)["status"], "untrusted_provenance")
-        self.assertFalse(self.implementer.requests)
+        self.assertEqual(self.core.dispatch_repair(candidate)["status"], "launched")
+        self.assertEqual(len(self.implementer.requests), 1)
 
     def test_orphan_without_pr_fails_closed_to_infra_blocked(self):
         self.set_snapshot(snap(state="agent-working"))

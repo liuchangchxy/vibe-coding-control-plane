@@ -308,6 +308,25 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(result["items"][0]["status"], "needs-human")
         self.assertEqual(len(self.implementer.launches), 1)
 
+    def test_restart_canonical_pr_adoption_resumes_ci_failure_with_one_same_pr_repair(self):
+        connection = self.core.store._connect()
+        connection.execute("DELETE FROM attempts WHERE repo=? AND issue_number=?", (self.repo, self.issue))
+        connection.execute("DELETE FROM flows WHERE repo=? AND issue_number=?", (self.repo, self.issue))
+        connection.commit(); connection.close()
+        adopted = self.core.reconcile_once(self.repo, "owner", 100)
+        self.assertEqual(adopted["items"][0]["status"], "orphan_adopted_trusted")
+        self.update(check_runs=self.failure())
+        repaired = self.driver().advance_once(self.repo, "owner", 101)
+        self.assertEqual(repaired["items"][0]["status"], "launched")
+        repair = [row for row in self.core.store.attempts_for_repo(self.repo) if row["kind"] == "repair"]
+        self.assertEqual(len(repair), 1)
+        self.assertEqual((repair[0]["pr_number"], repair[0]["branch"], repair[0]["repair_ordinal"]),
+                         (44, "implement/7", 1))
+        again = self.driver().advance_once(self.repo, "owner", 102)
+        self.assertEqual(again["items"][0]["status"], "waiting_for_repair")
+        self.assertEqual(len([row for row in self.core.store.attempts_for_repo(self.repo)
+                              if row["kind"] == "repair"]), 1)
+
     def test_ci_deadline_survives_runtime_restart(self):
         driver = self.driver()
         first = driver.advance_once(self.repo, "owner", 100)["items"][0]

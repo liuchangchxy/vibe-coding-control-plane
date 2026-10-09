@@ -32,11 +32,12 @@ class FakeAPI:
         self.reviews = []
         self.check_runs = []
         self.reads = []
-        self.discovery = {"agent-working": [], "changes-requested": []}
+        self.discovery = {"agent-ready": [], "agent-working": [], "changes-requested": []}
 
     def get(self, path):
         self.reads.append(path)
         if "/issues?" in path:
+            if "agent-ready" in path: return self.discovery["agent-ready"]
             if "agent-working" in path: return self.discovery["agent-working"]
             if "changes-requested" in path: return self.discovery["changes-requested"]
             return []
@@ -240,6 +241,17 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(adapter.discover_active("o/r"), [8, 10])
         self.assertTrue(all("agent-ready" not in path for path in api.reads))
         self.assertEqual(len(api.reads), 2)
+
+    def test_ready_discovery_is_separate_and_rejects_partial_scan(self):
+        api = FakeAPI()
+        api.discovery["agent-ready"] = [{"number": 12}, {"number": 14},
+                                          {"number": 13, "pull_request": {}}]
+        adapter = GitHubWorkflowAdapter(api, FakeWriter(), MANIFEST)
+        self.assertEqual(adapter.discover_ready("o/r"), [12, 14])
+        self.assertEqual(len(api.reads), 1)
+        api.discovery["agent-ready"] = [{"number": n} for n in range(100)]
+        with self.assertRaisesRegex(RuntimeError, "incomplete"):
+            adapter.discover_ready("o/r")
 
     def test_real_core_recovery_uses_app_writer_for_infra_blocked(self):
         with tempfile.TemporaryDirectory() as temp:

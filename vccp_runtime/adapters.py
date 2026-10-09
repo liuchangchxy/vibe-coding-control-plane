@@ -272,6 +272,7 @@ class GitHubWorkflowAdapter:
                 current_review = latest
         valid_pr = bool(pr and len(linked_numbers) == 1 and len(linked_prs) == 1
                         and pr.get("base", {}).get("ref") == self.base_branch
+                        and bool(head.get("ref")) and head.get("ref") != self.base_branch
                         and pr.get("user", {}).get("login", "").casefold() in self.authors)
         return WorkflowSnapshot(
             repo=repo, issue_number=number, revision=revision, issue_open=issue.get("state") == "open",
@@ -312,6 +313,19 @@ class GitHubWorkflowAdapter:
                     if isinstance(number, int) and number > 0:
                         found.add(number)
         return sorted(found)
+
+    def discover_ready(self, repo):
+        """Return a lightweight candidate list; dispatch_initial owns fresh eligibility."""
+        import urllib.parse
+        query = urllib.parse.urlencode({"state": "open", "labels": "agent-ready", "per_page": 100})
+        result = self.api.get(f"/repos/{repo}/issues?{query}")
+        if not isinstance(result, list):
+            raise RuntimeError("GitHub ready discovery returned an invalid response")
+        if len(result) >= 100:
+            raise RuntimeError("GitHub ready discovery may be incomplete; refusing partial scan")
+        return sorted({item["number"] for item in result
+                       if isinstance(item, dict) and "pull_request" not in item
+                       and isinstance(item.get("number"), int) and item["number"] > 0})
 
     def transition_coordination_state(self, repo, issue_number, expected_state, new_state, expected_revision):
         before = self._facts(repo, issue_number)
@@ -374,13 +388,14 @@ def generic_prompt(request: LaunchRequest, workspace: str, policy: dict,
 class AntiGravityImplementer:
     def __init__(self, executable: str, workspace: str, app_gh: str, app_git_push: str,
                  runner: Callable = subprocess.run, timeout: int = 60, environ=None, write_guard=None,
-                 runtime_context: dict | None = None):
+                 runtime_context: dict | None = None, conversation_roots=None):
         self.executable, self.workspace = executable, workspace
         self.app_gh, self.app_git_push = app_gh, app_git_push
         self.runner, self.timeout = runner, timeout
         self.environ = os.environ if environ is None else environ
         self.write_guard = write_guard or WorkspaceWriteGuard()
         self.runtime_context = runtime_context
+        self.conversation_roots = [Path(p).expanduser() for p in (conversation_roots or [])]
         if not executable or not workspace or (runtime_context is None and (not app_gh or not app_git_push)):
             raise ValueError("language server, workspace, app-gh, and app-git-push are required")
 
@@ -427,6 +442,28 @@ class AntiGravityImplementer:
             if identity:
                 return LaunchResult(LaunchDisposition.CONFIRMED, identity)
         return LaunchResult(LaunchDisposition.UNKNOWN)
+
+    def latest_activity(self, conversation_id: str):
+        """Observe artifact mtimes; a static conversation receipt is not progress."""
+        roots = list(self.conversation_roots)
+        configured = self.environ.get("VCCP_ANTIGRAVITY_ROOT")
+        if configured:
+            roots.append(Path(configured))
+        roots.append(Path.home() / ".gemini" / "antigravity")
+        for key, suffix in (("LOCALAPPDATA", Path("Programs") / "antigravity"),
+                            ("APPDATA", Path("Antigravity"))):
+            value = self.environ.get(key)
+            if value:
+                roots.append(Path(value) / suffix)
+        paths = []
+        for root in roots:
+            paths.extend((root / "conversations" / f"{conversation_id}.db",
+                          root / "brain" / conversation_id / ".system_generated" / "logs" / "transcript.jsonl",
+                          root / "brain" / conversation_id / ".system_generated" / "logs" / "transcript_full.jsonl",
+                          root / "brain" / conversation_id / "transcript.jsonl",
+                          root / "brain" / conversation_id / f"{conversation_id}.db"))
+        observed = [path.stat().st_mtime for path in paths if path.is_file()]
+        return max(observed) if observed else None
 
     @staticmethod
     def _conversation_id(stdout):
@@ -687,10 +724,13 @@ def build_runtime(manifest: dict, local_config: dict, api=None, writer=None,
     implementer = AntiGravityImplementer(local_config["antigravity_executable"], workspace,
                                          app_gh, app_git_push, runner,
                                          local_config.get("launch_timeout_seconds", 60),
-                                         runtime_context=runtime_context)
+                                         runtime_context=runtime_context,
+                                         conversation_roots=local_config.get("conversation_roots", []))
     implementer._policy = manifest
     core = RuntimeCore(local_config["database_path"], manifest, workflow, implementer,
-                       recovery_timeout_seconds=local_config.get("recovery_timeout_seconds", 900))
+                       recovery_timeout_seconds=local_config.get("recovery_timeout_seconds", 900),
+                       implementer_progress_timeout_seconds=local_config.get(
+                           "implementer_progress_timeout_seconds", 1800))
     from .lifecycle import LifecycleDriver
     lifecycle = LifecycleDriver(core, manifest, local_config.get("lifecycle_timeouts", {}))
     return RuntimeAdapters(core, workflow, implementer, lifecycle,
