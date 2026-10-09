@@ -292,6 +292,18 @@ test("cleanup aggregation returns conflict when a first-sorting workflow conflic
   });
 });
 
+test("add-only coordination mutation on Issue close conflicts because late cleanup can reactivate work", async () => {
+  await withRepo(async (root) => {
+    await writeCleanupWorkflow(root, "close-reopen.yml", "reopen.js",
+      'await addLabel("agent-working");\n');
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github: new FakeGitHub() });
+    const capability = plan.capabilities["coordination-label-cleanup"];
+    assert.equal(capability.status, "conflict");
+    assert.equal(capability.provider, "consumer");
+    assert.match(capability.reason, /late cleanup must never reactivate work/);
+  });
+});
+
 test("v2 manifest contract accepts only the shared frozen repair budget", () => {
   const manifest = createManifest(validInput());
   assert.deepEqual(validateManifest(manifest), []);
