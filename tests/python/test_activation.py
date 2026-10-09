@@ -3,84 +3,130 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from vccp_runtime.activation import qualify_activation
 
 
 MANIFEST = {
     "schema_version": 2,
-    "issue_contract": {"max_automated_repairs": 3},
+    "issue_contract": {"max_automated_repairs": 3,
+                       "active_coordination_labels": ["agent-ready", "agent-working", "changes-requested"],
+                       "terminal_coordination_labels": ["infra-blocked", "needs-human"],
+                       "frozen_spec_label": "frozen-spec"},
     "repository": {"base_branch": "main", "implementer_authors": ["builder[bot]"]},
     "reviewer": {"required_checks": [{"name": "Unit Tests", "accepted_conclusions": ["success"]}]},
 }
 REPO = "example/consumer"
-SECRET = "should-never-appear-in-output"
+
+
+class FakeProvider:
+    api_url = "https://api.github.com"
+    target_repository = REPO
+
+    def __init__(self, result=None):
+        self.result = result or {"installed": True, "permissions_sufficient": True,
+                                 "missing_permissions": []}
+        self.probes = []
+    def probe(self, repo):
+        self.probes.append(repo)
+        return self.result
+
+
+class FakeAPI:
+    def __init__(self, repo=REPO): self.repo = repo; self.reads = []
+    def get(self, path):
+        self.reads.append(path)
+        return {"full_name": self.repo}
+
+
+class FakeWriter:
+    def replace_labels(self, *args): raise AssertionError("readiness must not mutate labels")
+
+
+class FakePushBackend:
+    def push(self, *args, **kwargs): raise AssertionError("readiness must not push")
 
 
 class ActivationTests(unittest.TestCase):
-    def _environment(self, root: Path, remote=REPO):
-        workspace = root / "workspace"
-        workspace.mkdir()
-        subprocess.run(["git", "init", str(workspace)], check=True, capture_output=True)
-        subprocess.run(["git", "-C", str(workspace), "remote", "add", "origin",
-                        f"https://github.com/{remote}.git"], check=True, capture_output=True)
-        executables = []
-        for name in ("language_server.exe", "app-gh.exe", "app-git-push.exe"):
-            executable = root / name
-            executable.write_text("fake", encoding="utf-8")
-            executables.append(str(executable))
-        config = {
-            "database_path": str(root / "state" / "runtime.sqlite"),
-            "workspace": str(workspace),
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.workspace = self.root / "workspace"
+        self.workspace.mkdir()
+        subprocess.run(["git", "init", str(self.workspace)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(self.workspace), "remote", "add", "origin",
+                        f"https://github.com/{REPO}.git"], check=True, capture_output=True)
+        self.executable = self.root / "language_server.exe"
+        self.executable.write_bytes(b"fake executable")
+        self.credential_file = self.root / "app-key.dpapi"
+        self.credential_file.write_bytes(b"fake ciphertext")
+        (self.root / "state").mkdir()
+        self.config = {
+            "database_path": str(self.root / "state" / "runtime.sqlite"),
+            "workspace": str(self.workspace),
             "owner_id": "test-owner",
-            "antigravity_executable": executables[0],
-            "app_gh_executable": executables[1],
-            "app_git_push_executable": executables[2],
-            "github_read_token_env": "VCCP_TEST_READ_TOKEN",
+            "antigravity_executable": str(self.executable),
+            "github_app": {"app_id": "123456", "expected_app_slug": "app",
+                           "credential_source": {"type": "windows_dpapi_file",
+                                                 "path": str(self.credential_file)}},
         }
-        (root / "state").mkdir()
-        return config
+        self.provider, self.api, self.writer, self.push_backend = (
+            FakeProvider(), FakeAPI(), FakeWriter(), FakePushBackend())
 
-    def test_complete_config_constructs_existing_runtime_without_dispatch_or_database_mutation(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            config = self._environment(root)
-            result = qualify_activation(MANIFEST, config, REPO, {"VCCP_TEST_READ_TOKEN": SECRET})
-            encoded = json.dumps(result)
-            self.assertEqual(result["status"], "ready")
-            self.assertEqual(result["credential_source"], {
-                "environment_variable": "VCCP_TEST_READ_TOKEN", "present": True,
-            })
-            self.assertNotIn(SECRET, encoded)
-            self.assertFalse(Path(config["database_path"]).exists())
-            self.assertEqual(list((root / "state").iterdir()), [])
+    def tearDown(self): self.temp.cleanup()
 
-    def test_incomplete_config_workspace_mismatch_and_missing_credential_fail_closed(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            config = self._environment(root, remote="other/repo")
-            config.pop("owner_id")
-            result = qualify_activation(MANIFEST, config, REPO, {})
-            self.assertEqual(result["status"], "not_ready")
-            self.assertTrue(any("owner_id" in blocker for blocker in result["blockers"]))
+    def _qualify(self, config=None, provider=None, api=None):
+        with patch("vccp_runtime.activation.DPAPIFileCredentialSource") as source:
+            source.return_value.load_private_key.return_value = object()
+            return qualify_activation(
+                MANIFEST, self.config if config is None else config, REPO,
+                credential_provider=self.provider if provider is None else provider,
+                api=self.api if api is None else api, writer=self.writer,
+                push_backend=self.push_backend,
+            )
 
-            config["owner_id"] = "test-owner"
-            result = qualify_activation(MANIFEST, config, REPO, {})
-            self.assertEqual(result["status"], "not_ready")
-            self.assertTrue(any("workspace origin" in blocker for blocker in result["blockers"]))
-            self.assertTrue(any("present: false" in blocker for blocker in result["blockers"]))
-            self.assertNotIn(SECRET, json.dumps(result))
+    def test_readiness_probes_app_reads_repository_and_constructs_without_legacy_helpers(self):
+        result = self._qualify()
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(self.provider.probes, [REPO])
+        self.assertEqual(self.api.reads, [f"/repos/{REPO}"])
+        self.assertEqual(result["credential_source"], {"type": "windows_dpapi_file", "present": True})
+        self.assertFalse(Path(self.config["database_path"]).exists())
+        self.assertEqual(list((self.root / "state").iterdir()), [])
+        self.assertNotIn("github_read_token_env", self.config)
+        self.assertNotIn("app_gh_executable", self.config)
+        self.assertNotIn("app_git_push_executable", self.config)
 
-    def test_missing_executable_and_invalid_contract_are_not_ready(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            config = self._environment(root)
-            config["app_git_push_executable"] = str(root / "missing.exe")
-            result = qualify_activation({"schema_version": 1}, config, REPO, {"VCCP_TEST_READ_TOKEN": SECRET})
-            self.assertEqual(result["status"], "not_ready")
-            self.assertTrue(any("schema_version 2" in blocker for blocker in result["blockers"]))
-            self.assertTrue(any("app_git_push_executable" in blocker for blocker in result["blockers"]))
+    def test_missing_or_insufficient_installation_reports_human_action(self):
+        provider = FakeProvider({"installed": False, "permissions_sufficient": False,
+                                 "missing_permissions": []})
+        result = self._qualify(provider=provider)
+        self.assertEqual(result["status"], "not_ready")
+        self.assertIn("human must install", result["blockers"][0])
+
+        provider = FakeProvider({"installed": True, "permissions_sufficient": False,
+                                 "missing_permissions": {"contents": "write"}})
+        result = self._qualify(provider=provider)
+        self.assertEqual(result["status"], "not_ready")
+        self.assertEqual(result["installation"]["missing_permissions"], {"contents": "write"})
+        self.assertIn("contents:write", result["blockers"][0])
+
+    def test_repository_read_mismatch_and_missing_credential_fail_closed(self):
+        result = self._qualify(api=FakeAPI("other/repo"))
+        self.assertEqual(result["status"], "not_ready")
+        self.assertIn("wrong target", result["blockers"][0])
+        config = dict(self.config)
+        config["github_app"] = dict(self.config["github_app"], credential_source={
+            "type": "windows_dpapi_file", "path": str(self.root / "missing.dpapi")})
+        result = self._qualify(config=config)
+        self.assertEqual(result["status"], "not_ready")
+        self.assertIn("credential source is unavailable", result["blockers"][0])
+
+    def test_secret_never_appears_in_readiness_result(self):
+        secret = "fake-secret-should-not-be-in-report"
+        result = self._qualify()
+        self.assertNotIn(secret, json.dumps(result))
 
 
-if __name__ == "__main__":
-    unittest.main()
+if __name__ == "__main__": unittest.main()

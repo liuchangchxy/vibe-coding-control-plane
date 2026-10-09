@@ -8,11 +8,17 @@ from pathlib import Path
 import re
 import shlex
 import subprocess
+import sys
 from typing import Callable
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from .core import (LaunchDisposition, LaunchRequest, LaunchResult, RuntimeCore,
                    WorkflowSnapshot)
+from .github_app import (DPAPIFileCredentialSource, GitHubAppCredentialProvider,
+                         GitHubAppError, GitHubAppIdentityError, GitHubAppPermissionError,
+                         GitHubHTTPError, repository_from_remote)
+from .github_push import GitHubAppPushBackend
 
 
 _CONVERSATION_UUID = re.compile(
@@ -21,17 +27,41 @@ _CONVERSATION_UUID = re.compile(
 
 
 class GitHubAPI:
-    """Small read transport. The write credential boundary is the separate App writer."""
-    def __init__(self, token: str, api_url: str = "https://api.github.com",
+    """GitHub REST/GraphQL reads using a short-lived App token in production."""
+    def __init__(self, token: str | None = None, api_url: str = "https://api.github.com",
                  graphql_url: str | None = None, opener=urlopen):
         if not token:
-            raise ValueError("GitHub read token is required")
+            raise ValueError("legacy test token or a credential provider is required")
         if api_url.rstrip("/") != "https://api.github.com" and not graphql_url:
             raise ValueError("custom GitHub REST API URLs require an explicit GraphQL endpoint")
         self.token, self.api_url, self.opener = token, api_url.rstrip("/"), opener
         self.graphql_url = graphql_url or "https://api.github.com/graphql"
 
+    @classmethod
+    def with_app_provider(cls, provider: GitHubAppCredentialProvider,
+                          graphql_url: str | None = None):
+        instance = cls.__new__(cls)
+        instance.token = None
+        instance.provider = provider
+        instance.api_url = provider.api_url
+        instance.opener = None
+        instance.graphql_url = graphql_url or provider.api_url.replace("/api/v3", "") + "/graphql"
+        return instance
+
+    @staticmethod
+    def _repo_from_path(path: str) -> str:
+        match = re.match(r"^/repos/([^/]+/[^/?]+)(?:/|\?|$)", path)
+        if not match:
+            raise ValueError("GitHub API read must identify a repository")
+        return match.group(1)
+
     def get(self, path: str):
+        if getattr(self, "provider", None) is not None:
+            repo = self._repo_from_path(path)
+            status, payload = self.provider.request("GET", path, repo)
+            if status < 200 or status >= 300:
+                raise GitHubHTTPError(status, "GET")
+            return payload
         request = Request(self.api_url + path, headers={
             "Authorization": f"Bearer {self.token}", "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
@@ -40,6 +70,13 @@ class GitHubAPI:
             return json.loads(response.read().decode("utf-8"))
 
     def graphql(self, query: str, variables: dict):
+        if getattr(self, "provider", None) is not None:
+            repo = f"{variables['owner']}/{variables['name']}"
+            status, payload = self.provider.request("POST", "/graphql", repo,
+                                                    {"query": query, "variables": variables})
+            if status < 200 or status >= 300 or payload.get("errors"):
+                raise GitHubHTTPError(status, "GraphQL")
+            return payload["data"]
         request = Request(self.graphql_url,
                           data=json.dumps({"query": query, "variables": variables}).encode("utf-8"),
                           headers={"Authorization": f"Bearer {self.token}",
@@ -54,15 +91,62 @@ class GitHubAPI:
 
 
 class GitHubAppWriter:
-    """Use the configured controlled app-gh drop-in for the supported label edit."""
-    def __init__(self, executable: str, runner: Callable = subprocess.run):
-        if not executable:
-            raise ValueError("controlled GitHub App writer executable is required")
-        if Path(executable).name.casefold() in {"gh", "gh.exe"}:
-            raise ValueError("ordinary gh CLI cannot be used as the production coordination writer")
-        self.executable, self.runner = executable, runner
+    """Bounded GitHub App REST writer; the executable path is retained for test injection only."""
+    def __init__(self, executable: str | None = None, runner: Callable = subprocess.run,
+                 *, credential_provider: GitHubAppCredentialProvider | None = None,
+                 target_repository: str | None = None, allowed_labels=None):
+        if credential_provider is not None:
+            if not target_repository:
+                raise ValueError("controlled writer target repository is required")
+            self.provider = credential_provider
+            self.target_repository = target_repository.casefold()
+            self.allowed_labels = set(allowed_labels or ())
+            if not self.allowed_labels:
+                raise ValueError("controlled writer must be fenced to coordination labels")
+            self.executable = None
+        else:
+            # Backward-compatible command seam for deterministic adapter tests.
+            if not executable or Path(executable).name.casefold() in {"gh", "gh.exe"}:
+                raise ValueError("production coordination writer must use a GitHub App provider")
+            self.provider = None
+            self.executable, self.runner = executable, runner
 
     def replace_labels(self, repo: str, issue: int, remove: list[str], add: list[str]):
+        if self.provider is not None:
+            if repo.casefold() != self.target_repository or not isinstance(issue, int) or issue < 1:
+                raise GitHubAppIdentityError("controlled writer target does not match enrolled repository")
+            if (len(set(remove)) != len(remove) or len(set(add)) != len(add)
+                    or set(remove) & set(add)
+                    or any(label not in self.allowed_labels for label in (*remove, *add))):
+                raise GitHubAppIdentityError("controlled writer operation is outside coordination-label policy")
+            owner, name = repo.split("/", 1)
+            path = f"/repos/{owner}/{name}/issues/{issue}"
+            try:
+                status, current = self.provider.request("GET", path, repo)
+                if status != 200 or current.get("number") != issue:
+                    return False
+                repo_url = str(current.get("repository_url", "")).rstrip("/").casefold()
+                expected_url = f"{self.provider.api_url}/repos/{owner}/{name}".casefold()
+                if repo_url and repo_url != expected_url:
+                    return False
+                before = {item.get("name") for item in current.get("labels", []) if isinstance(item, dict)}
+                if not set(remove).issubset(before):
+                    return False
+                for label in remove:
+                    code, _ = self.provider.request("DELETE", f"{path}/labels/{quote(label, safe='')}", repo)
+                    if code not in (200, 204, 404):
+                        return False
+                if add:
+                    code, _ = self.provider.request("POST", f"{path}/labels", repo, {"labels": add})
+                    if code not in (200, 201):
+                        return False
+                verified_status, verified = self.provider.request("GET", path, repo)
+                if verified_status != 200 or verified.get("number") != issue:
+                    return False
+                after = {item.get("name") for item in verified.get("labels", []) if isinstance(item, dict)}
+                return after == (before - set(remove)) | set(add)
+            except GitHubAppError:
+                return False
         command = [self.executable, "issue", "edit", str(issue), "--repo", repo]
         for label in remove:
             command.extend(("--remove-label", label))
@@ -70,6 +154,25 @@ class GitHubAppWriter:
             command.extend(("--add-label", label))
         result = self.runner(command, text=True, capture_output=True, check=False)
         return result.returncode == 0
+
+    def create_pull_request(self, repo: str, issue: int, title: str, body: str,
+                            head: str, base: str, draft: bool = False):
+        if self.provider is None or repo.casefold() != self.target_repository:
+            raise GitHubAppIdentityError("controlled PR creation requires the enrolled GitHub App provider")
+        if not isinstance(issue, int) or issue < 1 or not all(isinstance(x, str) and x.strip()
+                                                            for x in (title, body, head, base)):
+            raise ValueError("controlled PR creation arguments are invalid")
+        if not re.search(rf"(?<![A-Za-z0-9_])#{issue}(?![0-9])", body):
+            raise GitHubAppIdentityError("controlled PR must reference its Frozen Issue")
+        if ":" in head or head.startswith("-") or head == base:
+            raise GitHubAppIdentityError("controlled PR head or base is outside the same-repository policy")
+        owner, name = repo.split("/", 1)
+        status, result = self.provider.request("POST", f"/repos/{owner}/{name}/pulls", repo,
+                                              {"title": title, "body": body, "head": head,
+                                               "base": base, "draft": bool(draft)})
+        if status != 201 or not isinstance(result.get("number"), int):
+            raise GitHubAppError("controlled pull request creation failed")
+        return result["number"]
 
 
 class GitHubWorkflowAdapter:
@@ -246,7 +349,9 @@ def generic_prompt(request: LaunchRequest, workspace: str, policy: dict,
               "Do not expand scope or merge. Report tests actually run. Ordinary host-human gh writes are "
               "forbidden; use only the configured controlled App writer for GitHub writes. Ordinary git push "
               "is forbidden; use only the configured controlled push wrapper. Do not persist or request GitHub "
-              "tokens.\n")
+              "tokens. For PR creation use: <app-gh> pr create --title TITLE --body BODY --head BRANCH "
+              "--base BASE. For labels use: <app-gh> issue edit ISSUE --remove-label LABEL --add-label LABEL. "
+              "For a push use: <app-git-push> --branch BRANCH --expected-sha FULL_SHA.\n")
     if request.attempt_kind == "repair":
         cause_guidance = ("This repair was admitted for an exact-head CI failure; inspect the configured required "
                           "checks on the supplied head and address the explicitly attributed implementation failure. "
@@ -261,13 +366,15 @@ def generic_prompt(request: LaunchRequest, workspace: str, policy: dict,
 
 class AntiGravityImplementer:
     def __init__(self, executable: str, workspace: str, app_gh: str, app_git_push: str,
-                 runner: Callable = subprocess.run, timeout: int = 60, environ=None, write_guard=None):
+                 runner: Callable = subprocess.run, timeout: int = 60, environ=None, write_guard=None,
+                 runtime_context: dict | None = None):
         self.executable, self.workspace = executable, workspace
         self.app_gh, self.app_git_push = app_gh, app_git_push
         self.runner, self.timeout = runner, timeout
         self.environ = os.environ if environ is None else environ
         self.write_guard = write_guard or WorkspaceWriteGuard()
-        if not executable or not workspace or not app_gh or not app_git_push:
+        self.runtime_context = runtime_context
+        if not executable or not workspace or (runtime_context is None and (not app_gh or not app_git_push)):
             raise ValueError("language server, workspace, app-gh, and app-git-push are required")
 
     def launch(self, request):
@@ -277,15 +384,28 @@ class AntiGravityImplementer:
                                "GITHUB_APP_PRIVATE_KEY"}:
                 env.pop(key)
         try:
-            guard = self.write_guard.install(self.workspace, request.attempt_id, self.app_git_push, env)
+            launch_context = None
+            if self.runtime_context is not None:
+                launch_context = dict(self.runtime_context)
+                launch_context.update({"repo": request.repo, "issue_number": request.issue_number,
+                                       "python_executable": self.runtime_context["python_executable"]})
+            if launch_context is None:
+                guard = self.write_guard.install(self.workspace, request.attempt_id, self.app_git_push, env)
+            else:
+                guard = self.write_guard.install(self.workspace, request.attempt_id, None, env,
+                                                 launch_context=launch_context)
         except Exception:
             # A missing/failed guard proves the external AgentAPI command was never invoked.
             return LaunchResult(LaunchDisposition.DEFINITELY_NOT_STARTED)
         env.update(guard.environment)
-        env["VCCP_APP_GH"] = self.app_gh
-        env["VCCP_APP_GIT_PUSH_BACKEND"] = self.app_git_push
+        app_gh_command = guard.github_command or self.app_gh
+        env["VCCP_APP_GH"] = app_gh_command
+        env["VCCP_APP_GIT_PUSH_BACKEND"] = (
+            "vccp_runtime.github_push.GitHubAppPushBackend" if self.runtime_context is not None
+            else self.app_git_push
+        )
         env["VCCP_APP_GIT_PUSH"] = guard.git_push_command
-        prompt = generic_prompt(request, self.workspace, self._policy, self.app_gh, guard.git_push_command)
+        prompt = generic_prompt(request, self.workspace, self._policy, app_gh_command, guard.git_push_command)
         try:
             result = self.runner([self.executable, "agentapi", "new-conversation", prompt],
                                  cwd=self.workspace, env=env, text=True, capture_output=True, check=False,
@@ -338,6 +458,7 @@ class AntiGravityImplementer:
 class WorkspaceGuard:
     git_push_command: str
     environment: dict[str, str]
+    github_command: str | None = None
 
 
 class WorkspaceWriteGuard:
@@ -346,8 +467,9 @@ class WorkspaceWriteGuard:
     def __init__(self, runner: Callable = subprocess.run):
         self.runner = runner
 
-    def install(self, workspace: str, attempt_id: str, app_git_push: str,
-                inherited_environment: dict | None = None) -> WorkspaceGuard:
+    def install(self, workspace: str, attempt_id: str, app_git_push: str | None = None,
+                inherited_environment: dict | None = None, *,
+                launch_context: dict | None = None) -> WorkspaceGuard:
         result = self.runner(["git", "rev-parse", "--absolute-git-dir"], cwd=workspace,
                              text=True, capture_output=True, check=False)
         if result.returncode != 0 or not result.stdout.strip():
@@ -389,21 +511,51 @@ class WorkspaceWriteGuard:
                 "exit 1\n",
                 encoding="utf-8",
             )
-            wrapper = root / ("app-git-push.cmd" if os.name == "nt" else "app-git-push")
-            if os.name == "nt":
-                if any(c in app_git_push for c in ('"', "%", "\r", "\n")):
-                    raise ValueError("controlled push path cannot be represented safely by the Windows shim")
-                wrapper.write_text(
-                    '@echo off\r\nsetlocal\r\nset "VCCP_CONTROLLED_PUSH=1"\r\n'
-                    f'call "{app_git_push}" %*\r\nexit /b %ERRORLEVEL%\r\n',
-                    encoding="utf-8",
-                )
+            if launch_context is not None:
+                python = str(launch_context["python_executable"])
+                if not python or any(c in python for c in ('"', "%", "\r", "\n")):
+                    raise ValueError("runtime Python path cannot be represented safely by the wrapper")
+                context_path = root / "runtime-context.json"
+                context = dict(launch_context)
+                context.pop("python_executable", None)
+                context_path.write_text(json.dumps(context, ensure_ascii=False), encoding="utf-8")
+                if os.name == "nt" and any(c in str(context_path) for c in ('"', "%", "\r", "\n")):
+                    raise ValueError("runtime context path cannot be represented safely by the wrapper")
+                github_wrapper = root / ("app-gh.cmd" if os.name == "nt" else "app-gh")
+                wrapper = root / ("app-git-push.cmd" if os.name == "nt" else "app-git-push")
+                command = f'"{python}" -m vccp_runtime.controlled_cli --context "{context_path}"'
+                if os.name == "nt":
+                    github_wrapper.write_text(f'@echo off\r\n{command} app-gh %*\r\nexit /b %ERRORLEVEL%\r\n',
+                                              encoding="utf-8")
+                    wrapper.write_text('@echo off\r\nsetlocal\r\nset "VCCP_CONTROLLED_PUSH=1"\r\n'
+                                       f'{command} git-push %*\r\nexit /b %ERRORLEVEL%\r\n', encoding="utf-8")
+                else:
+                    github_wrapper.write_text("#!/bin/sh\nexec " + command + ' app-gh "$@"\n', encoding="utf-8")
+                    wrapper.write_text("#!/bin/sh\nVCCP_CONTROLLED_PUSH=1 export VCCP_CONTROLLED_PUSH\n"
+                                       "exec " + command + ' git-push "$@"\n', encoding="utf-8")
+                    github_wrapper.chmod(0o700)
+                    wrapper.chmod(0o700)
+                    hook.chmod(0o700)
+                github_command = str(github_wrapper)
             else:
-                wrapper.write_text(
-                    "#!/bin/sh\nVCCP_CONTROLLED_PUSH=1 export VCCP_CONTROLLED_PUSH\n"
-                    f"exec {shlex.quote(app_git_push)} \"$@\"\n",
-                    encoding="utf-8",
-                )
+                if not app_git_push:
+                    raise ValueError("controlled push command is required")
+                github_command = None
+                wrapper = root / ("app-git-push.cmd" if os.name == "nt" else "app-git-push")
+                if os.name == "nt":
+                    if any(c in app_git_push for c in ('"', "%", "\r", "\n")):
+                        raise ValueError("controlled push path cannot be represented safely by the Windows shim")
+                    wrapper.write_text(
+                        '@echo off\r\nsetlocal\r\nset "VCCP_CONTROLLED_PUSH=1"\r\n'
+                        f'call "{app_git_push}" %*\r\nexit /b %ERRORLEVEL%\r\n',
+                        encoding="utf-8",
+                    )
+                else:
+                    wrapper.write_text(
+                        "#!/bin/sh\nVCCP_CONTROLLED_PUSH=1 export VCCP_CONTROLLED_PUSH\n"
+                        f"exec {shlex.quote(app_git_push)} \"$@\"\n",
+                        encoding="utf-8",
+                    )
                 wrapper.chmod(0o700)
                 hook.chmod(0o700)
             configured = self.runner(["git", "config", "--local", "core.hooksPath", str(hooks)],
@@ -430,7 +582,9 @@ class WorkspaceWriteGuard:
                 "GH_CONFIG_DIR": str(gh_config),
                 "GH_PROMPT_DISABLED": "1",
             }
-            return WorkspaceGuard(str(wrapper), env)
+            if launch_context is not None:
+                env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+            return WorkspaceGuard(str(wrapper), env, github_command)
         except Exception:
             if not config_written:
                 import shutil
@@ -444,25 +598,93 @@ class RuntimeAdapters:
     workflow: GitHubWorkflowAdapter
     implementer: AntiGravityImplementer
     lifecycle: object
+    credential_provider: GitHubAppCredentialProvider | None = None
+    push_backend: object | None = None
 
 
-def build_runtime(manifest: dict, local_config: dict, api=None, writer=None, runner=subprocess.run):
-    """Construct the existing core; local paths and executable settings stay machine-local."""
+def _workspace_repository(workspace: str, api_url: str) -> str:
+    try:
+        result = subprocess.run(["git", "remote", "get-url", "origin"], cwd=workspace,
+                                text=True, capture_output=True, check=False, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        raise ValueError("workspace origin is unavailable") from None
+    if result.returncode != 0:
+        raise ValueError("workspace must have an origin GitHub remote")
+    repo = repository_from_remote(result.stdout.strip(), api_url)
+    if not repo:
+        raise ValueError("workspace origin must identify a repository on the configured GitHub host")
+    return repo
+
+
+def _make_credential_provider(local_config: dict, target_repo: str):
+    app = local_config.get("github_app")
+    if not isinstance(app, dict) or not app.get("app_id"):
+        raise ValueError("machine-local github_app configuration is required")
+    source = app.get("credential_source")
+    if not isinstance(source, dict) or source.get("type") != "windows_dpapi_file" or not source.get("path"):
+        raise ValueError("github_app.credential_source must identify a Windows DPAPI file")
+    configured_repo = app.get("target_repository")
+    if configured_repo and str(configured_repo).casefold() != target_repo.casefold():
+        raise ValueError("GitHub App target_repository does not match workspace origin")
+    return GitHubAppCredentialProvider(
+        app["app_id"], DPAPIFileCredentialSource(source["path"]), target_repo,
+        app.get("expected_app_slug"), app.get("api_url", "https://api.github.com"),
+    )
+
+
+def build_runtime(manifest: dict, local_config: dict, api=None, writer=None,
+                  runner=subprocess.run, credential_provider=None, push_backend=None):
+    """Construct the Generic App-backed production graph or an explicit injected test graph."""
     if manifest.get("schema_version") != 2:
         raise ValueError("runtime wiring requires schema_version 2")
-    required = ("database_path", "workspace", "owner_id", "antigravity_executable",
-                "app_gh_executable", "app_git_push_executable", "github_read_token_env")
+    required = ("database_path", "workspace", "owner_id", "antigravity_executable")
     if any(not local_config.get(k) for k in required):
         raise ValueError("incomplete machine-local runtime configuration")
-    api = api or GitHubAPI(os.environ.get(local_config["github_read_token_env"], ""))
-    writer = writer or GitHubAppWriter(local_config["app_gh_executable"], runner)
+    workspace = str(Path(local_config["workspace"]).expanduser().resolve())
+    app_configured = isinstance(local_config.get("github_app"), dict)
+    legacy_fields = all(local_config.get(key) for key in (
+        "app_gh_executable", "app_git_push_executable", "github_read_token_env"))
+    if app_configured:
+        app_settings = local_config["github_app"]
+        api_url = app_settings.get("api_url", "https://api.github.com")
+        target_repo = _workspace_repository(workspace, api_url)
+        credential_provider = credential_provider or _make_credential_provider(local_config, target_repo)
+        api = api or GitHubAPI.with_app_provider(credential_provider)
+        writer = writer or GitHubAppWriter(
+            credential_provider=credential_provider, target_repository=target_repo,
+            allowed_labels=(manifest["issue_contract"]["active_coordination_labels"]
+                            + manifest["issue_contract"]["terminal_coordination_labels"]),
+        )
+        push_backend = push_backend or GitHubAppPushBackend(
+            credential_provider, workspace, target_repo,
+            manifest["repository"]["base_branch"], runner=runner,
+        )
+        runtime_context = {
+            "github_app": app_settings,
+            "workspace": workspace,
+            "repo": target_repo,
+            "base_branch": manifest["repository"]["base_branch"],
+            "coordination_labels": (manifest["issue_contract"]["active_coordination_labels"]
+                                    + manifest["issue_contract"]["terminal_coordination_labels"]),
+            "python_executable": sys.executable,
+        }
+        app_gh = app_git_push = None
+    elif api is not None and legacy_fields:
+        # Retained solely as the existing deterministic test injection seam.
+        writer = writer or GitHubAppWriter(local_config["app_gh_executable"], runner)
+        app_gh, app_git_push, runtime_context = (local_config["app_gh_executable"],
+                                                 local_config["app_git_push_executable"], None)
+    else:
+        raise ValueError("production runtime requires the Generic github_app provider configuration")
     workflow = GitHubWorkflowAdapter(api, writer, manifest)
-    implementer = AntiGravityImplementer(local_config["antigravity_executable"], local_config["workspace"],
-                                        local_config["app_gh_executable"], local_config["app_git_push_executable"], runner,
-                                        local_config.get("launch_timeout_seconds", 60))
+    implementer = AntiGravityImplementer(local_config["antigravity_executable"], workspace,
+                                         app_gh, app_git_push, runner,
+                                         local_config.get("launch_timeout_seconds", 60),
+                                         runtime_context=runtime_context)
     implementer._policy = manifest
     core = RuntimeCore(local_config["database_path"], manifest, workflow, implementer,
                        recovery_timeout_seconds=local_config.get("recovery_timeout_seconds", 900))
     from .lifecycle import LifecycleDriver
     lifecycle = LifecycleDriver(core, manifest, local_config.get("lifecycle_timeouts", {}))
-    return RuntimeAdapters(core, workflow, implementer, lifecycle)
+    return RuntimeAdapters(core, workflow, implementer, lifecycle,
+                           credential_provider=credential_provider, push_backend=push_backend)
