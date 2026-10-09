@@ -434,7 +434,7 @@ class AdapterTests(unittest.TestCase):
             self.assertNotIn("GITHUB_APP_PRIVATE_KEY", env)
             self.assertTrue(list(Path(subprocess.run(["git", "-C", str(workspace), "rev-parse", "--absolute-git-dir"],
                                                      capture_output=True, text=True, check=True).stdout.strip())
-                               .glob("vccp-control/*/app-gh.*")))
+                               .glob("vccp-control/*/app-gh*")))
 
     def test_exact_head_repair_and_stale_review_launch_counts(self):
         with tempfile.TemporaryDirectory() as temp:
