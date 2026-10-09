@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile, mkdir } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -479,6 +480,50 @@ test("managed artifact drift blocks apply without overwriting consumer edits", a
     assert.equal(result.overall_status, "repository_blocked");
     assert.equal(result.exit_code, 2);
     assert.equal(await readFile(target, "utf8"), before);
+  });
+});
+
+test("managed text audit canonicalizes Windows newlines while retaining raw stale-plan fencing", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const initial = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
+    await applyOnboardingPlan({ plan: initial, root, github });
+
+    const lock = JSON.parse(await readFile(path.join(root, ".github/vccp/installation-lock.json"), "utf8"));
+    const managedPaths = [
+      ".github/workflows/vccp-coordination-label-cleanup.yml",
+      ".github/vccp/reviewer-task-prompt.md",
+    ];
+    const original = new Map();
+    for (const relativePath of managedPaths) {
+      const target = path.join(root, relativePath);
+      const lfContent = await readFile(target, "utf8");
+      original.set(relativePath, lfContent);
+      const hash = createHash("sha256").update(lfContent.replace(/\r\n/g, "\n")).digest("hex");
+      assert.equal(lock.artifacts.find((record) => record.path === relativePath).sha256, hash);
+      await writeFile(target, lfContent.replace(/\r?\n/g, "\r\n"));
+    }
+
+    const windowsAudit = await auditConsumer({ repo: REPO, root, github });
+    assert.equal(windowsAudit.overall_status, "repository_ready");
+    assert.equal(windowsAudit.items.find((entry) => entry.id === "file:.github/workflows/vccp-coordination-label-cleanup.yml").status, "satisfied");
+    assert.equal(windowsAudit.items.find((entry) => entry.id === "file:.github/vccp/reviewer-task-prompt.md").status, "satisfied");
+
+    const reviewerPath = ".github/vccp/reviewer-task-prompt.md";
+    const reviewerFile = path.join(root, reviewerPath);
+    await writeFile(reviewerFile, `${await readFile(reviewerFile, "utf8")}Changed body.\r\n`);
+    const editedAudit = await auditConsumer({ repo: REPO, root, github });
+    assert.equal(editedAudit.overall_status, "repository_blocked");
+    assert.equal(editedAudit.items.find((entry) => entry.id === `file:${reviewerPath}`).status, "conflict");
+
+    await writeFile(reviewerFile, original.get(reviewerPath).replace(/\n/g, "\r\n"));
+    const planned = await createOnboardingPlan({ repo: REPO, root, github });
+    assert.equal(planned.overall_status, "repository_ready");
+    await writeFile(reviewerFile, original.get(reviewerPath));
+    const stale = await applyOnboardingPlan({ plan: planned, root, github });
+    assert.equal(stale.overall_status, "stale_plan");
+    assert.equal(stale.exit_code, 4);
+    assert.equal(github.labelCreates.length, 6);
   });
 });
 
