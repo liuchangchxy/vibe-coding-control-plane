@@ -15,6 +15,7 @@ from .core import RuntimeConfig
 from .github_app import (DPAPIFileCredentialSource, GitHubAppError,
                          GitHubAppNotInstalled, GitHubAppPermissionError)
 from .github_push import GitHubAppPushBackend
+from .runner import RuntimeAlreadyRunning, RuntimeLock
 
 _REQUIRED = (
     "database_path", "workspace", "owner_id", "antigravity_executable",
@@ -55,6 +56,13 @@ def qualify_activation(manifest: dict, local_config: dict, repo: str, environ=No
         blockers.append("local configuration missing: " + ", ".join(missing))
         return {"status": "not_ready", "blockers": blockers}
 
+    target_repo = local_config.get("target_repository")
+    enrollment = local_config.get("enrollment")
+    if not isinstance(target_repo, str) or target_repo.casefold() != repo.casefold():
+        blockers.append("machine-local target_repository does not match the requested consumer repository")
+    if not isinstance(enrollment, dict) or not isinstance(enrollment.get("authorized_repository"), str) or enrollment["authorized_repository"].casefold() != repo.casefold():
+        blockers.append(f"human enrollment authorization is required for {repo}")
+
     workspace = Path(local_config["workspace"]).expanduser()
     if not workspace.is_dir():
         blockers.append("workspace directory is unavailable")
@@ -70,6 +78,11 @@ def qualify_activation(manifest: dict, local_config: dict, repo: str, environ=No
     database_parent = database_path.parent
     if not database_parent.is_dir() or not os.access(database_parent, os.W_OK):
         blockers.append("database_path parent must be an existing writable directory")
+
+    if not isinstance(local_config.get("conversation_roots", []), list):
+        blockers.append("conversation_roots must be a list of machine-local directories")
+    elif any(not Path(root).expanduser().is_dir() for root in local_config.get("conversation_roots", [])):
+        blockers.append("configured AntiGravity conversation root is unavailable")
 
     app_config = local_config.get("github_app")
     if not isinstance(app_config, dict) or not str(app_config.get("app_id", "")).isdigit():
@@ -131,6 +144,8 @@ def qualify_activation(manifest: dict, local_config: dict, repo: str, environ=No
                                     push_backend=push_backend)
             if runtime.core is None or runtime.workflow is None or runtime.implementer is None or runtime.lifecycle is None:
                 raise ValueError("runtime component construction was incomplete")
+        with RuntimeLock(repo, str(database_path)):
+            pass
     except GitHubAppNotInstalled as error:
         return {"status": "not_ready", "blockers": [str(error)], "installation": {"installed": False}}
     except GitHubAppPermissionError as error:
@@ -139,7 +154,7 @@ def qualify_activation(manifest: dict, local_config: dict, repo: str, environ=No
                                  "missing_permissions": error.missing_permissions}}
     except GitHubAppError as error:
         return {"status": "not_ready", "blockers": [str(error)]}
-    except (OSError, TypeError, ValueError) as error:
+    except (OSError, RuntimeAlreadyRunning, TypeError, ValueError) as error:
         return {"status": "not_ready", "blockers": [f"production runtime qualification failed: {error}"]}
     return {"status": "ready", "blockers": [],
             "credential_source": {"type": "windows_dpapi_file", "present": True},

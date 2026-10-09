@@ -76,13 +76,26 @@ class RuntimeRunnerTests(unittest.TestCase):
             events.append("cycle")
             return {"status": "ok"}
 
-        with patch.object(runner, "_load", side_effect=[{}, {"database_path": "state.db", "owner_id": "owner"}]), \
+        local = {"database_path": "state.db", "owner_id": "owner", "workspace": ".",
+                 "target_repository": "owner/repo", "enrollment": {"authorized_repository": "owner/repo"}}
+        with patch.object(runner, "_load", side_effect=[{}, local]), \
+             patch.object(runner, "_workspace_repository", return_value="owner/repo"), \
              patch.object(runner, "RuntimeLock", Lock), \
              patch.object(runner, "build_runtime", side_effect=build), \
              patch.object(runner, "run_cycle", side_effect=cycle), redirect_stdout(StringIO()):
             runner.main(["--manifest", "manifest.json", "--runtime-config", "runtime.json",
                          "--repo", "owner/repo", "--one-cycle"])
         self.assertEqual(events, [("identity", "owner/repo", "state.db"), "lock", "build", "cycle", "release"])
+
+    def test_cli_rejects_target_or_enrollment_mismatch_before_runtime_construction(self):
+        local = {"database_path": "state.db", "owner_id": "owner", "workspace": ".",
+                 "target_repository": "other/repo", "enrollment": {"authorized_repository": "owner/repo"}}
+        with patch.object(runner, "_load", side_effect=[{}, local]), \
+             patch.object(runner, "build_runtime", side_effect=AssertionError("must not construct runtime")):
+            with self.assertRaises(SystemExit) as error:
+                runner.main(["--manifest", "manifest.json", "--runtime-config", "runtime.json",
+                             "--repo", "owner/repo"])
+        self.assertEqual(error.exception.code, 2)
 
 
 if __name__ == "__main__":

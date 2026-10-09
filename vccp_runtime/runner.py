@@ -10,7 +10,7 @@ import signal
 import tempfile
 import time
 
-from .adapters import build_runtime
+from .adapters import _workspace_repository, build_runtime
 from .orchestrator import run_once
 
 
@@ -102,6 +102,19 @@ def main(argv=None):
     parser.add_argument("--poll-interval", type=float, default=30.0)
     args = parser.parse_args(argv)
     manifest, local = _load(args.manifest), _load(args.runtime_config)
+    target_repo = local.get("target_repository")
+    enrollment = local.get("enrollment")
+    if not isinstance(target_repo, str) or target_repo.casefold() != args.repo.casefold():
+        parser.error("--repo must match machine-local target_repository")
+    authorized_repo = enrollment.get("authorized_repository") if isinstance(enrollment, dict) else None
+    if not isinstance(authorized_repo, str) or authorized_repo.casefold() != args.repo.casefold():
+        parser.error("human enrollment authorization does not match --repo")
+    if not isinstance(local.get("workspace"), str):
+        parser.error("machine-local workspace is required")
+    app_config = local.get("github_app")
+    api_url = app_config.get("api_url", "https://api.github.com") if isinstance(app_config, dict) else "https://api.github.com"
+    if _workspace_repository(local["workspace"], api_url).casefold() != args.repo.casefold():
+        parser.error("workspace origin does not match --repo")
     lock = RuntimeLock(args.repo, local["database_path"])
     try:
         with lock:

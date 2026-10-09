@@ -79,6 +79,9 @@ test("fresh input creates a read-only plan pinned to a reachable canonical revis
     assert.equal(plan.external_steps.find((item) => item.id === "reviewer-task").status, "external-step");
     assert.equal(plan.external_steps.some((item) => item.id === "dispatcher"), false);
     assert.equal(plan.runtime_activation.status, "unknown");
+    assert.equal(plan.machine_authorization.status, "unknown");
+    assert.equal(plan.machine_activation.status, "unknown");
+    assert.equal(plan.repository_status, "changes_planned");
     assert.equal(github.labelCreates.length, 0);
     await assert.rejects(readFile(path.join(root, ".github/control-plane.yml")));
   });
@@ -94,6 +97,21 @@ test("clean consumer plans VCCP cleanup creation and an exact managed cleanup is
     const second = await createOnboardingPlan({ repo: REPO, root, github });
     assert.equal(second.overall_status, "repository_ready");
     assert.equal(second.items.find((entry) => entry.path === ".github/workflows/vccp-coordination-label-cleanup.yml").status, "satisfied");
+  });
+});
+
+test("consumer-owned equivalent cleanup satisfies the capability without a VCCP adapter", async () => {
+  await withRepo(async (root) => {
+    const workflowDir = path.join(root, ".github/workflows");
+    const scriptDir = path.join(root, ".github/scripts");
+    await mkdir(workflowDir, { recursive: true });
+    await mkdir(scriptDir, { recursive: true });
+    await writeFile(path.join(workflowDir, "close-housekeeping.yml"), "on:\n  issues:\n    types: [closed]\njobs:\n  cleanup:\n    steps:\n      - run: node .github/scripts/prune-coordination.js\n");
+    await writeFile(path.join(scriptDir, "prune-coordination.js"), "const ACTIVE_LABELS = ['agent-ready', 'agent-working', 'changes-requested'];\nconst TERMINAL_LABELS = ['infra-blocked', 'needs-human'];\nfor (const label of ACTIVE_LABELS) await removeLabel(label);\n");
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github: new FakeGitHub() });
+    assert.equal(plan.capabilities["coordination-label-cleanup"].status, "satisfied");
+    assert.equal(plan.capabilities["coordination-label-cleanup"].provider, "consumer");
+    assert.equal(plan.items.some((entry) => entry.path === ".github/workflows/vccp-coordination-label-cleanup.yml"), false);
   });
 });
 

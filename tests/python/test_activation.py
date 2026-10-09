@@ -65,6 +65,8 @@ class ActivationTests(unittest.TestCase):
         self.config = {
             "database_path": str(self.root / "state" / "runtime.sqlite"),
             "workspace": str(self.workspace),
+            "target_repository": REPO,
+            "enrollment": {"authorized_repository": REPO},
             "owner_id": "test-owner",
             "antigravity_executable": str(self.executable),
             "github_app": {"app_id": "123456", "expected_app_slug": "app",
@@ -111,6 +113,17 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual(result["status"], "not_ready")
         self.assertEqual(result["installation"]["missing_permissions"], {"contents": "write"})
         self.assertIn("contents:write", result["blockers"][0])
+
+    def test_compatible_repository_without_enrollment_and_target_mismatch_are_not_ready(self):
+        un_enrolled = dict(self.config)
+        un_enrolled.pop("enrollment")
+        result = self._qualify(config=un_enrolled)
+        self.assertEqual(result["status"], "not_ready")
+        self.assertTrue(any("human enrollment authorization is required" in item for item in result["blockers"]))
+        wrong_target = dict(self.config, target_repository="other/repo")
+        result = self._qualify(config=wrong_target)
+        self.assertEqual(result["status"], "not_ready")
+        self.assertTrue(any("target_repository" in item for item in result["blockers"]))
 
     def test_repository_read_mismatch_and_missing_credential_fail_closed(self):
         result = self._qualify(api=FakeAPI("other/repo"))
