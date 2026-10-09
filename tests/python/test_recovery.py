@@ -54,10 +54,14 @@ class RecoveryImplementer:
     def __init__(self, *results):
         self.results = list(results)
         self.requests = []
+        self.activity = None
 
     def launch(self, request):
         self.requests.append(request)
         return self.results.pop(0) if self.results else LaunchResult(LaunchDisposition.CONFIRMED, "exec")
+
+    def latest_activity(self, conversation_id):
+        return self.activity
 
 
 class RecoveryTests(unittest.TestCase):
@@ -107,9 +111,11 @@ class RecoveryTests(unittest.TestCase):
 
     def test_restart_repair_with_unchanged_head_waits_without_relaunch(self):
         self._start_repair()
+        row = self.core.store.attempts_for_repo("acme/alpha")[-1]
         core = RuntimeCore(self.db, MANIFEST, self.workflow, self.implementer, recovery_timeout_seconds=60)
-        result = core.reconcile_once("acme/alpha", "owner")
+        result = core.reconcile_once("acme/alpha", "owner", row["implementer_activity_at"] + 61)
         self.assertEqual(result["items"][0]["status"], "waiting_for_repair_push")
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "agent-working")
         self.assertEqual(len(self.implementer.requests), 2)
 
     def test_restart_repair_with_new_head_binds_same_pr_and_branch(self):
@@ -179,9 +185,35 @@ class RecoveryTests(unittest.TestCase):
     def test_confirmed_launch_without_pr_waits_until_deadline(self):
         self.start(LaunchDisposition.CONFIRMED)
         row = self.core.store.attempts_for_repo("acme/alpha")[-1]
-        result = self.core.reconcile_once("acme/alpha", "owner", row["deadline_at"] - 1)
+        baseline = row["implementer_activity_at"]
+        self.implementer.activity = baseline
+        result = self.core.reconcile_once("acme/alpha", "owner", baseline + 901)
         self.assertEqual(result["items"][0]["status"], "unresolved")
         self.assertEqual(len(self.implementer.requests), 1)
+        before_stall = self.core.observe_implementer_progress("acme/alpha", baseline + 1799)
+        self.assertEqual(before_stall["items"][0]["status"], "no_new_activity")
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "agent-working")
+        stalled = self.core.observe_implementer_progress("acme/alpha", baseline + 1800)
+        self.assertEqual(stalled["items"][0]["status"], "implementer_stalled")
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "infra-blocked")
+
+    def test_confirmed_activity_after_recovery_boundary_refreshes_progress_deadline(self):
+        self.core = RuntimeCore(self.db, MANIFEST, self.workflow, self.implementer,
+                                recovery_timeout_seconds=900,
+                                implementer_progress_timeout_seconds=1800)
+        self.start(LaunchDisposition.CONFIRMED)
+        row = self.core.store.attempts_for_repo("acme/alpha")[-1]
+        baseline = row["implementer_activity_at"]
+        self.assertIsNone(row["deadline_at"])
+        self.implementer.activity = baseline + 901
+        reconciled = self.core.reconcile_once("acme/alpha", "owner", baseline + 901)
+        self.assertEqual(reconciled["items"][0]["status"], "unresolved")
+        observed = self.core.observe_implementer_progress("acme/alpha", baseline + 901)
+        self.assertEqual(observed["items"][0]["status"], "progress")
+        updated = self.core.store.attempts_for_repo("acme/alpha")[-1]
+        self.assertEqual(updated["implementer_activity_at"], baseline + 901)
+        self.assertEqual(updated["progress_deadline_at"], baseline + 901 + 1800)
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "agent-working")
 
     def test_unknown_timeout_moves_to_infra_blocked_without_second_launch(self):
         self.start(LaunchDisposition.UNKNOWN)

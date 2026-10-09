@@ -213,6 +213,9 @@ class RuntimeCoreTests(unittest.TestCase):
         self.assertEqual(refreshed["implementer_activity_at"], baseline + 20)
         self.core.store.renew_owner_lease("acme/alpha", 7, "worker", baseline + 30, 300)
         self.assertEqual(self.core.store.attempt(result["attempt_id"])["implementer_activity_at"], baseline + 20)
+        before_deadline = self.core.observe_implementer_progress("acme/alpha", baseline + 20 + 1799)
+        self.assertEqual(before_deadline["items"][0]["status"], "no_new_activity")
+        self.assertEqual(self.workflow.current.coordination_state, "agent-working")
         outcome = self.core.observe_implementer_progress("acme/alpha", baseline + 20 + 1800)
         self.assertEqual(outcome["items"][0]["status"], "implementer_stalled")
         self.assertEqual(self.workflow.current.coordination_state, "infra-blocked")
@@ -225,7 +228,7 @@ class RuntimeCoreTests(unittest.TestCase):
         attempt = self.core.store.attempt(confirmed["attempt_id"])
         baseline = attempt["implementer_activity_at"]
         self.assertEqual(attempt["progress_deadline_at"] - baseline, 1800)
-        self.assertEqual(attempt["deadline_at"] - attempt["phase_entered_at"], 900)
+        self.assertIsNone(attempt["deadline_at"])
 
     def test_unknown_launch_uses_recovery_timeout_independent_of_progress_timeout(self):
         for progress_timeout in (1800, 37):

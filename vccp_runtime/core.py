@@ -332,7 +332,7 @@ class _Store:
             now = time.time()
             entered = now if row["phase"] != phase else None
             deadline = now + recovery_timeout if entered is not None and phase in {
-                "CLAIM_INTENT", "CLAIMED", "LAUNCH_INTENT", "LAUNCH_UNKNOWN", "LAUNCH_CONFIRMED"
+                "CLAIM_INTENT", "CLAIMED", "LAUNCH_INTENT", "LAUNCH_UNKNOWN"
             } else None
             connection.execute(
                 "UPDATE attempts SET phase=?, launch_outcome=?, execution_id=?, updated_at=?, "
@@ -340,7 +340,8 @@ class _Store:
                 "WHEN ? THEN NULL ELSE deadline_at END WHERE attempt_id=?",
                 (phase, outcome, execution_id, now, entered, deadline, deadline,
                  phase in {"CLAIM_FAILED", "LAUNCH_NOT_STARTED", "BUDGET_EXHAUSTED", "PR_BOUND",
-                           "STOPPED_CANCELLED", "TERMINAL_UNRESOLVED", "RETRY_ELIGIBLE"}, attempt_id),
+                           "LAUNCH_CONFIRMED", "STOPPED_CANCELLED", "TERMINAL_UNRESOLVED",
+                           "RETRY_ELIGIBLE"}, attempt_id),
             )
             if phase == "LAUNCH_CONFIRMED" and execution_id and implementer_progress_timeout is not None:
                 connection.execute("UPDATE attempts SET implementer_activity_at=?,progress_deadline_at=? "
@@ -542,6 +543,12 @@ class _Store:
             return row["deadline_at"] if row else None
         finally:
             connection.close()
+
+    def clear_recovery_deadline(self, attempt_id: str):
+        with closing(self._connect()) as connection:
+            connection.execute("UPDATE attempts SET deadline_at=NULL WHERE attempt_id=? AND deadline_at IS NOT NULL",
+                               (attempt_id,))
+            connection.commit()
 
     def adopt_orphan(self, repo: str, issue: int, owner: str, pr_number: int, branch: str,
                      head_sha: str, now: float, trusted: bool = False):
@@ -1007,8 +1014,12 @@ class RuntimeCore:
                 continue
             if latest:
                 self.store.renew_owner_lease(repo_key, issue, owner_id, current_time, self.lease_ttl_seconds)
-                latest["deadline_at"] = self.store.ensure_deadline(latest["attempt_id"],
-                                                                    self.recovery_timeout_seconds)
+                if latest["phase"] == "LAUNCH_CONFIRMED" and latest.get("execution_id"):
+                    self.store.clear_recovery_deadline(latest["attempt_id"])
+                    latest["deadline_at"] = None
+                else:
+                    latest["deadline_at"] = self.store.ensure_deadline(latest["attempt_id"],
+                                                                        self.recovery_timeout_seconds)
                 if not snapshot.canonical_relationship_valid:
                     self._recovery_terminal(repo_key, issue, snapshot, "needs-human")
                     self.store.local_terminal(latest["attempt_id"], "TERMINAL_UNRESOLVED", current_time)
