@@ -40,13 +40,16 @@ class FakeProvider:
     api_url = "https://api.github.com"
     target_repository = REPO
 
-    def __init__(self, remote_sha=None):
+    def __init__(self, remote_sha=None, on_token=None):
         self.remote_sha = remote_sha
+        self.on_token = on_token
         self.requests = []
 
     def get_token(self, repo):
         if repo.casefold() != REPO:
             raise GitHubAppIdentityError("target denied")
+        if self.on_token:
+            self.on_token()
         return TOKEN
 
     def request(self, method, path, repo, payload=None):
@@ -87,6 +90,27 @@ class PushBackendTests(unittest.TestCase):
         self.assertNotIn(TOKEN, repr(result))
         self.assertEqual(self.provider.requests[-1][1],
                          f"/repos/{REPO}/git/ref/heads/feature/test")
+
+    def test_branch_move_after_preflight_still_pushes_the_preflight_sha(self):
+        run_git(["git", "checkout", "-b", "move-source"], self.workspace).check_returncode()
+        (self.workspace / "file.txt").write_text("moved", encoding="utf-8")
+        run_git(["git", "add", "file.txt"], self.workspace).check_returncode()
+        run_git(["git", "commit", "-m", "moved"], self.workspace).check_returncode()
+        sha_b = run_git(["git", "rev-parse", "HEAD"], self.workspace).stdout.strip()
+        run_git(["git", "checkout", "feature/test"], self.workspace).check_returncode()
+        sha_a = run_git(["git", "rev-parse", "HEAD"], self.workspace).stdout.strip()
+        run_git(["git", "update-ref", "refs/heads/feature/test", sha_a], self.workspace).check_returncode()
+
+        def move_after_preflight():
+            run_git(["git", "update-ref", "refs/heads/feature/test", sha_b], self.workspace).check_returncode()
+
+        self.provider.on_token = move_after_preflight
+        self.backend.push(REPO, "feature/test", sha_a, "feature/test", controlled=True)
+
+        refspec = self.push_calls[0][0][-1]
+        self.assertEqual(refspec, f"{sha_a}:refs/heads/feature/test")
+        self.assertNotEqual(refspec, "refs/heads/feature/test:refs/heads/feature/test")
+        self.assertEqual(run_git(["git", "rev-parse", "refs/heads/feature/test"], self.workspace).stdout.strip(), sha_b)
 
     def test_expected_sha_mismatch_and_wrong_repo_fail_before_push(self):
         with self.assertRaisesRegex(GitHubAppIdentityError, "expected SHA"):

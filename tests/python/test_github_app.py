@@ -187,7 +187,7 @@ class GitHubAppWriterTests(unittest.TestCase):
         self.assertEqual(len(self.transport.calls), before)
 
     def test_writer_limits_pr_creation_to_enrolled_issue_and_base(self):
-        number = self.writer.create_pull_request(REPO, 7, "Change", "Resolves #7", "work", "main")
+        number = self.writer.create_pull_request(REPO, 7, "Change", "Summary\n\nResolves #7", "work", "main")
         self.assertEqual(number, 44)
         request = next(call for call in self.transport.calls if call[0] == "POST" and call[1].endswith("/pulls"))
         self.assertEqual(request[3]["head"], "work")
@@ -195,6 +195,30 @@ class GitHubAppWriterTests(unittest.TestCase):
             self.writer.create_pull_request(REPO, 7, "Change", "No issue ref", "work", "main")
         with self.assertRaises(GitHubAppIdentityError):
             self.writer.create_pull_request("owner/other", 7, "Change", "#7", "work", "main")
+
+    def test_writer_accepts_github_closing_keywords_case_insensitively(self):
+        bodies = ("Close #7", "Closes #7", "Closed #7", "Fix #7", "Fixes #7", "Fixed #7",
+                  "Resolve #7", "Resolves #7", "Resolved #7", "cLoSeD: #7")
+        for body in bodies:
+            with self.subTest(body=body):
+                before = len([call for call in self.transport.calls
+                              if call[0] == "POST" and call[1].endswith("/pulls")])
+                self.writer.create_pull_request(REPO, 7, "Change", body, "work", "main")
+                after = len([call for call in self.transport.calls
+                             if call[0] == "POST" and call[1].endswith("/pulls")])
+                self.assertEqual(after, before + 1)
+
+    def test_writer_rejects_nonclosing_or_wrong_issue_references_before_mutation(self):
+        bodies = ("See #7", "Related to #7", "Refs #7", "Closes #8", "No issue reference")
+        for body in bodies:
+            with self.subTest(body=body):
+                before = len([call for call in self.transport.calls
+                              if call[0] == "POST" and call[1].endswith("/pulls")])
+                with self.assertRaises(GitHubAppIdentityError):
+                    self.writer.create_pull_request(REPO, 7, "Change", body, "work", "main")
+                after = len([call for call in self.transport.calls
+                             if call[0] == "POST" and call[1].endswith("/pulls")])
+                self.assertEqual(after, before)
 
 
 if __name__ == "__main__":

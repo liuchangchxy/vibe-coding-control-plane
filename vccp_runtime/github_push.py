@@ -103,7 +103,7 @@ class GitHubAppPushBackend:
         environment = self._git_auth_environment(os.environ.copy(), push_url, token, self.remote_name)
         environment["VCCP_CONTROLLED_PUSH"] = "1"
         self._run_git(["push", "--porcelain", self.remote_name,
-                       f"refs/heads/{source_name}:{destination}"], env=environment)
+                       f"{expected_sha.lower()}:{destination}"], env=environment)
 
         owner, name = repo.split("/", 1)
         path = f"/repos/{owner}/{name}/git/ref/heads/{quote(destination_branch, safe='/')}"

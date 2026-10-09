@@ -372,6 +372,9 @@ class AdapterTests(unittest.TestCase):
         self.assertIn("Frozen Issue: #3", prompt)
         self.assertIn("ordinary host-human gh writes are forbidden", prompt.lower())
         self.assertIn("ordinary git push is forbidden", prompt.lower())
+        self.assertIn("Closes #<issue_number>", prompt)
+        self.assertIn("a plain mention is insufficient", prompt)
+        self.assertIn("--body 'SUMMARY. Closes #<issue_number>'", prompt)
         self.assertIn("C:/tools/app-git-push.exe", prompt)
         for forbidden in ("EasyExam", "Reviewer-only", "three REQUEST_CHANGES rounds"):
             self.assertNotIn(forbidden, prompt)

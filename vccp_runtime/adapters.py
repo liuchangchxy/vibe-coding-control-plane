@@ -162,8 +162,12 @@ class GitHubAppWriter:
         if not isinstance(issue, int) or issue < 1 or not all(isinstance(x, str) and x.strip()
                                                             for x in (title, body, head, base)):
             raise ValueError("controlled PR creation arguments are invalid")
-        if not re.search(rf"(?<![A-Za-z0-9_])#{issue}(?![0-9])", body):
-            raise GitHubAppIdentityError("controlled PR must reference its Frozen Issue")
+        closing_reference = (rf"(?<![A-Za-z0-9_])(?:close(?:s|d)?|fix(?:es|ed)?|"
+                             rf"resolve(?:s|d)?)(?:\s*:\s*|\s+)#{issue}(?![A-Za-z0-9])")
+        if not re.search(closing_reference, body, re.IGNORECASE):
+            raise GitHubAppIdentityError(
+                "controlled PR body must close its Frozen Issue with a GitHub closing keyword"
+            )
         if ":" in head or head.startswith("-") or head == base:
             raise GitHubAppIdentityError("controlled PR head or base is outside the same-repository policy")
         owner, name = repo.split("/", 1)
@@ -349,7 +353,10 @@ def generic_prompt(request: LaunchRequest, workspace: str, policy: dict,
               "Do not expand scope or merge. Report tests actually run. Ordinary host-human gh writes are "
               "forbidden; use only the configured controlled App writer for GitHub writes. Ordinary git push "
               "is forbidden; use only the configured controlled push wrapper. Do not persist or request GitHub "
-              "tokens. For PR creation use: <app-gh> pr create --title TITLE --body BODY --head BRANCH "
+              "tokens. The PR body MUST include a GitHub closing reference to this Frozen Issue, for example "
+              "'Closes #<issue_number>' (or 'Fixes'/'Resolves'); a plain mention is insufficient. "
+              "For PR creation use: <app-gh> pr create --title TITLE --body 'SUMMARY. Closes #<issue_number>' "
+              "--head BRANCH "
               "--base BASE. For labels use: <app-gh> issue edit ISSUE --remove-label LABEL --add-label LABEL. "
               "For a push use: <app-git-push> --branch BRANCH --expected-sha FULL_SHA.\n")
     if request.attempt_kind == "repair":
