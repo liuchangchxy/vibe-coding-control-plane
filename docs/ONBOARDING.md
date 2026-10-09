@@ -77,6 +77,7 @@ Example `C:/Users/<user>/.vccp/consumer-runtime.json` (replace every example pat
   },
   "launch_timeout_seconds": 60,
   "recovery_timeout_seconds": 900,
+  "implementer_progress_timeout_seconds": 1800,
   "lifecycle_timeouts": {
     "waiting_ci": 3600,
     "waiting_review": 86400,

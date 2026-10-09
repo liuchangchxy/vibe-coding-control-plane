@@ -308,7 +308,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(result["items"][0]["status"], "needs-human")
         self.assertEqual(len(self.implementer.launches), 1)
 
-    def test_restart_canonical_pr_adoption_resumes_ci_failure_with_one_same_pr_repair(self):
+    def test_restart_adoption_without_budget_evidence_blocks_ci_repair(self):
         connection = self.core.store._connect()
         connection.execute("DELETE FROM attempts WHERE repo=? AND issue_number=?", (self.repo, self.issue))
         connection.execute("DELETE FROM flows WHERE repo=? AND issue_number=?", (self.repo, self.issue))
@@ -317,15 +317,30 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(adopted["items"][0]["status"], "orphan_adopted_trusted")
         self.update(check_runs=self.failure())
         repaired = self.driver().advance_once(self.repo, "owner", 101)
-        self.assertEqual(repaired["items"][0]["status"], "launched")
+        self.assertEqual(repaired["items"][0]["status"], "needs-human")
+        self.assertEqual(repaired["items"][0]["outcome"],
+                         "repair_history_or_budget_provenance_unknown")
         repair = [row for row in self.core.store.attempts_for_repo(self.repo) if row["kind"] == "repair"]
-        self.assertEqual(len(repair), 1)
-        self.assertEqual((repair[0]["pr_number"], repair[0]["branch"], repair[0]["repair_ordinal"]),
-                         (44, "implement/7", 1))
-        again = self.driver().advance_once(self.repo, "owner", 102)
-        self.assertEqual(again["items"][0]["status"], "waiting_for_repair")
+        self.assertEqual(repair, [])
+        self.assertEqual(len(self.implementer.launches), 1)
+
+    def test_adopted_pr_with_unknown_budget_remains_observable_through_merge(self):
+        connection = self.core.store._connect()
+        connection.execute("DELETE FROM attempts WHERE repo=? AND issue_number=?", (self.repo, self.issue))
+        connection.execute("DELETE FROM flows WHERE repo=? AND issue_number=?", (self.repo, self.issue))
+        connection.commit(); connection.close()
+        self.core.reconcile_once(self.repo, "owner", 100)
+        self.update(check_runs=self.accepted())
+        self.assertEqual(self.driver().advance_once(self.repo, "owner", 101)["items"][0]["status"],
+                         "WAITING_REVIEW")
+        self.update(formal_review_state="APPROVED", formal_review_head_sha=SHA)
+        self.assertEqual(self.driver().advance_once(self.repo, "owner", 102)["items"][0]["status"],
+                         "WAITING_MERGE")
+        self.update(pr_merged=True, pr_state="closed", pr_open=False, issue_open=False)
+        self.assertEqual(self.driver().advance_once(self.repo, "owner", 103)["items"][0]["status"],
+                         "merged_success")
         self.assertEqual(len([row for row in self.core.store.attempts_for_repo(self.repo)
-                              if row["kind"] == "repair"]), 1)
+                              if row["kind"] == "repair"]), 0)
 
     def test_ci_deadline_survives_runtime_restart(self):
         driver = self.driver()

@@ -72,17 +72,18 @@ def run_cycle(runtime, repo: str, owner_id: str, issue_number: int | None = None
 
 
 def run_continuous(runtime, repo: str, owner_id: str, poll_interval: float = 30.0,
-                   sleep=time.sleep, stop=None, issue_number: int | None = None):
+                   sleep=time.sleep, stop=None, issue_number: int | None = None,
+                   on_cycle=None):
     """Run cycles until the injected stop predicate or process termination."""
     if poll_interval <= 0:
         raise ValueError("poll_interval must be positive")
     stop = stop or (lambda: False)
-    results = []
     while not stop():
-        results.append(run_cycle(runtime, repo, owner_id, issue_number))
+        result = run_cycle(runtime, repo, owner_id, issue_number)
+        if on_cycle is not None:
+            on_cycle(result)
         if not stop():
             sleep(poll_interval)
-    return results
 
 
 def _load(path):
@@ -101,10 +102,10 @@ def main(argv=None):
     parser.add_argument("--poll-interval", type=float, default=30.0)
     args = parser.parse_args(argv)
     manifest, local = _load(args.manifest), _load(args.runtime_config)
-    runtime = build_runtime(manifest, local)
     lock = RuntimeLock(args.repo, local["database_path"])
     try:
         with lock:
+            runtime = build_runtime(manifest, local)
             if args.continuous:
                 run_continuous(runtime, args.repo, local["owner_id"], args.poll_interval)
             else:

@@ -217,6 +217,31 @@ class RuntimeCoreTests(unittest.TestCase):
         self.assertEqual(outcome["items"][0]["status"], "implementer_stalled")
         self.assertEqual(self.workflow.current.coordination_state, "infra-blocked")
 
+    def test_launch_recovery_and_progress_deadlines_use_separate_timeouts(self):
+        self.core = RuntimeCore(self.db, MANIFEST_V2, self.workflow, self.implementer,
+                                recovery_timeout_seconds=900,
+                                implementer_progress_timeout_seconds=1800)
+        confirmed = self.dispatch_initial()
+        attempt = self.core.store.attempt(confirmed["attempt_id"])
+        baseline = attempt["implementer_activity_at"]
+        self.assertEqual(attempt["progress_deadline_at"] - baseline, 1800)
+        self.assertEqual(attempt["deadline_at"] - attempt["phase_entered_at"], 900)
+
+    def test_unknown_launch_uses_recovery_timeout_independent_of_progress_timeout(self):
+        for progress_timeout in (1800, 37):
+            with self.subTest(progress_timeout=progress_timeout), tempfile.TemporaryDirectory() as folder:
+                workflow = FakeWorkflow(snapshot())
+                implementer = FakeImplementer([LaunchResult(LaunchDisposition.UNKNOWN)])
+                core = RuntimeCore(Path(folder) / "runtime.db", MANIFEST_V2, workflow, implementer,
+                                   recovery_timeout_seconds=900,
+                                   implementer_progress_timeout_seconds=progress_timeout)
+                result = core.dispatch_initial("acme/alpha", 7, "worker")
+                self.assertEqual(result["phase"], "LAUNCH_UNKNOWN")
+                attempt = core.store.attempt(result["attempt_id"])
+                self.assertEqual(attempt["deadline_at"] - attempt["phase_entered_at"], 900)
+                self.assertIsNone(attempt["implementer_activity_at"])
+                self.assertIsNone(attempt["progress_deadline_at"])
+
     def test_two_worker_initial_claim_race_launches_once(self):
         other = RuntimeCore(self.db, MANIFEST_V2, self.workflow, self.implementer)
         with ThreadPoolExecutor(max_workers=2) as pool:

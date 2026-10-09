@@ -204,7 +204,12 @@ class LifecycleDriver:
                 continue
             check_state, evidence = self._checks(snapshot)
             if check_state == "implementation":
-                if not self.core.store.flow(repo_key, issue).get("trusted"):
+                flow = self.core.store.flow(repo_key, issue)
+                if flow and not flow.get("repair_budget_known"):
+                    results.append(self._terminal(repo_key, issue, snapshot, "needs-human", current,
+                                                  "repair_history_or_budget_provenance_unknown"))
+                    continue
+                if not flow or not flow.get("trusted"):
                     results.append(self._terminal(repo_key, issue, snapshot, "needs-human", current,
                                                   "untrusted_flow_requires_repair"))
                     continue
@@ -231,7 +236,12 @@ class LifecycleDriver:
                     and snapshot.formal_review_head_sha \
                     and snapshot.formal_review_head_sha.casefold() == head \
                     and snapshot.coordination_state == "changes-requested":
-                if not self.core.store.flow(repo_key, issue).get("trusted"):
+                flow = self.core.store.flow(repo_key, issue)
+                if flow and not flow.get("repair_budget_known"):
+                    results.append(self._terminal(repo_key, issue, snapshot, "needs-human", current,
+                                                  "repair_history_or_budget_provenance_unknown"))
+                    continue
+                if not flow or not flow.get("trusted"):
                     results.append(self._terminal(repo_key, issue, snapshot, "needs-human", current,
                                                   "untrusted_flow_requires_repair"))
                     continue

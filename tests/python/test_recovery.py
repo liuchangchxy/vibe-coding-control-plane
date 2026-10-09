@@ -261,15 +261,50 @@ class RecoveryTests(unittest.TestCase):
         self.assertTrue(self.core.store.flow("acme/alpha", 7)["trusted"])
         self.assertEqual(self.core.store.attempts_for_repo("acme/alpha")[-1]["kind"], "adopted")
 
-    def test_canonical_adoption_restores_same_pr_repair_authority(self):
+    def test_canonical_adoption_without_budget_evidence_cannot_repair(self):
         self.set_snapshot(replace(snap(state="agent-working"), pr_number=44, pr_open=True,
                                   pr_linked_issue=7, pr_head_sha=SHA, pr_branch=BRANCH,
                                   open_linked_pr_count=1, canonical_link_count=1))
         self.core.reconcile_once("acme/alpha", "owner")
         candidate = RepairCandidate("acme/alpha", 7, 44, SHA, BRANCH,
                                     "implementation_failure", "check-1", "owner")
-        self.assertEqual(self.core.dispatch_repair(candidate)["status"], "launched")
-        self.assertEqual(len(self.implementer.requests), 1)
+        result = self.core.dispatch_repair(candidate)
+        self.assertEqual(result["status"], "repair_budget_unknown")
+        self.assertEqual(result["reason"], "repair_history_or_budget_provenance_unknown")
+        self.assertTrue(result["needs_human_transitioned"])
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "needs-human")
+        self.assertFalse(self.implementer.requests)
+
+    def test_canonical_adoption_preserves_durable_repair_count_and_uses_next_ordinal(self):
+        self.set_snapshot(replace(snap(state="agent-working"), pr_number=44, pr_open=True,
+                                  pr_linked_issue=7, pr_head_sha=SHA, pr_branch=BRANCH,
+                                  open_linked_pr_count=1, canonical_link_count=1))
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("INSERT INTO flows(repo,issue_number,trusted,initial_confirmed,pr_number,branch,repair_count,"
+                         "repair_budget_known) VALUES(?,?,?,?,?,?,?,?)",
+                         ("acme/alpha", 7, 1, 1, 44, BRANCH, 2, 1))
+            conn.commit()
+        result = self.core.reconcile_once("acme/alpha", "owner")
+        self.assertEqual(result["items"][0]["status"], "orphan_adopted_trusted")
+        flow = self.core.store.flow("acme/alpha", 7)
+        self.assertEqual((flow["repair_count"], flow["repair_budget_known"]), (2, 1))
+        candidate = RepairCandidate("acme/alpha", 7, 44, SHA, BRANCH,
+                                    "implementation_failure", "check-1", "owner")
+        repair = self.core.dispatch_repair(candidate)
+        self.assertEqual((repair["status"], repair["ordinal"]), ("launched", 3))
+        self.assertEqual(self.core.store.flow("acme/alpha", 7)["repair_count"], 3)
+
+    def test_legacy_flow_without_count_or_attempt_evidence_migrates_as_unknown(self):
+        legacy_db = Path(self.temp.name) / "legacy.sqlite"
+        with closing(sqlite3.connect(legacy_db)) as conn:
+            conn.execute("CREATE TABLE flows(repo TEXT NOT NULL,issue_number INTEGER NOT NULL,"
+                         "trusted INTEGER NOT NULL,initial_confirmed INTEGER NOT NULL,pr_number INTEGER,"
+                         "branch TEXT,PRIMARY KEY(repo,issue_number))")
+            conn.execute("INSERT INTO flows VALUES('acme/alpha',7,1,1,44,?)", (BRANCH,))
+            conn.commit()
+        core = RuntimeCore(legacy_db, MANIFEST, self.workflow, self.implementer)
+        flow = core.store.flow("acme/alpha", 7)
+        self.assertEqual((flow["repair_count"], flow["repair_budget_known"]), (0, 0))
 
     def test_orphan_without_pr_fails_closed_to_infra_blocked(self):
         self.set_snapshot(snap(state="agent-working"))
