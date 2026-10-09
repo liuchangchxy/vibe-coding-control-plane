@@ -498,7 +498,7 @@ test("CLI emits machine-readable plan JSON and routes all GitHub calls through t
   });
 });
 
-test("readiness CLI qualifies the real Python runtime wiring without exposing credentials or touching configured SQLite", async () => {
+test("readiness CLI blocks an unavailable App credential without exposing secrets or touching SQLite", async () => {
   await withRepo(async (root) => {
     const consumerDir = path.join(root, ".github");
     await mkdir(consumerDir, { recursive: true });
@@ -507,43 +507,31 @@ test("readiness CLI qualifies the real Python runtime wiring without exposing cr
     const toolsDir = path.join(root, "tools");
     await mkdir(stateDir);
     await mkdir(toolsDir);
-    const executablePaths = [];
-    for (const name of ["language_server.exe", "app-gh.exe", "app-git-push.exe"]) {
-      const executable = path.join(toolsDir, name);
-      await writeFile(executable, "fake");
-      executablePaths.push(executable);
-    }
-    const secret = "readiness-cli-secret-must-not-appear";
-    const prior = process.env.VCCP_ONBOARDING_READ_TOKEN;
-    process.env.VCCP_ONBOARDING_READ_TOKEN = secret;
+    const executable = path.join(toolsDir, "language_server.exe");
+    await writeFile(executable, "fake");
     const configPath = path.join(root, "runtime-config.json");
     const databasePath = path.join(stateDir, "runtime.sqlite");
     await writeFile(configPath, JSON.stringify({
       database_path: databasePath,
       workspace: root,
       owner_id: "test-owner",
-      antigravity_executable: executablePaths[0],
-      app_gh_executable: executablePaths[1],
-      app_git_push_executable: executablePaths[2],
-      github_read_token_env: "VCCP_ONBOARDING_READ_TOKEN",
+      antigravity_executable: executable,
+      github_app: {
+        app_id: "123456",
+        credential_source: { type: "windows_dpapi_file", path: path.join(root, "missing.dpapi") },
+      },
     }));
     let output = "";
-    try {
-      const code = await runOnboardingCli(["readiness", "--repo", REPO, "--path", root, "--runtime-config", configPath], {
-        stdout: { write: (text) => { output += text; } },
-        stderr: { write: () => assert.fail("readiness should emit no stderr") },
-        runtimeRevision: REV_A,
-      });
-      assert.equal(code, 0);
-      const report = JSON.parse(output);
-      assert.equal(report.overall_status, "machine_activation_ready");
-      assert.equal(report.runtime_activation.credential_source.present, true);
-      assert.doesNotMatch(output, new RegExp(secret));
-      await assert.rejects(readFile(databasePath));
-    } finally {
-      if (prior === undefined) delete process.env.VCCP_ONBOARDING_READ_TOKEN;
-      else process.env.VCCP_ONBOARDING_READ_TOKEN = prior;
-    }
+    const code = await runOnboardingCli(["readiness", "--repo", REPO, "--path", root, "--runtime-config", configPath], {
+      stdout: { write: (text) => { output += text; } },
+      stderr: { write: () => assert.fail("readiness should emit no stderr") },
+      runtimeRevision: REV_A,
+    });
+    assert.equal(code, 2);
+    const report = JSON.parse(output);
+    assert.equal(report.overall_status, "machine_activation_blocked");
+    assert.ok(report.runtime_activation.blockers.some((item) => item.includes("credential source is unavailable")));
+    await assert.rejects(readFile(databasePath));
   });
 });
 

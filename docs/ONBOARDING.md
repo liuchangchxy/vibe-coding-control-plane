@@ -57,7 +57,7 @@ For example, from a clean VCCP checkout, obtain its source revision with `git re
 
 ## 5. Machine-local runtime activation
 
-Repository onboarding writes `.github/control-plane.yml`, the shared consumer contract. Machine-local activation is separate: a JSON file on the runtime host supplies local paths, the SQLite location, owner identity, and the name of the environment variable that contains a GitHub read token. Never put these values in `.github/control-plane.yml`, generated onboarding files, or another repository-managed artifact. In particular, the token value is not stored in the JSON file.
+Repository onboarding writes `.github/control-plane.yml`, the shared consumer contract. Machine-local activation is separate: a JSON file on the runtime host supplies local paths, the SQLite location, owner identity, and GitHub App ID plus a path to a current-user DPAPI-protected private key. Never put these values or credential material in `.github/control-plane.yml`, installation lock, generated onboarding files, or another repository-managed artifact. Installation tokens are short-lived and held only in process memory; the runtime database stores no credentials.
 
 Example `C:/Users/<user>/.vccp/consumer-runtime.json` (replace every example path locally):
 
@@ -67,9 +67,14 @@ Example `C:/Users/<user>/.vccp/consumer-runtime.json` (replace every example pat
   "workspace": "C:/work/consumer",
   "owner_id": "local-runtime-owner",
   "antigravity_executable": "C:/Users/<user>/AppData/Local/AntiGravity/language_server.exe",
-  "app_gh_executable": "C:/tools/app-gh.exe",
-  "app_git_push_executable": "C:/tools/app-git-push.exe",
-  "github_read_token_env": "VCCP_GITHUB_READ_TOKEN",
+  "github_app": {
+    "app_id": "123456",
+    "expected_app_slug": "consumer-implementer",
+    "credential_source": {
+      "type": "windows_dpapi_file",
+      "path": "C:/Users/<user>/.vccp/credentials/github-app-key.dpapi"
+    }
+  },
   "launch_timeout_seconds": 60,
   "recovery_timeout_seconds": 900,
   "lifecycle_timeouts": {
@@ -80,7 +85,9 @@ Example `C:/Users/<user>/.vccp/consumer-runtime.json` (replace every example pat
 }
 ```
 
-The database parent directory must already exist and be writable. The workspace `origin` must identify the same `OWNER/REPO` passed to the command. The controlled GitHub writer must not be ordinary `gh`. Provide the token through the named environment variable in the runtime process environment; readiness reports only its name and whether a value is present.
+The database parent directory must already exist and be writable. The workspace `origin` must identify the same `OWNER/REPO` passed to the command. The DPAPI key file is created by a human-controlled one-time bootstrap, for example `python -m vccp_runtime.github_app C:/secure-source/app-private-key.pem C:/Users/<user>/.vccp/credentials/github-app-key.dpapi`. This command reads the PEM into memory, encrypts it for the current Windows user, and creates the destination without overwriting an existing file. Creating/selecting the App, installing it, approving permissions, and importing the private key remain human actions.
+
+The runtime probes installation and granted permissions without changing them. It requests only `contents:write`, `issues:write`, `pull_requests:write`, `checks:read`, and `metadata:read`; `metadata:read` is the GitHub App baseline permission. `contents:write` supports controlled pushes, `issues:write` supports coordination labels, `pull_requests:write` supports linked PR creation, and `checks:read` supports CI observation. Actions permissions are not needed in this package. If installation or permissions are missing, readiness reports the human action required; VCCP never changes App installation or permissions.
 
 Run qualification explicitly:
 
@@ -88,9 +95,9 @@ Run qualification explicitly:
 node scripts/onboard-consumer.mjs readiness --repo OWNER/REPO --path /path/to/consumer --runtime-config /path/to/consumer-runtime.json
 ```
 
-Readiness validates the local schema-v2 repository contract, workspace identity, config, executable and database-directory prerequisites, credential source presence, then constructs the existing production adapter/runtime graph using a temporary SQLite file in the configured database directory. It deletes that temporary state afterwards. It does not dispatch Issues, mutate GitHub labels, create PRs, start repairs, or launch AntiGravity conversations. Its credential and writer collaborators are inert construction fakes; this qualifies wiring and local prerequisites, not token authorization or a production dispatch.
+Readiness validates the local schema-v2 repository contract, workspace identity, config, executable and database-directory prerequisites, reads and parses the protected private key, verifies App identity and installation, checks minimum permissions, mints a short-lived token, performs a harmless repository read, constructs the bounded writer and controlled push backend, then builds the runtime graph using temporary SQLite. It deletes the temporary state afterwards. It does not dispatch Issues, mutate GitHub labels, create PRs, push, start repairs, or launch AntiGravity conversations. Installation/token/read calls are read-only and never report credential material.
 
-`repository_status` and `runtime_activation.status` are independent. Repository drift/blockage is `repository_blocked`; a schema-v1 manifest is `repository_upgrade_required`; a clean repository is `repository_ready`. PLAN, APPLY, and AUDIT without a supplied activation config report `runtime_activation.status: unknown`. AUDIT can qualify a supplied config with `--runtime-config`. Readiness returns `machine_activation_ready` only when activation succeeds; missing config/prerequisites or runtime-construction failure returns `machine_activation_blocked` with blocker reasons and exit code 2. This status describes the current machine's construction readiness, not an always-running daemon or completed business operation.
+`repository_status` and `runtime_activation.status` are independent. Repository drift/blockage is `repository_blocked`; a schema-v1 manifest is `repository_upgrade_required`; a clean repository is `repository_ready`. PLAN, APPLY, and AUDIT without a supplied activation config report `runtime_activation.status: unknown`. AUDIT can qualify a supplied config with `--runtime-config`. Readiness returns `machine_activation_ready` only when App installation, minimum permissions, harmless read, and construction succeed; missing human authorization or local prerequisites returns `machine_activation_blocked` with blocker reasons and exit code 2. This status does not imply an always-running daemon or completed business operation.
 
 To actually construct and run the existing runtime from Python, load the manifest and local JSON config and pass them to `vccp_runtime.adapters.build_runtime(manifest, local_config)`. The caller may then explicitly invoke `vccp_runtime.orchestrator.run_once(...)` when it intends to perform one runtime step. Readiness never calls `run_once()`.
 

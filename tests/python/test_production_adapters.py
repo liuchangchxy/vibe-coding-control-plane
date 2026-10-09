@@ -372,6 +372,9 @@ class AdapterTests(unittest.TestCase):
         self.assertIn("Frozen Issue: #3", prompt)
         self.assertIn("ordinary host-human gh writes are forbidden", prompt.lower())
         self.assertIn("ordinary git push is forbidden", prompt.lower())
+        self.assertIn("Closes #<issue_number>", prompt)
+        self.assertIn("a plain mention is insufficient", prompt)
+        self.assertIn("--body 'SUMMARY. Closes #<issue_number>'", prompt)
         self.assertIn("C:/tools/app-git-push.exe", prompt)
         for forbidden in ("EasyExam", "Reviewer-only", "three REQUEST_CHANGES rounds"):
             self.assertNotIn(forbidden, prompt)
@@ -393,6 +396,48 @@ class AdapterTests(unittest.TestCase):
             self.assertEqual(result["phase"], "LAUNCH_CONFIRMED")
             self.assertEqual(len(launches), 1)
             with self.assertRaises(ValueError): build_runtime({"schema_version": 1}, local, api, FakeWriter(), runner)
+
+    def test_generic_app_runtime_needs_no_prebuilt_helpers_and_generates_attempt_wrappers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            api = FakeAPI()
+            workspace = init_git_repo(Path(temp) / "repo")
+            subprocess.run(["git", "-C", str(workspace), "remote", "add", "origin",
+                            "https://github.com/o/r.git"], check=True, capture_output=True)
+
+            class Provider:
+                api_url = "https://api.github.com"
+                target_repository = "o/r"
+                def get_token(self, repo): raise AssertionError("launch must not mint a token")
+                def request(self, *args, **kwargs): raise AssertionError("launch must not call GitHub")
+
+            class PushBackend:
+                def push(self, *args, **kwargs): raise AssertionError("construction must not push")
+
+            local = {"database_path": str(Path(temp) / "runtime.sqlite"), "workspace": str(workspace),
+                     "owner_id": "owner", "antigravity_executable": "language_server.exe",
+                     "github_app": {"app_id": "123456", "credential_source": {
+                         "type": "windows_dpapi_file", "path": str(Path(temp) / "key.dpapi")}}}
+            provider = Provider()
+            launches = []
+            def agent_runner(args, **kwargs):
+                launches.append((args, kwargs))
+                return SimpleNamespace(returncode=0, stdout=json.dumps({"conversation_id": CONVERSATION_ID}))
+            runtime = build_runtime(MANIFEST, local, api=api, writer=MutatingWriter(api),
+                                    runner=agent_runner, credential_provider=provider,
+                                    push_backend=PushBackend())
+            result = runtime.core.dispatch_initial("o/r", 1, "owner")
+            self.assertEqual(result["phase"], "LAUNCH_CONFIRMED")
+            self.assertIn(".cmd" if os.name == "nt" else "app-gh", launches[0][0][-1])
+            self.assertIn("app-git-push", launches[0][0][-1])
+            self.assertNotIn("app_gh_executable", local)
+            self.assertNotIn("app_git_push_executable", local)
+            self.assertNotIn("github_read_token_env", local)
+            env = launches[0][1]["env"]
+            self.assertEqual(env["VCCP_APP_GIT_PUSH_BACKEND"], "vccp_runtime.github_push.GitHubAppPushBackend")
+            self.assertNotIn("GITHUB_APP_PRIVATE_KEY", env)
+            self.assertTrue(list(Path(subprocess.run(["git", "-C", str(workspace), "rev-parse", "--absolute-git-dir"],
+                                                     capture_output=True, text=True, check=True).stdout.strip())
+                               .glob("vccp-control/*/app-gh*")))
 
     def test_exact_head_repair_and_stale_review_launch_counts(self):
         with tempfile.TemporaryDirectory() as temp:
