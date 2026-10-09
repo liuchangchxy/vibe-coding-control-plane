@@ -244,7 +244,7 @@ test("schema, generated manifest, onboarding guide, contract, and Reviewer promp
   assert.match(template, /schema_version: 2/);
   assert.match(template, /max_automated_repairs: 3/);
   assert.match(onboarding, /`repository_upgrade_required` \(0\)/);
-  assert.match(onboarding, /Python owns activation qualification and construction of the Generic Runtime, plus claim\/ownership, dispatch, repair admission/);
+  assert.match(onboarding, /Python owns activation qualification and construction of the Generic Runtime, plus claim\/ownership, discovery, dispatch, repair admission/);
   assert.match(contract, /shared by implementation-attributable CI repairs and Reviewer-caused repairs/);
   assert.match(contract, /Dispatcher admits a candidate/);
   assert.match(contract, /repair:<repo>:pr:<pr_number>:head:<failed_or_rejected_head_sha>/);

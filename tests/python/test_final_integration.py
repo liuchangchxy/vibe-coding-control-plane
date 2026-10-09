@@ -65,7 +65,7 @@ class FakeGitHub:
         self.reads.append(path)
         if "/issues?" in path:
             repo = path.split("/repos/", 1)[1].split("/issues?", 1)[0]
-            label = "agent-working" if "agent-working" in path else "changes-requested"
+            label = path.split("labels=", 1)[1].split("&", 1)[0]
             return [issue.copy() for (key_repo, _), issue in self.issues.items()
                     if key_repo == repo and issue["state"] == "open"
                     and any(x["name"] == label for x in issue["labels"])]
@@ -166,15 +166,15 @@ class FinalIntegrationAcceptanceTests(unittest.TestCase):
         return {"name": name, "head_sha": sha, "status": "completed", "conclusion": "success", "id": id}
 
     def test_two_consumers_complete_happy_and_repair_flows_with_restart_isolation(self):
-        # Consumer A: explicit dispatch; no-issue invocation never schedules new work.
+        # Consumer A: production discovery dispatches eligible work without an Issue argument.
         runtime_a = self.runtime(self.a[0])
         first = run_once(runtime_a, self.a[0], "acceptance-owner", now=100)
-        self.assertEqual(first["dispatch"]["status"], "not_requested")
-        self.assertEqual(len(self.agent.launches), 0)
-        self.assertFalse(any("labels=agent-ready" in path for path in self.github.reads))
-        first = run_once(runtime_a, self.a[0], "acceptance-owner", self.a[1], now=101)
-        self.assertEqual(first["dispatch"]["status"], "launched")
+        self.assertEqual(first["dispatches"][0]["status"], "launched")
+        self.assertTrue(any("labels=agent-ready" in path for path in self.github.reads))
         self.assertEqual(runtime_a.core.store.attempts_for_repo(self.a[0])[0]["phase"], "LAUNCH_CONFIRMED")
+        self.assertEqual(len(self.agent.launches), 1)
+        duplicate_cycle = run_once(runtime_a, self.a[0], "acceptance-owner", now=100.5)
+        self.assertEqual(duplicate_cycle["dispatches"], [])
         self.assertEqual(len(self.agent.launches), 1)
         self.github.link_pr(self.a, 41, "trunk", "a-builder[bot]", "work/a-7", SHA_A)
         result = run_once(runtime_a, self.a[0], "acceptance-owner", now=102)

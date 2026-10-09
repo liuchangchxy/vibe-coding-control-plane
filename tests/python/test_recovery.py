@@ -54,10 +54,14 @@ class RecoveryImplementer:
     def __init__(self, *results):
         self.results = list(results)
         self.requests = []
+        self.activity = None
 
     def launch(self, request):
         self.requests.append(request)
         return self.results.pop(0) if self.results else LaunchResult(LaunchDisposition.CONFIRMED, "exec")
+
+    def latest_activity(self, conversation_id):
+        return self.activity
 
 
 class RecoveryTests(unittest.TestCase):
@@ -107,9 +111,11 @@ class RecoveryTests(unittest.TestCase):
 
     def test_restart_repair_with_unchanged_head_waits_without_relaunch(self):
         self._start_repair()
+        row = self.core.store.attempts_for_repo("acme/alpha")[-1]
         core = RuntimeCore(self.db, MANIFEST, self.workflow, self.implementer, recovery_timeout_seconds=60)
-        result = core.reconcile_once("acme/alpha", "owner")
+        result = core.reconcile_once("acme/alpha", "owner", row["implementer_activity_at"] + 61)
         self.assertEqual(result["items"][0]["status"], "waiting_for_repair_push")
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "agent-working")
         self.assertEqual(len(self.implementer.requests), 2)
 
     def test_restart_repair_with_new_head_binds_same_pr_and_branch(self):
@@ -179,9 +185,35 @@ class RecoveryTests(unittest.TestCase):
     def test_confirmed_launch_without_pr_waits_until_deadline(self):
         self.start(LaunchDisposition.CONFIRMED)
         row = self.core.store.attempts_for_repo("acme/alpha")[-1]
-        result = self.core.reconcile_once("acme/alpha", "owner", row["deadline_at"] - 1)
+        baseline = row["implementer_activity_at"]
+        self.implementer.activity = baseline
+        result = self.core.reconcile_once("acme/alpha", "owner", baseline + 901)
         self.assertEqual(result["items"][0]["status"], "unresolved")
         self.assertEqual(len(self.implementer.requests), 1)
+        before_stall = self.core.observe_implementer_progress("acme/alpha", baseline + 1799)
+        self.assertEqual(before_stall["items"][0]["status"], "no_new_activity")
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "agent-working")
+        stalled = self.core.observe_implementer_progress("acme/alpha", baseline + 1800)
+        self.assertEqual(stalled["items"][0]["status"], "implementer_stalled")
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "infra-blocked")
+
+    def test_confirmed_activity_after_recovery_boundary_refreshes_progress_deadline(self):
+        self.core = RuntimeCore(self.db, MANIFEST, self.workflow, self.implementer,
+                                recovery_timeout_seconds=900,
+                                implementer_progress_timeout_seconds=1800)
+        self.start(LaunchDisposition.CONFIRMED)
+        row = self.core.store.attempts_for_repo("acme/alpha")[-1]
+        baseline = row["implementer_activity_at"]
+        self.assertIsNone(row["deadline_at"])
+        self.implementer.activity = baseline + 901
+        reconciled = self.core.reconcile_once("acme/alpha", "owner", baseline + 901)
+        self.assertEqual(reconciled["items"][0]["status"], "unresolved")
+        observed = self.core.observe_implementer_progress("acme/alpha", baseline + 901)
+        self.assertEqual(observed["items"][0]["status"], "progress")
+        updated = self.core.store.attempts_for_repo("acme/alpha")[-1]
+        self.assertEqual(updated["implementer_activity_at"], baseline + 901)
+        self.assertEqual(updated["progress_deadline_at"], baseline + 901 + 1800)
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "agent-working")
 
     def test_unknown_timeout_moves_to_infra_blocked_without_second_launch(self):
         self.start(LaunchDisposition.UNKNOWN)
@@ -241,35 +273,70 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.workflow.transitions, transitions)
         self.assertEqual(len(self.implementer.requests), 1)
 
-    def test_orphan_agent_working_with_one_pr_is_adopted_untrusted(self):
+    def test_orphan_agent_working_with_one_canonical_pr_recovers_trust(self):
         self.set_snapshot(replace(snap(state="agent-working"), pr_number=44, pr_open=True,
                                   pr_linked_issue=7, pr_head_sha=SHA, pr_branch=BRANCH,
                                   open_linked_pr_count=1, canonical_link_count=1))
         result = self.core.reconcile_once("acme/alpha", "owner")
-        self.assertEqual(result["items"][0]["status"], "orphan_adopted_untrusted")
-        self.assertFalse(self.core.store.flow("acme/alpha", 7)["trusted"])
+        self.assertEqual(result["items"][0]["status"], "orphan_adopted_trusted")
+        self.assertTrue(self.core.store.flow("acme/alpha", 7)["trusted"])
         self.assertFalse(self.implementer.requests)
 
-    def test_missing_attempt_ledger_with_existing_flow_is_downgraded_to_untrusted(self):
+    def test_missing_attempt_ledger_recovers_trust_from_canonical_pr(self):
         self.start()
         with closing(sqlite3.connect(self.db)) as conn:
             conn.execute("DELETE FROM attempts")
             conn.commit()
         self.add_pr()
         result = self.core.reconcile_once("acme/alpha", "owner")
-        self.assertEqual(result["items"][0]["status"], "orphan_adopted_untrusted")
-        self.assertFalse(self.core.store.flow("acme/alpha", 7)["trusted"])
+        self.assertEqual(result["items"][0]["status"], "orphan_adopted_trusted")
+        self.assertTrue(self.core.store.flow("acme/alpha", 7)["trusted"])
         self.assertEqual(self.core.store.attempts_for_repo("acme/alpha")[-1]["kind"], "adopted")
 
-    def test_untrusted_adoption_cannot_authorize_repair(self):
+    def test_canonical_adoption_without_budget_evidence_cannot_repair(self):
         self.set_snapshot(replace(snap(state="agent-working"), pr_number=44, pr_open=True,
                                   pr_linked_issue=7, pr_head_sha=SHA, pr_branch=BRANCH,
                                   open_linked_pr_count=1, canonical_link_count=1))
         self.core.reconcile_once("acme/alpha", "owner")
         candidate = RepairCandidate("acme/alpha", 7, 44, SHA, BRANCH,
                                     "implementation_failure", "check-1", "owner")
-        self.assertEqual(self.core.dispatch_repair(candidate)["status"], "untrusted_provenance")
+        result = self.core.dispatch_repair(candidate)
+        self.assertEqual(result["status"], "repair_budget_unknown")
+        self.assertEqual(result["reason"], "repair_history_or_budget_provenance_unknown")
+        self.assertTrue(result["needs_human_transitioned"])
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "needs-human")
         self.assertFalse(self.implementer.requests)
+
+    def test_canonical_adoption_preserves_durable_repair_count_and_uses_next_ordinal(self):
+        self.set_snapshot(replace(snap(state="agent-working"), pr_number=44, pr_open=True,
+                                  pr_linked_issue=7, pr_head_sha=SHA, pr_branch=BRANCH,
+                                  open_linked_pr_count=1, canonical_link_count=1))
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("INSERT INTO flows(repo,issue_number,trusted,initial_confirmed,pr_number,branch,repair_count,"
+                         "repair_budget_known) VALUES(?,?,?,?,?,?,?,?)",
+                         ("acme/alpha", 7, 1, 1, 44, BRANCH, 2, 1))
+            conn.commit()
+        result = self.core.reconcile_once("acme/alpha", "owner")
+        self.assertEqual(result["items"][0]["status"], "orphan_adopted_trusted")
+        flow = self.core.store.flow("acme/alpha", 7)
+        self.assertEqual((flow["repair_count"], flow["repair_budget_known"]), (2, 1))
+        candidate = RepairCandidate("acme/alpha", 7, 44, SHA, BRANCH,
+                                    "implementation_failure", "check-1", "owner")
+        repair = self.core.dispatch_repair(candidate)
+        self.assertEqual((repair["status"], repair["ordinal"]), ("launched", 3))
+        self.assertEqual(self.core.store.flow("acme/alpha", 7)["repair_count"], 3)
+
+    def test_legacy_flow_without_count_or_attempt_evidence_migrates_as_unknown(self):
+        legacy_db = Path(self.temp.name) / "legacy.sqlite"
+        with closing(sqlite3.connect(legacy_db)) as conn:
+            conn.execute("CREATE TABLE flows(repo TEXT NOT NULL,issue_number INTEGER NOT NULL,"
+                         "trusted INTEGER NOT NULL,initial_confirmed INTEGER NOT NULL,pr_number INTEGER,"
+                         "branch TEXT,PRIMARY KEY(repo,issue_number))")
+            conn.execute("INSERT INTO flows VALUES('acme/alpha',7,1,1,44,?)", (BRANCH,))
+            conn.commit()
+        core = RuntimeCore(legacy_db, MANIFEST, self.workflow, self.implementer)
+        flow = core.store.flow("acme/alpha", 7)
+        self.assertEqual((flow["repair_count"], flow["repair_budget_known"]), (0, 0))
 
     def test_orphan_without_pr_fails_closed_to_infra_blocked(self):
         self.set_snapshot(snap(state="agent-working"))

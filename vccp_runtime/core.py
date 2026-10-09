@@ -150,6 +150,7 @@ class _Store:
                     pr_number INTEGER,
                     branch TEXT,
                     repair_count INTEGER NOT NULL DEFAULT 0,
+                    repair_budget_known INTEGER NOT NULL DEFAULT 1,
                     PRIMARY KEY (repo, issue_number)
                 );
                 CREATE TABLE IF NOT EXISTS leases (
@@ -191,7 +192,9 @@ class _Store:
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     phase_entered_at REAL,
-                    deadline_at REAL
+                    deadline_at REAL,
+                    implementer_activity_at REAL,
+                    progress_deadline_at REAL
                 );
                 CREATE INDEX IF NOT EXISTS attempts_flow_idx
                     ON attempts(repo, issue_number, kind, repair_ordinal);
@@ -202,6 +205,10 @@ class _Store:
                 connection.execute("ALTER TABLE attempts ADD COLUMN phase_entered_at REAL")
             if "deadline_at" not in columns:
                 connection.execute("ALTER TABLE attempts ADD COLUMN deadline_at REAL")
+            if "implementer_activity_at" not in columns:
+                connection.execute("ALTER TABLE attempts ADD COLUMN implementer_activity_at REAL")
+            if "progress_deadline_at" not in columns:
+                connection.execute("ALTER TABLE attempts ADD COLUMN progress_deadline_at REAL")
             migrating_bound_head = "resulting_head_sha" not in columns
             if migrating_bound_head:
                 connection.execute("ALTER TABLE attempts ADD COLUMN resulting_head_sha TEXT")
@@ -217,13 +224,22 @@ class _Store:
                                    "AND attempts.issue_number=flows.issue_number AND attempts.kind='repair' "
                                    "AND attempts.phase='PR_BOUND')")
             flow_columns = {row[1] for row in connection.execute("PRAGMA table_info(flows)")}
+            migrating_repair_count = "repair_count" not in flow_columns
             if "repair_count" not in flow_columns:
                 connection.execute("ALTER TABLE flows ADD COLUMN repair_count INTEGER NOT NULL DEFAULT 0")
+            if "repair_budget_known" not in flow_columns:
+                connection.execute("ALTER TABLE flows ADD COLUMN repair_budget_known INTEGER NOT NULL DEFAULT 1")
             connection.execute(
                 "UPDATE flows SET repair_count=(SELECT COUNT(*) FROM attempts WHERE attempts.repo=flows.repo "
                 "AND attempts.issue_number=flows.issue_number AND attempts.kind='repair' "
                 "AND attempts.phase!='BUDGET_EXHAUSTED') WHERE repair_count=0"
             )
+            if migrating_repair_count:
+                connection.execute(
+                    "UPDATE flows SET repair_budget_known=CASE WHEN EXISTS "
+                    "(SELECT 1 FROM attempts WHERE attempts.repo=flows.repo "
+                    "AND attempts.issue_number=flows.issue_number) THEN 1 ELSE 0 END"
+                )
             connection.commit()
 
     def _connect(self) -> sqlite3.Connection:
@@ -304,7 +320,8 @@ class _Store:
             connection.close()
 
     def mark_phase(self, attempt_id: str, phase: str, outcome: str | None = None,
-                   execution_id: str | None = None, recovery_timeout: float = 300.0):
+                   execution_id: str | None = None, recovery_timeout: float = 300.0,
+                   implementer_progress_timeout: float | None = None):
         connection = self.transaction()
         try:
             row = connection.execute(
@@ -315,7 +332,7 @@ class _Store:
             now = time.time()
             entered = now if row["phase"] != phase else None
             deadline = now + recovery_timeout if entered is not None and phase in {
-                "CLAIM_INTENT", "CLAIMED", "LAUNCH_INTENT", "LAUNCH_UNKNOWN", "LAUNCH_CONFIRMED"
+                "CLAIM_INTENT", "CLAIMED", "LAUNCH_INTENT", "LAUNCH_UNKNOWN"
             } else None
             connection.execute(
                 "UPDATE attempts SET phase=?, launch_outcome=?, execution_id=?, updated_at=?, "
@@ -323,8 +340,12 @@ class _Store:
                 "WHEN ? THEN NULL ELSE deadline_at END WHERE attempt_id=?",
                 (phase, outcome, execution_id, now, entered, deadline, deadline,
                  phase in {"CLAIM_FAILED", "LAUNCH_NOT_STARTED", "BUDGET_EXHAUSTED", "PR_BOUND",
-                           "STOPPED_CANCELLED", "TERMINAL_UNRESOLVED", "RETRY_ELIGIBLE"}, attempt_id),
+                           "LAUNCH_CONFIRMED", "STOPPED_CANCELLED", "TERMINAL_UNRESOLVED",
+                           "RETRY_ELIGIBLE"}, attempt_id),
             )
+            if phase == "LAUNCH_CONFIRMED" and execution_id and implementer_progress_timeout is not None:
+                connection.execute("UPDATE attempts SET implementer_activity_at=?,progress_deadline_at=? "
+                                   "WHERE attempt_id=?", (now, now + implementer_progress_timeout, attempt_id))
             if row["kind"] == "initial_dispatch":
                 if phase == "LAUNCH_CONFIRMED":
                     connection.execute(
@@ -367,15 +388,19 @@ class _Store:
                 connection.commit()
                 return {"status": "duplicate", "attempt_id": duplicate["attempt_id"], "ordinal": duplicate["repair_ordinal"]}
             flow = connection.execute(
-                "SELECT trusted, initial_confirmed, pr_number, branch, repair_count FROM flows "
+                "SELECT trusted, initial_confirmed, pr_number, branch, repair_count, repair_budget_known FROM flows "
                 "WHERE repo=? AND issue_number=?",
                 (repo, candidate.issue_number),
             ).fetchone()
             if flow is None or not flow["trusted"] or not flow["initial_confirmed"]:
                 connection.commit()
                 return {"status": "untrusted_provenance"}
+            if not flow["repair_budget_known"]:
+                connection.commit()
+                return {"status": "repair_budget_unknown"}
             initial = connection.execute(
-                "SELECT phase FROM attempts WHERE repo=? AND issue_number=? AND kind='initial_dispatch' "
+                "SELECT phase FROM attempts WHERE repo=? AND issue_number=? "
+                "AND kind IN ('initial_dispatch','adopted') "
                 "AND phase IN ('LAUNCH_CONFIRMED','PR_BOUND') LIMIT 1", (repo, candidate.issue_number)
             ).fetchone()
             if initial is None:
@@ -475,6 +500,13 @@ class _Store:
         finally:
             connection.close()
 
+    def update_implementer_activity(self, attempt_id: str, activity_at: float, timeout: float):
+        with closing(self._connect()) as connection:
+            connection.execute("UPDATE attempts SET implementer_activity_at=?,progress_deadline_at=?,updated_at=? "
+                               "WHERE attempt_id=? AND phase='LAUNCH_CONFIRMED'",
+                               (activity_at, activity_at + timeout, activity_at, attempt_id))
+            connection.commit()
+
     def bind_pr(self, attempt_id: str, pr_number: int, branch: str, head_sha: str, now: float):
         connection = self.transaction()
         try:
@@ -512,19 +544,29 @@ class _Store:
         finally:
             connection.close()
 
+    def clear_recovery_deadline(self, attempt_id: str):
+        with closing(self._connect()) as connection:
+            connection.execute("UPDATE attempts SET deadline_at=NULL WHERE attempt_id=? AND deadline_at IS NOT NULL",
+                               (attempt_id,))
+            connection.commit()
+
     def adopt_orphan(self, repo: str, issue: int, owner: str, pr_number: int, branch: str,
-                     head_sha: str, now: float):
+                     head_sha: str, now: float, trusted: bool = False):
         connection = self.transaction()
         try:
             existing = connection.execute("SELECT 1 FROM flows WHERE repo=? AND issue_number=?",
                                           (_repo_key(repo), issue)).fetchone()
             if existing:
-                connection.execute("UPDATE flows SET trusted=0,initial_confirmed=0,pr_number=?,branch=? "
+                connection.execute("UPDATE flows SET trusted=?,initial_confirmed=?,pr_number=?,branch=? "
                                    "WHERE repo=? AND issue_number=?",
-                                   (pr_number, branch, _repo_key(repo), issue))
+                                   (int(trusted), int(trusted), pr_number, branch, _repo_key(repo), issue))
             else:
                 connection.execute("INSERT INTO flows(repo,issue_number,trusted,initial_confirmed,pr_number,branch) "
-                                   "VALUES(?,?,0,0,?,?)", (_repo_key(repo), issue, pr_number, branch))
+                                   "VALUES(?,?,?,?,?,?)", (_repo_key(repo), issue, int(trusted), int(trusted),
+                                                            pr_number, branch))
+                if trusted:
+                    connection.execute("UPDATE flows SET repair_budget_known=0 WHERE repo=? AND issue_number=?",
+                                       (_repo_key(repo), issue))
             attempt_id = str(uuid4())
             connection.execute("INSERT INTO attempts(attempt_id,repo,issue_number,owner_id,lease_token,kind,"
                                "phase,resulting_head_sha,pr_number,branch,created_at,updated_at,phase_entered_at) "
@@ -630,6 +672,7 @@ class RuntimeCore:
         implementer: ImplementerPort,
         lease_ttl_seconds: float = 300.0,
         recovery_timeout_seconds: float = 900.0,
+        implementer_progress_timeout_seconds: float = 1800.0,
     ):
         self.config = RuntimeConfig.from_manifest(manifest)
         self.store = _Store(database_path)
@@ -639,6 +682,47 @@ class RuntimeCore:
         if recovery_timeout_seconds <= 0:
             raise ValueError("recovery_timeout_seconds must be positive")
         self.recovery_timeout_seconds = recovery_timeout_seconds
+        if implementer_progress_timeout_seconds <= 0:
+            raise ValueError("implementer_progress_timeout_seconds must be positive")
+        self.implementer_progress_timeout_seconds = implementer_progress_timeout_seconds
+
+    def observe_implementer_progress(self, repo: str, now: float | None = None):
+        """Advance durable Implementer activity only when its conversation artifacts advance."""
+        current = time.time() if now is None else float(now)
+        items = []
+        for row in self.store.attempts_for_repo(repo):
+            if row["phase"] != "LAUNCH_CONFIRMED" or not row.get("execution_id"):
+                continue
+            observer = getattr(self.implementer, "latest_activity", None)
+            activity = observer(row["execution_id"]) if observer else None
+            baseline = row.get("implementer_activity_at") or row.get("phase_entered_at") or row["created_at"]
+            if activity is not None and activity > baseline:
+                self.store.update_implementer_activity(row["attempt_id"], activity,
+                                                       self.implementer_progress_timeout_seconds)
+                items.append({"issue": row["issue_number"], "status": "progress"})
+                continue
+            deadline = row.get("progress_deadline_at") or (baseline + self.implementer_progress_timeout_seconds)
+            if current >= deadline:
+                try:
+                    snapshot = self.workflow.observe(repo, row["issue_number"])
+                    if not (snapshot.issue_open and snapshot.coordination_state == "agent-working"
+                            and snapshot.frozen_spec and not snapshot.canceled and not snapshot.terminal_labels):
+                        self.store.local_terminal(row["attempt_id"], "STOPPED_CANCELLED", current)
+                        items.append({"issue": row["issue_number"], "status": "cancelled_or_terminal"})
+                        continue
+                    changed = self.workflow.transition_coordination_state(repo, row["issue_number"],
+                        "agent-working", "infra-blocked", snapshot.revision)
+                    if changed:
+                        self.store.local_terminal(row["attempt_id"], "TERMINAL_UNRESOLVED", current)
+                        items.append({"issue": row["issue_number"], "status": "implementer_stalled"})
+                    else:
+                        items.append({"issue": row["issue_number"], "status": "stale_watchdog_evidence"})
+                except Exception as error:
+                    items.append({"issue": row["issue_number"], "status": "workflow_unavailable",
+                                  "detail": str(error)})
+            else:
+                items.append({"issue": row["issue_number"], "status": "no_new_activity"})
+        return {"status": "observed", "items": items}
 
     @staticmethod
     def _eligible_initial(snapshot: WorkflowSnapshot, repo: str, issue: int) -> bool:
@@ -750,6 +834,16 @@ class RuntimeCore:
         admission = self.store.admit_repair(candidate, self.lease_ttl_seconds, self.config.max_automated_repairs,
                                             self.recovery_timeout_seconds)
         status = admission["status"]
+        if status == "repair_budget_unknown":
+            transitioned = False
+            try:
+                transitioned = self.workflow.transition_coordination_state(
+                    repo, candidate.issue_number, observed.coordination_state, "needs-human", observed.revision
+                )
+            except Exception:
+                pass
+            return {**admission, "reason": "repair_history_or_budget_provenance_unknown",
+                    "needs_human": True, "needs_human_transitioned": transitioned}
         if status == "budget_exhausted":
             transitioned = False
             try:
@@ -820,7 +914,8 @@ class RuntimeCore:
             status = "launch_unresolved"
             execution_id = None
         self.store.mark_phase(request.attempt_id, phase, outcome, execution_id,
-                              self.recovery_timeout_seconds)
+                              recovery_timeout=self.recovery_timeout_seconds,
+                              implementer_progress_timeout=self.implementer_progress_timeout_seconds)
         response = {
             "status": status,
             "attempt_id": request.attempt_id,
@@ -919,8 +1014,12 @@ class RuntimeCore:
                 continue
             if latest:
                 self.store.renew_owner_lease(repo_key, issue, owner_id, current_time, self.lease_ttl_seconds)
-                latest["deadline_at"] = self.store.ensure_deadline(latest["attempt_id"],
-                                                                    self.recovery_timeout_seconds)
+                if latest["phase"] == "LAUNCH_CONFIRMED" and latest.get("execution_id"):
+                    self.store.clear_recovery_deadline(latest["attempt_id"])
+                    latest["deadline_at"] = None
+                else:
+                    latest["deadline_at"] = self.store.ensure_deadline(latest["attempt_id"],
+                                                                        self.recovery_timeout_seconds)
                 if not snapshot.canonical_relationship_valid:
                     self._recovery_terminal(repo_key, issue, snapshot, "needs-human")
                     self.store.local_terminal(latest["attempt_id"], "TERMINAL_UNRESOLVED", current_time)
@@ -981,9 +1080,13 @@ class RuntimeCore:
                 if not self._recovery_pr_still_current(repo_key, issue, snapshot):
                     output.append({"issue": issue, "status": "stale_recovery_evidence"})
                     continue
+                # GitHub evidence is sufficient to restore provenance: one native
+                # closing relationship, canonical author/base, current authorization,
+                # and a fresh unchanged PR snapshot. Local launch receipts are not required.
                 adopted = self.store.adopt_orphan(repo_key, issue, owner_id, snapshot.pr_number,
-                                                  snapshot.pr_branch, snapshot.pr_head_sha, current_time)
-                output.append({"issue": issue, "status": "orphan_adopted_untrusted", "attempt_id": adopted,
+                                                  snapshot.pr_branch, snapshot.pr_head_sha, current_time,
+                                                  trusted=True)
+                output.append({"issue": issue, "status": "orphan_adopted_trusted", "attempt_id": adopted,
                                "pr": snapshot.pr_number})
             else:
                 self._recovery_terminal(repo_key, issue, snapshot, "infra-blocked")

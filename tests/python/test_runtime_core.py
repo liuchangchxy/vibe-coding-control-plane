@@ -102,6 +102,7 @@ class FakeImplementer:
     def __init__(self, results=None):
         self.results = list(results or [])
         self.requests = []
+        self.activity = None
         self._lock = threading.Lock()
 
     def launch(self, request):
@@ -110,6 +111,9 @@ class FakeImplementer:
             if self.results:
                 return self.results.pop(0)
         return LaunchResult(LaunchDisposition.CONFIRMED, f"execution-{len(self.requests)}")
+
+    def latest_activity(self, conversation_id):
+        return self.activity
 
 
 class ThreadRoutedWorkflow:
@@ -194,6 +198,52 @@ class RuntimeCoreTests(unittest.TestCase):
             [entry[2:4] for entry in self.workflow.transitions],
             [("agent-ready", "agent-working")],
         )
+
+    def test_conversation_activity_advances_durable_deadline_and_stall_is_terminal(self):
+        result = self.dispatch_initial()
+        row = self.core.store.attempt(result["attempt_id"])
+        baseline = row["implementer_activity_at"]
+        self.implementer.activity = baseline  # Existing static artifact is not progress.
+        self.assertEqual(self.core.observe_implementer_progress("acme/alpha", baseline + 100)
+                         ["items"][0]["status"], "no_new_activity")
+        self.implementer.activity = baseline + 20
+        self.assertEqual(self.core.observe_implementer_progress("acme/alpha", baseline + 21)
+                         ["items"][0]["status"], "progress")
+        refreshed = self.core.store.attempt(result["attempt_id"])
+        self.assertEqual(refreshed["implementer_activity_at"], baseline + 20)
+        self.core.store.renew_owner_lease("acme/alpha", 7, "worker", baseline + 30, 300)
+        self.assertEqual(self.core.store.attempt(result["attempt_id"])["implementer_activity_at"], baseline + 20)
+        before_deadline = self.core.observe_implementer_progress("acme/alpha", baseline + 20 + 1799)
+        self.assertEqual(before_deadline["items"][0]["status"], "no_new_activity")
+        self.assertEqual(self.workflow.current.coordination_state, "agent-working")
+        outcome = self.core.observe_implementer_progress("acme/alpha", baseline + 20 + 1800)
+        self.assertEqual(outcome["items"][0]["status"], "implementer_stalled")
+        self.assertEqual(self.workflow.current.coordination_state, "infra-blocked")
+
+    def test_launch_recovery_and_progress_deadlines_use_separate_timeouts(self):
+        self.core = RuntimeCore(self.db, MANIFEST_V2, self.workflow, self.implementer,
+                                recovery_timeout_seconds=900,
+                                implementer_progress_timeout_seconds=1800)
+        confirmed = self.dispatch_initial()
+        attempt = self.core.store.attempt(confirmed["attempt_id"])
+        baseline = attempt["implementer_activity_at"]
+        self.assertEqual(attempt["progress_deadline_at"] - baseline, 1800)
+        self.assertIsNone(attempt["deadline_at"])
+
+    def test_unknown_launch_uses_recovery_timeout_independent_of_progress_timeout(self):
+        for progress_timeout in (1800, 37):
+            with self.subTest(progress_timeout=progress_timeout), tempfile.TemporaryDirectory() as folder:
+                workflow = FakeWorkflow(snapshot())
+                implementer = FakeImplementer([LaunchResult(LaunchDisposition.UNKNOWN)])
+                core = RuntimeCore(Path(folder) / "runtime.db", MANIFEST_V2, workflow, implementer,
+                                   recovery_timeout_seconds=900,
+                                   implementer_progress_timeout_seconds=progress_timeout)
+                result = core.dispatch_initial("acme/alpha", 7, "worker")
+                self.assertEqual(result["phase"], "LAUNCH_UNKNOWN")
+                attempt = core.store.attempt(result["attempt_id"])
+                self.assertEqual(attempt["deadline_at"] - attempt["phase_entered_at"], 900)
+                self.assertIsNone(attempt["implementer_activity_at"])
+                self.assertIsNone(attempt["progress_deadline_at"])
 
     def test_two_worker_initial_claim_race_launches_once(self):
         other = RuntimeCore(self.db, MANIFEST_V2, self.workflow, self.implementer)
