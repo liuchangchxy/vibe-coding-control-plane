@@ -368,6 +368,18 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "needs-human")
         self.assertEqual(len(self.implementer.requests), 1)
 
+    def test_first_reviewer_rejection_on_bound_initial_attempt_allows_reconcile_without_terminal(self):
+        self.start()
+        self.add_pr()
+        self.core.reconcile_once("acme/alpha", "owner")
+        self.assertEqual(self.core.store.attempts_for_repo("acme/alpha")[-1]["phase"], "PR_BOUND")
+        self.set_snapshot(replace(self.workflow.observe("acme/alpha", 7), coordination_state="changes-requested"))
+        result = self.core.reconcile_once("acme/alpha", "owner")
+        self.assertEqual(result["items"][0]["status"], "already_bound")
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "changes-requested")
+        self.assertEqual(self.core.store.attempts_for_repo("acme/alpha")[-1]["phase"], "PR_BOUND")
+
+
     def test_deleted_repair_rows_do_not_reset_durable_repair_budget(self):
         self.start()
         for ordinal in range(1, 4):

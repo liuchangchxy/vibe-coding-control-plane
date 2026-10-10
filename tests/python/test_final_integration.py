@@ -262,6 +262,46 @@ class FinalIntegrationAcceptanceTests(unittest.TestCase):
         self.assertNotEqual(self.manifests[self.a[0]]["reviewer"]["required_checks"][0]["name"],
                             self.manifests[self.b[0]]["reviewer"]["required_checks"][0]["name"])
 
+    def test_first_reviewer_rejection_dispatches_repair_ordinal_one_without_duplicate(self):
+        runtime_a = self.runtime(self.a[0])
+        # 1. Initial dispatch
+        result = run_once(runtime_a, self.a[0], "acceptance-owner", self.a[1], now=100)
+        self.assertEqual(result["dispatch"]["status"], "launched")
+        self.assertEqual(len(self.agent.launches), 1)
+
+        # 2. PR bound and passes CI check
+        self.github.link_pr(self.a, 11, "trunk", "a-builder[bot]", "patch/a-7", SHA_A)
+        self.github.checks[self.a][SHA_A] = [self.accepted("A / Verify", SHA_A, 1)]
+        bound = run_once(runtime_a, self.a[0], "acceptance-owner", now=101)
+        self.assertEqual(bound["lifecycle"]["items"][0]["status"], "WAITING_REVIEW")
+
+        # 3. Reviewer submits CHANGES_REQUESTED
+        self.github.issues[self.a]["labels"] = [{"name": "changes-requested"}, {"name": "frozen-spec"}]
+        self.github.reviews[self.a] = [{"id": 10, "state": "CHANGES_REQUESTED", "commit_id": SHA_A,
+                                        "submitted_at": "2026-10-08T00:00:00Z"}]
+
+        # 4. Orchestrator cycle: advance_once dispatches reviewer repair (ordinal=1), reconcile_once does NOT mark needs-human
+        cycle = run_once(runtime_a, self.a[0], "acceptance-owner", now=102)
+        self.assertEqual(cycle["lifecycle"]["items"][0]["trigger"], "reviewer_repair")
+        self.assertEqual(cycle["lifecycle"]["items"][0]["status"], "launched")
+        self.assertEqual(cycle["lifecycle"]["items"][0]["ordinal"], 1)
+        self.assertEqual(len(self.agent.launches), 2)
+        labels = {item["name"] for item in self.github.issues[self.a]["labels"]}
+        self.assertIn("agent-working", labels)
+        self.assertNotIn("changes-requested", labels)
+        self.assertIn("frozen-spec", labels)
+
+        # Verify attempts state in DB
+        repairs = [row for row in runtime_a.core.store.attempts_for_repo(self.a[0]) if row["kind"] == "repair"]
+        self.assertEqual(len(repairs), 1)
+        self.assertEqual(repairs[0]["repair_ordinal"], 1)
+        self.assertEqual(repairs[0]["cause_type"], "reviewer_rejection")
+
+        # 5. Subsequent cycle while repair is in-flight: waiting_for_repair, no duplicate dispatch
+        cycle2 = run_once(runtime_a, self.a[0], "acceptance-owner", now=103)
+        self.assertEqual(cycle2["lifecycle"]["items"][0]["status"], "waiting_for_repair")
+        self.assertEqual(len(self.agent.launches), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
