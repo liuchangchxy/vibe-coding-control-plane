@@ -14,6 +14,7 @@ from .core import LaunchDisposition, LaunchRequest, LaunchResult
 
 
 ANTIGRAVITY_PROVIDER = "antigravity"
+CLAUDE_CODE_PROVIDER = "claude_code"
 _PROVIDER_KEY = re.compile(r"^[a-z][a-z0-9_]*$")
 
 

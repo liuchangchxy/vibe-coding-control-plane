@@ -385,8 +385,8 @@ class ProductionWiringTests(unittest.TestCase):
         self.assertEqual(wired.core.dispatch_initial("o/r", 1, "owner")["status"], "launched")
 
     def test_unimplemented_provider_type_fails_closed(self):
-        configured = self.legacy_config(providers=[{"key": "claude_code", "type": "claude_code"}])
-        with self.assertRaisesRegex(ValueError, "unsupported implementer provider type: claude_code"):
+        configured = self.legacy_config(providers=[{"key": "codex", "type": "codex_cli"}])
+        with self.assertRaisesRegex(ValueError, "unsupported implementer provider type: codex_cli"):
             build_runtime(PRODUCTION_MANIFEST, configured, api=self.api, writer=self.writer)
 
 

@@ -289,8 +289,8 @@ class AdapterTests(unittest.TestCase):
             calls, envs, events = [], [], []
             real_guard = WorkspaceWriteGuard()
             class RecordingGuard:
-                def install(self, *args):
-                    result = real_guard.install(*args)
+                def install(self, *args, **kwargs):
+                    result = real_guard.install(*args, **kwargs)
                     events.append("guard-installed")
                     return result
             adapter = AntiGravityImplementer("language_server.exe", str(workspace), "app-gh", "app-git-push",
@@ -441,7 +441,8 @@ class AdapterTests(unittest.TestCase):
             subprocess.run(["git", "-C", str(workspace), "remote", "add", "origin", str(remote)],
                            check=True, capture_output=True)
             before = subprocess.run(["git", "status", "--porcelain"], cwd=workspace, capture_output=True, text=True)
-            guard = WorkspaceWriteGuard().install(str(workspace), "guarded-attempt", shutil.which("git"))
+            guard = WorkspaceWriteGuard().install(str(workspace), "guarded-attempt", shutil.which("git"),
+                                                  provider="antigravity")
             env = dict(os.environ); env.update(guard.environment)
             blocked = subprocess.run(["git", "push", "origin", "HEAD"], cwd=workspace,
                                      capture_output=True, text=True, timeout=10)
@@ -536,7 +537,7 @@ class AdapterTests(unittest.TestCase):
             self.assertNotIn("GITHUB_APP_PRIVATE_KEY", env)
             self.assertTrue(list(Path(subprocess.run(["git", "-C", str(workspace), "rev-parse", "--absolute-git-dir"],
                                                      capture_output=True, text=True, check=True).stdout.strip())
-                               .glob("vccp-control/*/app-gh*")))
+                               .glob("vccp-control/*/*/app-gh*")))
 
     def test_exact_head_repair_and_stale_review_launch_counts(self):
         with tempfile.TemporaryDirectory() as temp:

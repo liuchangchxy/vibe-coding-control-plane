@@ -9,8 +9,8 @@ import subprocess
 import sys
 import tempfile
 
-from .adapters import (GitHubAPI, GitHubAppWriter, _make_credential_provider,
-                       _workspace_repository, build_runtime)
+from .adapters import (GitHubAPI, GitHubAppWriter, _PROVIDER_ADAPTERS, _configured_providers,
+                       _make_credential_provider, _workspace_repository, build_runtime)
 from .core import RuntimeConfig
 from .github_app import (DPAPIFileCredentialSource, GitHubAppError,
                          GitHubAppNotInstalled, GitHubAppPermissionError)
@@ -18,7 +18,7 @@ from .github_push import GitHubAppPushBackend
 from .runner import RuntimeAlreadyRunning, RuntimeLock
 
 _REQUIRED = (
-    "database_path", "workspace", "owner_id", "antigravity_executable",
+    "database_path", "workspace", "owner_id",
 )
 
 
@@ -69,10 +69,21 @@ def qualify_activation(manifest: dict, local_config: dict, repo: str, environ=No
     elif _remote_repository(workspace, host) != repo.casefold():
         blockers.append("workspace origin does not match the consumer repository")
 
-    for key in ("antigravity_executable",):
-        executable = Path(local_config[key]).expanduser()
-        if not executable.is_file():
-            blockers.append(f"required executable is unavailable: {key}")
+    try:
+        providers = _configured_providers(local_config)
+    except ValueError as error:
+        providers = []
+        blockers.append(f"machine-local providers: {error}")
+    for settings in providers:
+        provider_type = settings.get("type")
+        if provider_type not in _PROVIDER_ADAPTERS:
+            blockers.append(f"unsupported implementer provider type: {provider_type}")
+            continue
+        executable = settings.get("executable")
+        if not isinstance(executable, str) or not executable.strip():
+            blockers.append(f"{provider_type} provider requires a configured executable")
+        elif not Path(executable).expanduser().is_file():
+            blockers.append(f"required executable is unavailable: {provider_type}")
 
     database_path = Path(local_config["database_path"]).expanduser()
     database_parent = database_path.parent
