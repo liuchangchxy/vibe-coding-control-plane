@@ -9,6 +9,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from typing import Callable
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
@@ -19,12 +20,30 @@ from .github_app import (DPAPIFileCredentialSource, GitHubAppCredentialProvider,
                          GitHubAppError, GitHubAppIdentityError, GitHubAppPermissionError,
                          GitHubHTTPError, repository_from_remote)
 from .github_push import GitHubAppPushBackend
-from .providers import ANTIGRAVITY_PROVIDER, ProviderRouter
+from .providers import ANTIGRAVITY_PROVIDER, CLAUDE_CODE_PROVIDER, ProviderRouter, normalize_provider_key
 
 
 _CONVERSATION_UUID = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
+
+# Host GitHub credentials are never inherited by a launched implementer; it may only
+# reach GitHub through the controlled App writer and controlled push wrapper.
+_GITHUB_CREDENTIAL_ENVIRONMENT = frozenset({
+    "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_APP_TOKEN", "GITHUB_APP_PRIVATE_KEY",
+})
+
+# A Claude implementer is launched from the VCCP runner, but the runner itself may be
+# started inside another Claude Code session; that session's identity must not leak.
+_CLAUDE_SESSION_ENVIRONMENT = frozenset({
+    "CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_PID", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN",
+})
+
+# `claude --bg` otherwise fences the session out of the shared checkout through a
+# git-worktree isolation guard, which VCCP's in-workspace branch/PR model cannot use.
+_CLAUDE_BACKGROUND_SETTINGS = json.dumps({"worktree": {"bgIsolation": "none"}})
+_CLAUDE_BACKGROUND_HANDLE = re.compile(r"backgrounded\s+\S*\s*([0-9a-f]{8})\b")
 
 
 class GitHubAPI:
@@ -386,17 +405,51 @@ def generic_prompt(request: LaunchRequest, workspace: str, policy: dict,
                      f"using base branch {policy['repository']['base_branch']}.\n")
 
 
-class AntiGravityImplementer:
+class _GuardedProvider:
+    """Shared attempt/provider-scoped guard installation for concrete provider adapters."""
+
+    provider: str
+    workspace: str
+    app_gh: str | None
+    app_git_push: str | None
+    write_guard: "WorkspaceWriteGuard"
+    runtime_context: dict | None
+
+    def _guarded_environment(self, request: LaunchRequest, env: dict):
+        """Install this provider's guard and return it with the controlled app-gh command."""
+        if self.runtime_context is not None:
+            context = dict(self.runtime_context)
+            context.update({"repo": request.repo, "issue_number": request.issue_number,
+                            "python_executable": self.runtime_context["python_executable"]})
+            guard = self.write_guard.install(self.workspace, request.attempt_id, None, env,
+                                             provider=self.provider, launch_context=context)
+        else:
+            guard = self.write_guard.install(self.workspace, request.attempt_id, self.app_git_push, env,
+                                             provider=self.provider)
+        env.update(guard.environment)
+        app_gh_command = guard.github_command or self.app_gh
+        env["VCCP_APP_GH"] = app_gh_command
+        env["VCCP_APP_GIT_PUSH"] = guard.git_push_command
+        env["VCCP_APP_GIT_PUSH_BACKEND"] = (
+            "vccp_runtime.github_push.GitHubAppPushBackend" if self.runtime_context is not None
+            else self.app_git_push
+        )
+        return guard, app_gh_command
+
+
+class AntiGravityImplementer(_GuardedProvider):
     def __init__(self, executable: str, workspace: str, app_gh: str, app_git_push: str,
                  runner: Callable = subprocess.run, timeout: int = 60, environ=None, write_guard=None,
                  runtime_context: dict | None = None, conversation_roots=None,
-                 project_config_root: str | Path | None = None):
+                 project_config_root: str | Path | None = None,
+                 provider: str = ANTIGRAVITY_PROVIDER):
         self.executable, self.workspace = executable, workspace
         self.app_gh, self.app_git_push = app_gh, app_git_push
         self.runner, self.timeout = runner, timeout
         self.environ = os.environ if environ is None else environ
         self.write_guard = write_guard or WorkspaceWriteGuard()
         self.runtime_context = runtime_context
+        self.provider = provider
         self.conversation_roots = [Path(p).expanduser() for p in (conversation_roots or [])]
         self.project_config_root = Path(project_config_root).expanduser() if project_config_root else (
             Path.home() / ".gemini" / "config" / "projects"
@@ -428,8 +481,7 @@ class AntiGravityImplementer:
     def launch(self, request):
         env = dict(self.environ)
         for key in list(env):
-            if key.upper() in {"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_APP_TOKEN",
-                               "GITHUB_APP_PRIVATE_KEY"}:
+            if key.upper() in _GITHUB_CREDENTIAL_ENVIRONMENT:
                 env.pop(key)
         for key in ("ANTIGRAVITY_CONVERSATION_ID", "ANTIGRAVITY_SOURCE_METADATA", "ANTIGRAVITY_TRAJECTORY_ID"):
             env.pop(key, None)
@@ -439,27 +491,10 @@ class AntiGravityImplementer:
         else:
             env.pop("ANTIGRAVITY_PROJECT_ID", None)
         try:
-            launch_context = None
-            if self.runtime_context is not None:
-                launch_context = dict(self.runtime_context)
-                launch_context.update({"repo": request.repo, "issue_number": request.issue_number,
-                                       "python_executable": self.runtime_context["python_executable"]})
-            if launch_context is None:
-                guard = self.write_guard.install(self.workspace, request.attempt_id, self.app_git_push, env)
-            else:
-                guard = self.write_guard.install(self.workspace, request.attempt_id, None, env,
-                                                 launch_context=launch_context)
+            guard, app_gh_command = self._guarded_environment(request, env)
         except Exception:
             # A missing/failed guard proves the external AgentAPI command was never invoked.
             return LaunchResult(LaunchDisposition.DEFINITELY_NOT_STARTED)
-        env.update(guard.environment)
-        app_gh_command = guard.github_command or self.app_gh
-        env["VCCP_APP_GH"] = app_gh_command
-        env["VCCP_APP_GIT_PUSH_BACKEND"] = (
-            "vccp_runtime.github_push.GitHubAppPushBackend" if self.runtime_context is not None
-            else self.app_git_push
-        )
-        env["VCCP_APP_GIT_PUSH"] = guard.git_push_command
         prompt = generic_prompt(request, self.workspace, self._policy, app_gh_command, guard.git_push_command)
         try:
             result = self.runner([self.executable, "agentapi", "new-conversation", prompt],
@@ -531,6 +566,114 @@ class AntiGravityImplementer:
     _policy = {"repository": {"base_branch": ""}}
 
 
+class ClaudeCodeImplementer(_GuardedProvider):
+    """Claude Code provider: detached `claude --bg` launch with session-scoped activity.
+
+    Claude is qualified to run unattended in the consumer workspace: `--bg` returns
+    immediately with a handle for a session that outlives the VCCP runner, `agents --json`
+    is the supported listing used to resolve and later re-observe that session, and the
+    session's own transcript is the only available activity clock.
+    """
+
+    def __init__(self, executable: str, workspace: str, app_gh: str, app_git_push: str,
+                 runner: Callable = subprocess.run, timeout: int = 60, environ=None, write_guard=None,
+                 runtime_context: dict | None = None, provider: str = CLAUDE_CODE_PROVIDER,
+                 permission_mode: str = "bypassPermissions", session_lookup_attempts: int = 5,
+                 session_lookup_interval: float = 1.0):
+        self.executable, self.workspace = executable, workspace
+        self.app_gh, self.app_git_push = app_gh, app_git_push
+        self.runner, self.timeout = runner, timeout
+        self.environ = os.environ if environ is None else environ
+        self.write_guard = write_guard or WorkspaceWriteGuard()
+        self.runtime_context = runtime_context
+        self.provider = provider
+        self.permission_mode = permission_mode
+        self.session_lookup_attempts = session_lookup_attempts
+        self.session_lookup_interval = session_lookup_interval
+        if not executable or not workspace or (runtime_context is None and (not app_gh or not app_git_push)):
+            raise ValueError("claude executable, workspace, app-gh, and app-git-push are required")
+
+    def _sanitized_environment(self) -> dict:
+        env = dict(self.environ)
+        for key in list(env):
+            if key.upper() in _GITHUB_CREDENTIAL_ENVIRONMENT or key.upper() in _CLAUDE_SESSION_ENVIRONMENT:
+                env.pop(key)
+        return env
+
+    def _workspace_sessions(self, env: dict):
+        """Read Claude's supported background-session listing scoped to this workspace."""
+        try:
+            result = self.runner([self.executable, "agents", "--json", "--all", "--cwd", self.workspace],
+                                 cwd=self.workspace, env=env, text=True, encoding="utf-8",
+                                 errors="replace", capture_output=True, check=False, timeout=self.timeout)
+        except Exception:
+            return None
+        if result.returncode != 0:
+            return None
+        try:
+            records = json.loads(result.stdout or "")
+        except ValueError:
+            return None
+        return records if isinstance(records, list) else None
+
+    def _resolve_execution_id(self, handle: str, env: dict) -> str | None:
+        """Resolve the launch handle to the durable session UUID through Claude's own listing."""
+        for attempt in range(self.session_lookup_attempts):
+            for record in self._workspace_sessions(env) or ():
+                if isinstance(record, dict) and record.get("id") == handle:
+                    session_id = record.get("sessionId")
+                    if isinstance(session_id, str) and session_id:
+                        return session_id
+            if attempt + 1 < self.session_lookup_attempts:
+                time.sleep(self.session_lookup_interval)
+        return None
+
+    def launch(self, request):
+        env = self._sanitized_environment()
+        try:
+            guard, app_gh_command = self._guarded_environment(request, env)
+        except Exception:
+            # A missing/failed guard proves the external Claude command was never invoked.
+            return LaunchResult(LaunchDisposition.DEFINITELY_NOT_STARTED)
+        prompt = generic_prompt(request, self.workspace, self._policy, app_gh_command, guard.git_push_command)
+        command = [self.executable, "--bg", prompt, "--permission-mode", self.permission_mode,
+                   "--settings", _CLAUDE_BACKGROUND_SETTINGS]
+        try:
+            result = self.runner(command, cwd=self.workspace, env=env, text=True, encoding="utf-8",
+                                 errors="replace", capture_output=True, check=False, timeout=self.timeout)
+        except (FileNotFoundError, PermissionError):
+            # CreateProcess failure proves Claude was never invoked.
+            return LaunchResult(LaunchDisposition.DEFINITELY_NOT_STARTED)
+        except Exception:
+            return LaunchResult(LaunchDisposition.UNKNOWN)
+        # Past the invocation every ambiguous outcome stays UNKNOWN: a completed command
+        # without a resolvable session identity cannot disprove that Claude started.
+        if result.returncode != 0:
+            return LaunchResult(LaunchDisposition.UNKNOWN)
+        handle = _CLAUDE_BACKGROUND_HANDLE.search(result.stdout or "")
+        if handle is None:
+            return LaunchResult(LaunchDisposition.UNKNOWN)
+        execution_id = self._resolve_execution_id(handle.group(1), env)
+        if execution_id is None:
+            return LaunchResult(LaunchDisposition.UNKNOWN)
+        return LaunchResult(LaunchDisposition.CONFIRMED, execution_id)
+
+    def latest_activity(self, execution_id: str):
+        """Observe one Claude session passively; a session is never resumed or relaunched."""
+        observed = self._workspace_sessions(self._sanitized_environment())
+        if not any(isinstance(record, dict) and record.get("sessionId") == execution_id
+                   for record in observed or ()):
+            # Missing or unobservable provenance fails closed instead of guessing.
+            return None
+        root = self.environ.get("CLAUDE_CONFIG_DIR")
+        projects = (Path(root).expanduser() if root else Path.home() / ".claude") / "projects"
+        activity = [path.stat().st_mtime
+                    for path in projects.glob(f"*/{execution_id}.jsonl") if path.is_file()]
+        return max(activity) if activity else None
+
+    _policy = {"repository": {"base_branch": ""}}
+
+
 @dataclass(frozen=True)
 class WorkspaceGuard:
     git_push_command: str
@@ -546,7 +689,7 @@ class WorkspaceWriteGuard:
 
     def install(self, workspace: str, attempt_id: str, app_git_push: str | None = None,
                 inherited_environment: dict | None = None, *,
-                launch_context: dict | None = None) -> WorkspaceGuard:
+                provider: str, launch_context: dict | None = None) -> WorkspaceGuard:
         result = self.runner(["git", "rev-parse", "--absolute-git-dir"], cwd=workspace,
                              text=True, capture_output=True, check=False)
         if result.returncode != 0 or not result.stdout.strip():
@@ -568,9 +711,12 @@ class WorkspaceWriteGuard:
                     or "# VCCP fail-closed pre-push guard v1" not in previous_hook.read_text(encoding="utf-8"):
                 raise RuntimeError("existing Git hook configuration cannot be safely composed")
         safe_id = re.sub(r"[^A-Za-z0-9._-]", "_", attempt_id)
-        if not safe_id or safe_id in {".", ".."}:
+        safe_provider = re.sub(r"[^A-Za-z0-9._-]", "_", provider)
+        if not safe_id or safe_id in {".", ".."} or not safe_provider or safe_provider in {".", ".."}:
             raise ValueError("invalid launch identity for workspace guard")
-        root = git_dir / "vccp-control" / safe_id
+        # One Runtime attempt may try several providers in fallback order, so the guard
+        # root is provider-scoped: a fallback never collides with the primary's guard.
+        root = git_dir / "vccp-control" / safe_id / safe_provider
         root.parent.mkdir(parents=True, exist_ok=True)
         root.mkdir(exist_ok=False)
         config_written = False
@@ -731,22 +877,49 @@ def _configured_providers(local_config: dict) -> list[dict]:
     for entry in configured:
         if not isinstance(entry, dict) or not isinstance(entry.get("type"), str) or not entry["type"].strip():
             raise ValueError("each machine-local provider must be an object declaring a type")
+        # The key names the guard root and the durable provenance, so it is validated
+        # here rather than only when the router is constructed.
+        normalize_provider_key(entry.get("key"))
     return list(configured)
 
 
-def _provider_adapter(settings: dict, manifest: dict, workspace: str, app_gh, app_git_push,
-                      runner, runtime_context):
-    """Build one concrete provider adapter from its machine-local settings."""
-    if settings["type"] != ANTIGRAVITY_PROVIDER:
-        raise ValueError(f"unsupported implementer provider type: {settings['type']}")
+def _antigravity_provider(settings: dict, manifest: dict, workspace: str, app_gh, app_git_push,
+                          runner, runtime_context):
     adapter = AntiGravityImplementer(
         settings.get("executable"), workspace, app_gh, app_git_push, runner,
         settings.get("launch_timeout_seconds", 60), runtime_context=runtime_context,
         conversation_roots=settings.get("conversation_roots", []),
         project_config_root=settings.get("project_config_root"),
+        provider=settings["key"],
     )
     adapter._policy = manifest
     return adapter
+
+
+def _claude_code_provider(settings: dict, manifest: dict, workspace: str, app_gh, app_git_push,
+                          runner, runtime_context):
+    adapter = ClaudeCodeImplementer(
+        settings.get("executable"), workspace, app_gh, app_git_push, runner,
+        settings.get("launch_timeout_seconds", 60), runtime_context=runtime_context,
+        provider=settings["key"], permission_mode=settings.get("permission_mode", "bypassPermissions"),
+    )
+    adapter._policy = manifest
+    return adapter
+
+
+_PROVIDER_ADAPTERS = {
+    ANTIGRAVITY_PROVIDER: _antigravity_provider,
+    CLAUDE_CODE_PROVIDER: _claude_code_provider,
+}
+
+
+def _provider_adapter(settings: dict, manifest: dict, workspace: str, app_gh, app_git_push,
+                      runner, runtime_context):
+    """Build one concrete provider adapter from its machine-local settings."""
+    factory = _PROVIDER_ADAPTERS.get(settings["type"])
+    if factory is None:
+        raise ValueError(f"unsupported implementer provider type: {settings['type']}")
+    return factory(settings, manifest, workspace, app_gh, app_git_push, runner, runtime_context)
 
 
 def build_runtime(manifest: dict, local_config: dict, api=None, writer=None,
