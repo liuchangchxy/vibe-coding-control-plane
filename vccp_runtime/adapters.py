@@ -10,7 +10,7 @@ import shlex
 import subprocess
 import sys
 from typing import Callable
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
 from .core import (LaunchDisposition, LaunchRequest, LaunchResult, RuntimeCore,
@@ -388,7 +388,8 @@ def generic_prompt(request: LaunchRequest, workspace: str, policy: dict,
 class AntiGravityImplementer:
     def __init__(self, executable: str, workspace: str, app_gh: str, app_git_push: str,
                  runner: Callable = subprocess.run, timeout: int = 60, environ=None, write_guard=None,
-                 runtime_context: dict | None = None, conversation_roots=None):
+                 runtime_context: dict | None = None, conversation_roots=None,
+                 project_config_root: str | Path | None = None):
         self.executable, self.workspace = executable, workspace
         self.app_gh, self.app_git_push = app_gh, app_git_push
         self.runner, self.timeout = runner, timeout
@@ -396,8 +397,32 @@ class AntiGravityImplementer:
         self.write_guard = write_guard or WorkspaceWriteGuard()
         self.runtime_context = runtime_context
         self.conversation_roots = [Path(p).expanduser() for p in (conversation_roots or [])]
+        self.project_config_root = Path(project_config_root).expanduser() if project_config_root else (
+            Path.home() / ".gemini" / "config" / "projects"
+        )
         if not executable or not workspace or (runtime_context is None and (not app_gh or not app_git_push)):
             raise ValueError("language server, workspace, app-gh, and app-git-push are required")
+
+    def _resolve_project_id(self) -> str | None:
+        if not self.project_config_root or not self.project_config_root.is_dir():
+            return None
+        target = Path(self.workspace).resolve()
+        for p in self.project_config_root.glob("*.json"):
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            resources = data.get("projectResources", {}).get("resources", [])
+            for res in resources:
+                uri = res.get("gitFolder", {}).get("folderUri") or res.get("folderUri")
+                if uri:
+                    parsed = urlparse(uri)
+                    raw_path = unquote(parsed.path, encoding="utf-8")
+                    if len(raw_path) > 2 and raw_path[0] == "/" and raw_path[2] == ":":
+                        raw_path = raw_path[1:]
+                    if Path(raw_path).resolve() == target:
+                        return data.get("id")
+        return None
 
     def launch(self, request):
         env = dict(self.environ)
@@ -405,6 +430,13 @@ class AntiGravityImplementer:
             if key.upper() in {"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_APP_TOKEN",
                                "GITHUB_APP_PRIVATE_KEY"}:
                 env.pop(key)
+        for key in ("ANTIGRAVITY_CONVERSATION_ID", "ANTIGRAVITY_SOURCE_METADATA", "ANTIGRAVITY_TRAJECTORY_ID"):
+            env.pop(key, None)
+        project_id = self._resolve_project_id()
+        if project_id:
+            env["ANTIGRAVITY_PROJECT_ID"] = project_id
+        else:
+            env.pop("ANTIGRAVITY_PROJECT_ID", None)
         try:
             launch_context = None
             if self.runtime_context is not None:
@@ -725,7 +757,8 @@ def build_runtime(manifest: dict, local_config: dict, api=None, writer=None,
                                          app_gh, app_git_push, runner,
                                          local_config.get("launch_timeout_seconds", 60),
                                          runtime_context=runtime_context,
-                                         conversation_roots=local_config.get("conversation_roots", []))
+                                         conversation_roots=local_config.get("conversation_roots", []),
+                                         project_config_root=local_config.get("project_config_root"))
     implementer._policy = manifest
     core = RuntimeCore(local_config["database_path"], manifest, workflow, implementer,
                        recovery_timeout_seconds=local_config.get("recovery_timeout_seconds", 900),
