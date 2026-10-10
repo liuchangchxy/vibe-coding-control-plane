@@ -346,6 +346,93 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(result.disposition, LaunchDisposition.DEFINITELY_NOT_STARTED)
         self.assertEqual(calls, [])
 
+    def test_implementer_session_project_isolation_and_env_sanitization(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_dir = Path(temp)
+            projects_dir = temp_dir / "projects"
+            projects_dir.mkdir()
+            ws_a = init_git_repo(temp_dir / "consumer_a")
+            ws_b = init_git_repo(temp_dir / "consumer_b")
+            ws_c = init_git_repo(temp_dir / "consumer_unregistered")
+
+            # Register projects A and B with file:// URIs
+            uri_a = f"file:///{str(ws_a).replace(chr(92), '/')}"
+            uri_b = f"file:///{str(ws_b).replace(chr(92), '/')}"
+            (projects_dir / "proj_a.json").write_text(json.dumps({
+                "id": "proj-id-alpha",
+                "name": "consumer_a",
+                "projectResources": {"resources": [{"gitFolder": {"folderUri": uri_a}}]}
+            }), encoding="utf-8")
+            (projects_dir / "proj_b.json").write_text(json.dumps({
+                "id": "proj-id-beta",
+                "name": "consumer_b",
+                "projectResources": {"resources": [{"gitFolder": {"folderUri": uri_b}}]}
+            }), encoding="utf-8")
+
+            parent_env = {
+                "ANTIGRAVITY_PROJECT_ID": "parent-vccp-control-plane-id",
+                "ANTIGRAVITY_CONVERSATION_ID": "parent-runner-conversation-id",
+                "ANTIGRAVITY_SOURCE_METADATA": "{\"tool\":{}}",
+                "ANTIGRAVITY_TRAJECTORY_ID": "parent-traj-id",
+                "CUSTOM_RUNNER_VAR": "runner-val",
+            }
+            dummy_resp = SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"response": {"newConversation": {"conversationId": CONVERSATION_ID}}})
+            )
+
+            # Case 1: Consumer A -> Should resolve to proj-id-alpha and clear conversation ID
+            recorded_calls = []
+            adapter_a = AntiGravityImplementer(
+                "language_server.exe", str(ws_a), "app-gh", "app-git-push",
+                environ=parent_env,
+                runner=lambda args, **kw: (recorded_calls.append((args, kw)), dummy_resp)[1],
+                project_config_root=projects_dir,
+            )
+            res_a = adapter_a.launch(LaunchRequest("o/r", 1, "attempt-a", "initial_dispatch"))
+            self.assertEqual(res_a.disposition, LaunchDisposition.CONFIRMED)
+            self.assertEqual(recorded_calls[0][1]["cwd"], str(ws_a))
+            env_a = recorded_calls[0][1]["env"]
+            self.assertEqual(env_a.get("ANTIGRAVITY_PROJECT_ID"), "proj-id-alpha")
+            self.assertNotIn("ANTIGRAVITY_CONVERSATION_ID", env_a)
+            self.assertNotIn("ANTIGRAVITY_SOURCE_METADATA", env_a)
+            self.assertNotIn("ANTIGRAVITY_TRAJECTORY_ID", env_a)
+            self.assertEqual(env_a.get("CUSTOM_RUNNER_VAR"), "runner-val")
+
+            # Case 2: Consumer B -> Should resolve to proj-id-beta
+            recorded_calls.clear()
+            adapter_b = AntiGravityImplementer(
+                "language_server.exe", str(ws_b), "app-gh", "app-git-push",
+                environ=parent_env,
+                runner=lambda args, **kw: (recorded_calls.append((args, kw)), dummy_resp)[1],
+                project_config_root=projects_dir,
+            )
+            res_b = adapter_b.launch(LaunchRequest("o/r", 2, "attempt-b", "initial_dispatch"))
+            self.assertEqual(res_b.disposition, LaunchDisposition.CONFIRMED)
+            self.assertEqual(recorded_calls[0][1]["cwd"], str(ws_b))
+            env_b = recorded_calls[0][1]["env"]
+            self.assertEqual(env_b.get("ANTIGRAVITY_PROJECT_ID"), "proj-id-beta")
+            self.assertNotIn("ANTIGRAVITY_CONVERSATION_ID", env_b)
+            self.assertNotIn("ANTIGRAVITY_SOURCE_METADATA", env_b)
+            self.assertNotIn("ANTIGRAVITY_TRAJECTORY_ID", env_b)
+
+            # Case 3: Unregistered Consumer C -> Must strip ANTIGRAVITY_PROJECT_ID, NOT leak parent VCCP ID
+            recorded_calls.clear()
+            adapter_c = AntiGravityImplementer(
+                "language_server.exe", str(ws_c), "app-gh", "app-git-push",
+                environ=parent_env,
+                runner=lambda args, **kw: (recorded_calls.append((args, kw)), dummy_resp)[1],
+                project_config_root=projects_dir,
+            )
+            res_c = adapter_c.launch(LaunchRequest("o/r", 3, "attempt-c", "initial_dispatch"))
+            self.assertEqual(res_c.disposition, LaunchDisposition.CONFIRMED)
+            self.assertEqual(recorded_calls[0][1]["cwd"], str(ws_c))
+            env_c = recorded_calls[0][1]["env"]
+            self.assertNotIn("ANTIGRAVITY_PROJECT_ID", env_c)
+            self.assertNotIn("ANTIGRAVITY_CONVERSATION_ID", env_c)
+            self.assertNotIn("ANTIGRAVITY_SOURCE_METADATA", env_c)
+            self.assertNotIn("ANTIGRAVITY_TRAJECTORY_ID", env_c)
+
     def test_workspace_guard_blocks_direct_push_without_tracked_changes(self):
         with tempfile.TemporaryDirectory() as temp:
             workspace = init_git_repo(Path(temp) / "repo")
