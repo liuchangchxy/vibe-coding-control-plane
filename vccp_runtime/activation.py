@@ -142,7 +142,7 @@ def qualify_activation(manifest: dict, local_config: dict, repo: str, environ=No
             runtime = build_runtime(manifest, scratch_config,
                                     api=api, writer=writer, credential_provider=credential_provider,
                                     push_backend=push_backend)
-            if runtime.core is None or runtime.workflow is None or runtime.implementer is None or runtime.lifecycle is None:
+            if runtime.core is None or runtime.workflow is None or runtime.router is None or runtime.lifecycle is None:
                 raise ValueError("runtime component construction was incomplete")
         with RuntimeLock(repo, str(database_path)):
             pass

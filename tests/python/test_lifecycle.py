@@ -10,6 +10,7 @@ from vccp_runtime.lifecycle import LifecycleDriver
 
 SHA = "a" * 40
 SHA_B = "b" * 40
+PROVIDER = "antigravity"
 BASE_MANIFEST = {
     "schema_version": 2,
     "issue_contract": {"max_automated_repairs": 3},
@@ -53,7 +54,7 @@ class FakeImplementer:
     def __init__(self): self.launches = []
     def launch(self, request):
         self.launches.append(request)
-        return LaunchResult(LaunchDisposition.CONFIRMED, f"exec-{len(self.launches)}")
+        return LaunchResult(LaunchDisposition.CONFIRMED, f"exec-{len(self.launches)}", PROVIDER)
 
 
 class LifecycleTests(unittest.TestCase):
