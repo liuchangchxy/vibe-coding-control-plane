@@ -19,6 +19,7 @@ from .github_app import (DPAPIFileCredentialSource, GitHubAppCredentialProvider,
                          GitHubAppError, GitHubAppIdentityError, GitHubAppPermissionError,
                          GitHubHTTPError, repository_from_remote)
 from .github_push import GitHubAppPushBackend
+from .providers import ANTIGRAVITY_PROVIDER, ProviderRouter
 
 
 _CONVERSATION_UUID = re.compile(
@@ -672,7 +673,7 @@ class WorkspaceWriteGuard:
 class RuntimeAdapters:
     core: RuntimeCore
     workflow: GitHubWorkflowAdapter
-    implementer: AntiGravityImplementer
+    router: ProviderRouter
     lifecycle: object
     credential_provider: GitHubAppCredentialProvider | None = None
     push_backend: object | None = None
@@ -708,12 +709,52 @@ def _make_credential_provider(local_config: dict, target_repo: str):
     )
 
 
+def _configured_providers(local_config: dict) -> list[dict]:
+    """Normalize machine-local provider configuration into ordered provider settings.
+
+    The first entry is primary and later entries are fallbacks in order. The pre-P5
+    AntiGravity-only configuration stays valid: without an explicit ``providers`` list,
+    the existing top-level fields describe exactly one primary provider.
+    """
+    configured = local_config.get("providers")
+    if configured is None:
+        return [{
+            "key": ANTIGRAVITY_PROVIDER,
+            "type": ANTIGRAVITY_PROVIDER,
+            "executable": local_config.get("antigravity_executable"),
+            "launch_timeout_seconds": local_config.get("launch_timeout_seconds", 60),
+            "conversation_roots": local_config.get("conversation_roots", []),
+            "project_config_root": local_config.get("project_config_root"),
+        }]
+    if not isinstance(configured, list) or not configured:
+        raise ValueError("machine-local providers must be a non-empty ordered list")
+    for entry in configured:
+        if not isinstance(entry, dict) or not isinstance(entry.get("type"), str) or not entry["type"].strip():
+            raise ValueError("each machine-local provider must be an object declaring a type")
+    return list(configured)
+
+
+def _provider_adapter(settings: dict, manifest: dict, workspace: str, app_gh, app_git_push,
+                      runner, runtime_context):
+    """Build one concrete provider adapter from its machine-local settings."""
+    if settings["type"] != ANTIGRAVITY_PROVIDER:
+        raise ValueError(f"unsupported implementer provider type: {settings['type']}")
+    adapter = AntiGravityImplementer(
+        settings.get("executable"), workspace, app_gh, app_git_push, runner,
+        settings.get("launch_timeout_seconds", 60), runtime_context=runtime_context,
+        conversation_roots=settings.get("conversation_roots", []),
+        project_config_root=settings.get("project_config_root"),
+    )
+    adapter._policy = manifest
+    return adapter
+
+
 def build_runtime(manifest: dict, local_config: dict, api=None, writer=None,
                   runner=subprocess.run, credential_provider=None, push_backend=None):
     """Construct the Generic App-backed production graph or an explicit injected test graph."""
     if manifest.get("schema_version") != 2:
         raise ValueError("runtime wiring requires schema_version 2")
-    required = ("database_path", "workspace", "owner_id", "antigravity_executable")
+    required = ("database_path", "workspace", "owner_id")
     if any(not local_config.get(k) for k in required):
         raise ValueError("incomplete machine-local runtime configuration")
     workspace = str(Path(local_config["workspace"]).expanduser().resolve())
@@ -753,18 +794,16 @@ def build_runtime(manifest: dict, local_config: dict, api=None, writer=None,
     else:
         raise ValueError("production runtime requires the Generic github_app provider configuration")
     workflow = GitHubWorkflowAdapter(api, writer, manifest)
-    implementer = AntiGravityImplementer(local_config["antigravity_executable"], workspace,
-                                         app_gh, app_git_push, runner,
-                                         local_config.get("launch_timeout_seconds", 60),
-                                         runtime_context=runtime_context,
-                                         conversation_roots=local_config.get("conversation_roots", []),
-                                         project_config_root=local_config.get("project_config_root"))
-    implementer._policy = manifest
-    core = RuntimeCore(local_config["database_path"], manifest, workflow, implementer,
+    router = ProviderRouter(
+        (settings.get("key"), _provider_adapter(settings, manifest, workspace, app_gh,
+                                                app_git_push, runner, runtime_context))
+        for settings in _configured_providers(local_config)
+    )
+    core = RuntimeCore(local_config["database_path"], manifest, workflow, router,
                        recovery_timeout_seconds=local_config.get("recovery_timeout_seconds", 900),
                        implementer_progress_timeout_seconds=local_config.get(
                            "implementer_progress_timeout_seconds", 1800))
     from .lifecycle import LifecycleDriver
     lifecycle = LifecycleDriver(core, manifest, local_config.get("lifecycle_timeouts", {}))
-    return RuntimeAdapters(core, workflow, implementer, lifecycle,
+    return RuntimeAdapters(core, workflow, router, lifecycle,
                            credential_provider=credential_provider, push_backend=push_backend)

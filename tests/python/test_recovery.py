@@ -13,6 +13,7 @@ from vccp_runtime.core import (LaunchDisposition, LaunchResult, RepairCandidate,
 MANIFEST = {"schema_version": 2, "issue_contract": {"max_automated_repairs": 3}}
 SHA = "a" * 40
 BRANCH = "implement/7"
+PROVIDER = "antigravity"
 
 
 def snap(repo="acme/alpha", issue=7, state="agent-ready", revision="1", **kwargs):
@@ -58,9 +59,9 @@ class RecoveryImplementer:
 
     def launch(self, request):
         self.requests.append(request)
-        return self.results.pop(0) if self.results else LaunchResult(LaunchDisposition.CONFIRMED, "exec")
+        return self.results.pop(0) if self.results else LaunchResult(LaunchDisposition.CONFIRMED, "exec", PROVIDER)
 
-    def latest_activity(self, conversation_id):
+    def latest_activity_for(self, provider, execution_id):
         return self.activity
 
 
@@ -86,7 +87,8 @@ class RecoveryTests(unittest.TestCase):
                                   canonical_relationship_valid=True))
 
     def start(self, disposition=LaunchDisposition.CONFIRMED):
-        self.implementer.results = [LaunchResult(disposition, "execution" if disposition == LaunchDisposition.CONFIRMED else None)]
+        self.implementer.results = [LaunchResult(
+            disposition, "execution" if disposition == LaunchDisposition.CONFIRMED else None, PROVIDER)]
         return self.core.dispatch_initial("acme/alpha", 7, "owner")
 
     def test_restart_after_launch_confirmed_binds_canonical_pr_without_duplicate_launch(self):

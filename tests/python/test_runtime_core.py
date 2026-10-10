@@ -19,6 +19,7 @@ from vccp_runtime import (
 
 REVISION = "a" * 40
 BRANCH = "implement/issue-7"
+PROVIDER = "antigravity"
 MANIFEST_V2 = {
     "schema_version": 2,
     "issue_contract": {"max_automated_repairs": 3},
@@ -110,9 +111,9 @@ class FakeImplementer:
             self.requests.append(request)
             if self.results:
                 return self.results.pop(0)
-        return LaunchResult(LaunchDisposition.CONFIRMED, f"execution-{len(self.requests)}")
+        return LaunchResult(LaunchDisposition.CONFIRMED, f"execution-{len(self.requests)}", PROVIDER)
 
-    def latest_activity(self, conversation_id):
+    def latest_activity_for(self, provider, execution_id):
         return self.activity
 
 
@@ -234,7 +235,7 @@ class RuntimeCoreTests(unittest.TestCase):
         for progress_timeout in (1800, 37):
             with self.subTest(progress_timeout=progress_timeout), tempfile.TemporaryDirectory() as folder:
                 workflow = FakeWorkflow(snapshot())
-                implementer = FakeImplementer([LaunchResult(LaunchDisposition.UNKNOWN)])
+                implementer = FakeImplementer([LaunchResult(LaunchDisposition.UNKNOWN, provider=PROVIDER)])
                 core = RuntimeCore(Path(folder) / "runtime.db", MANIFEST_V2, workflow, implementer,
                                    recovery_timeout_seconds=900,
                                    implementer_progress_timeout_seconds=progress_timeout)
@@ -271,7 +272,7 @@ class RuntimeCoreTests(unittest.TestCase):
 
     def test_confirmed_launch_persists_stable_execution_identity(self):
         stable_id = "conversation-012345"
-        self.implementer.results.append(LaunchResult(LaunchDisposition.CONFIRMED, stable_id))
+        self.implementer.results.append(LaunchResult(LaunchDisposition.CONFIRMED, stable_id, PROVIDER))
         result = self.dispatch_initial()
         self.assertEqual(result["execution_id"], stable_id)
         self.assertEqual(self.core.store.attempt(result["attempt_id"])["execution_id"], stable_id)
@@ -285,7 +286,7 @@ class RuntimeCoreTests(unittest.TestCase):
         self.assertIsNone(attempt["execution_id"])
 
     def test_unknown_launch_is_durable_and_never_relaunched(self):
-        self.implementer.results.append(LaunchResult(LaunchDisposition.UNKNOWN))
+        self.implementer.results.append(LaunchResult(LaunchDisposition.UNKNOWN, provider=PROVIDER))
         result = self.dispatch_initial()
         self.assertEqual(result["status"], "launch_unresolved")
         self.assertEqual(self.core.store.attempt(result["attempt_id"])["phase"], "LAUNCH_UNKNOWN")
@@ -418,7 +419,7 @@ class RuntimeCoreTests(unittest.TestCase):
         self.establish_flow()
         first = self.candidate(cause="reviewer_rejection", cause_id="review-unknown")
         self.prepare_repair(first)
-        self.implementer.results.append(LaunchResult(LaunchDisposition.UNKNOWN))
+        self.implementer.results.append(LaunchResult(LaunchDisposition.UNKNOWN, provider=PROVIDER))
         result = self.core.dispatch_repair(first)
         self.assertEqual(result["status"], "launch_unresolved")
         next_candidate = self.candidate(sha="b" * 40, cause="implementation_failure", cause_id="next-check")

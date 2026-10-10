@@ -83,8 +83,16 @@ class RepairCandidate:
 
 @dataclass(frozen=True)
 class LaunchResult:
+    """Launch outcome plus the durable provenance of the provider that produced it.
+
+    ``execution_id`` is present only for CONFIRMED launches. ``provider`` names the
+    implementer provider that owns the outcome and must be recorded for CONFIRMED and
+    UNKNOWN launches so later progress observation never guesses a provider.
+    """
+
     disposition: LaunchDisposition
     execution_id: str | None = None
+    provider: str | None = None
 
 
 @dataclass(frozen=True)
@@ -118,6 +126,14 @@ class ImplementerPort(Protocol):
     """Launch must distinguish confirmed, definitely-not-started, and unknown outcomes."""
 
     def launch(self, request: LaunchRequest) -> LaunchResult: ...
+
+    def latest_activity_for(self, provider: str | None, execution_id: str) -> float | None:
+        """Observe one execution through the provider that durably owns it.
+
+        ``provider`` is the opaque key recorded with the attempt. A missing or
+        unregistered provider fails closed instead of selecting another provider.
+        """
+        ...
 
 
 def _repo_key(repo: str) -> str:
@@ -189,6 +205,7 @@ class _Store:
                     phase TEXT NOT NULL,
                     launch_outcome TEXT,
                     execution_id TEXT,
+                    implementer_provider TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     phase_entered_at REAL,
@@ -212,6 +229,14 @@ class _Store:
             migrating_bound_head = "resulting_head_sha" not in columns
             if migrating_bound_head:
                 connection.execute("ALTER TABLE attempts ADD COLUMN resulting_head_sha TEXT")
+            if "implementer_provider" not in columns:
+                # Every pre-P5 production Implementer was AntiGravity, so a legacy row may
+                # be attributed only when it records a real launch outcome. Adopted,
+                # budget-exhausted, claim-failed, and never-launched rows keep NULL provider.
+                # The column's own creation makes this backfill run once per database.
+                connection.execute("ALTER TABLE attempts ADD COLUMN implementer_provider TEXT")
+                connection.execute("UPDATE attempts SET implementer_provider='antigravity' "
+                                   "WHERE launch_outcome IN ('confirmed','unknown','definitely_not_started')")
             connection.execute("UPDATE attempts SET phase_entered_at=created_at WHERE phase_entered_at IS NULL")
             if migrating_bound_head:
                 # Older P2-D1 code stored the bound head in expected_head_sha.
@@ -321,7 +346,8 @@ class _Store:
 
     def mark_phase(self, attempt_id: str, phase: str, outcome: str | None = None,
                    execution_id: str | None = None, recovery_timeout: float = 300.0,
-                   implementer_progress_timeout: float | None = None):
+                   implementer_progress_timeout: float | None = None,
+                   implementer_provider: str | None = None):
         connection = self.transaction()
         try:
             row = connection.execute(
@@ -335,10 +361,10 @@ class _Store:
                 "CLAIM_INTENT", "CLAIMED", "LAUNCH_INTENT", "LAUNCH_UNKNOWN"
             } else None
             connection.execute(
-                "UPDATE attempts SET phase=?, launch_outcome=?, execution_id=?, updated_at=?, "
-                "phase_entered_at=COALESCE(?,phase_entered_at), deadline_at=CASE WHEN ? IS NOT NULL THEN ? "
-                "WHEN ? THEN NULL ELSE deadline_at END WHERE attempt_id=?",
-                (phase, outcome, execution_id, now, entered, deadline, deadline,
+                "UPDATE attempts SET phase=?, launch_outcome=?, execution_id=?, implementer_provider=?, "
+                "updated_at=?, phase_entered_at=COALESCE(?,phase_entered_at), deadline_at=CASE WHEN ? IS NOT NULL "
+                "THEN ? WHEN ? THEN NULL ELSE deadline_at END WHERE attempt_id=?",
+                (phase, outcome, execution_id, implementer_provider, now, entered, deadline, deadline,
                  phase in {"CLAIM_FAILED", "LAUNCH_NOT_STARTED", "BUDGET_EXHAUSTED", "PR_BOUND",
                            "LAUNCH_CONFIRMED", "STOPPED_CANCELLED", "TERMINAL_UNRESOLVED",
                            "RETRY_ELIGIBLE"}, attempt_id),
@@ -693,8 +719,8 @@ class RuntimeCore:
         for row in self.store.attempts_for_repo(repo):
             if row["phase"] != "LAUNCH_CONFIRMED" or not row.get("execution_id"):
                 continue
-            observer = getattr(self.implementer, "latest_activity", None)
-            activity = observer(row["execution_id"]) if observer else None
+            # The durable attempt owns its provider; the current primary never substitutes.
+            activity = self.implementer.latest_activity_for(row["implementer_provider"], row["execution_id"])
             baseline = row.get("implementer_activity_at") or row.get("phase_entered_at") or row["created_at"]
             if activity is not None and activity > baseline:
                 self.store.update_implementer_activity(row["attempt_id"], activity,
@@ -903,19 +929,25 @@ class RuntimeCore:
             outcome = "confirmed"
             status = "launched"
             execution_id = result.execution_id
+            provider = result.provider
         elif result.disposition == LaunchDisposition.DEFINITELY_NOT_STARTED:
             phase = "LAUNCH_NOT_STARTED"
             outcome = "definitely_not_started"
             status = "launch_not_started"
+            # No provider started work, so there is no provider to own an execution.
             execution_id = None
+            provider = None
         else:
             phase = "LAUNCH_UNKNOWN"
             outcome = "unknown"
             status = "launch_unresolved"
+            # UNKNOWN keeps the provider that produced the uncertainty and never reroutes.
             execution_id = None
+            provider = result.provider
         self.store.mark_phase(request.attempt_id, phase, outcome, execution_id,
                               recovery_timeout=self.recovery_timeout_seconds,
-                              implementer_progress_timeout=self.implementer_progress_timeout_seconds)
+                              implementer_progress_timeout=self.implementer_progress_timeout_seconds,
+                              implementer_provider=provider)
         response = {
             "status": status,
             "attempt_id": request.attempt_id,
