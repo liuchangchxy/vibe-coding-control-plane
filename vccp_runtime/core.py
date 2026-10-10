@@ -991,7 +991,12 @@ class RuntimeCore:
                 continue
             flow = self.store.flow(repo_key, issue)
             has_repair_history = any(r["kind"] == "repair" and r["phase"] != "BUDGET_EXHAUSTED" for r in rows)
-            if snapshot.coordination_state == "changes-requested" and (
+            first_review_rejection_pending = (
+                bool(flow and flow.get("trusted"))
+                and flow.get("repair_count", 0) == 0
+                and any(r["kind"] == "initial_dispatch" and r["phase"] == "PR_BOUND" for r in rows)
+            )
+            if snapshot.coordination_state == "changes-requested" and not first_review_rejection_pending and (
                     not flow or not flow.get("trusted") or not has_repair_history):
                 self._recovery_terminal(repo_key, issue, snapshot, "needs-human")
                 for row in local_fence_attempts:
