@@ -29,6 +29,7 @@ class FakeAPI:
         self.canonical_events = []
         self.has_next_page = False
         self.pr = None
+        self.merged_pr = None
         self.reviews = []
         self.check_runs = []
         self.reads = []
@@ -50,6 +51,8 @@ class FakeAPI:
     def graphql(self, query, variables):
         self.query = query
         self.variables = variables
+        if "pullRequest(number:" in query:
+            return {"repository": {"pullRequest": self.merged_pr}}
         return {"repository": {"issue": {"timelineItems": {
             "nodes": self.canonical_events, "pageInfo": {"hasNextPage": self.has_next_page}}}}}
 
@@ -190,6 +193,45 @@ class AdapterTests(unittest.TestCase):
         self.assertFalse(snap.pr_open)
         self.assertIsNone(snap.pr_number)
         self.assertIn("willCloseTarget", api.query)
+
+    def test_bound_pr_merge_is_re_read_after_the_issue_auto_closes(self):
+        api = linked_api(review=False)
+        api.merged_pr = {"number": 12, "state": "MERGED", "merged": True, "baseRefName": "main",
+                         "headRefName": "implement/12", "headRefOid": SHA,
+                         "closingIssuesReferences": {"nodes": [{"number": 1}]}}
+        adapter = GitHubWorkflowAdapter(api, FakeWriter(), MANIFEST)
+        self.assertEqual(adapter.merged_closing_pr("o/r", 1, 12)["headRefOid"], SHA)
+        self.assertEqual(api.variables, {"owner": "o", "name": "r", "number": 12})
+        # The moment the Issue auto-closes, the timeline reports the closing PR as a plain
+        # cross-reference, so the Issue read alone can no longer show that it merged.
+        api.canonical_events = [{"willCloseTarget": False,
+                                 "source": {"__typename": "PullRequest", "number": 12}}]
+        api.issue["state"] = "closed"
+        self.assertIsNone(adapter.observe("o/r", 1).pr_number)
+        self.assertEqual(adapter.merged_closing_pr("o/r", 1, 12)["headRefOid"], SHA)
+
+    def test_bound_pr_merge_read_fails_closed(self):
+        api = linked_api(review=False)
+        api.merged_pr = {"number": 12, "state": "MERGED", "merged": True, "baseRefName": "main",
+                         "headRefName": "implement/12", "headRefOid": SHA,
+                         "closingIssuesReferences": {"nodes": [{"number": 1}]}}
+        adapter = GitHubWorkflowAdapter(api, FakeWriter(), MANIFEST)
+        for mutate in (lambda a: a.merged_pr.update(closingIssuesReferences={"nodes": [{"number": 2}]}),
+                       lambda a: a.merged_pr.update(closingIssuesReferences={"nodes": []}),
+                       lambda a: a.merged_pr.update(state="CLOSED", merged=False),
+                       lambda a: a.merged_pr.update(state="OPEN", merged=False),
+                       lambda a: a.merged_pr.update(baseRefName="release"),
+                       lambda a: a.merged_pr.update(headRefName="main"),
+                       lambda a: a.merged_pr.update(headRefOid="")):
+            api.merged_pr = {"number": 12, "state": "MERGED", "merged": True, "baseRefName": "main",
+                             "headRefName": "implement/12", "headRefOid": SHA,
+                             "closingIssuesReferences": {"nodes": [{"number": 1}]}}
+            mutate(api)
+            self.assertIsNone(adapter.merged_closing_pr("o/r", 1, 12))
+        api.merged_pr = None
+        self.assertIsNone(adapter.merged_closing_pr("o/r", 1, 12))
+        self.assertIsNone(adapter.merged_closing_pr("o/r", 1, 0))
+        self.assertIsNone(adapter.merged_closing_pr("o/r", 1, None))
 
     def test_github_api_uses_authenticated_graphql_post(self):
         seen = []
