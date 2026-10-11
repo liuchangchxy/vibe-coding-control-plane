@@ -702,15 +702,15 @@ class _Store:
                                (now, now, repo_key, issue))
             if recovered:
                 placeholders = ",".join("?" for _ in recovered)
+                still_bound = ("AND phase='STOPPED_CANCELLED' AND pr_number IS NOT NULL "
+                               "AND branch IS NOT NULL AND branch!=''")
                 tokens.extend(connection.execute(
                     "SELECT DISTINCT lease_token FROM attempts WHERE repo=? AND issue_number=? "
-                    f"AND attempt_id IN ({placeholders}) AND phase='STOPPED_CANCELLED' "
-                    "AND pr_number IS NOT NULL AND lease_token!=''",
+                    f"AND attempt_id IN ({placeholders}) {still_bound} AND lease_token!=''",
                     (repo_key, issue, *recovered)).fetchall())
                 connection.execute(
                     "UPDATE attempts SET phase='MERGED_SUCCESS',updated_at=?,phase_entered_at=?,deadline_at=NULL "
-                    f"WHERE repo=? AND issue_number=? AND attempt_id IN ({placeholders}) "
-                    "AND phase='STOPPED_CANCELLED' AND pr_number IS NOT NULL",
+                    f"WHERE repo=? AND issue_number=? AND attempt_id IN ({placeholders}) {still_bound}",
                     (now, now, repo_key, issue, *recovered))
             for token in tokens:
                 connection.execute("DELETE FROM leases WHERE repo=? AND issue_number=? AND token=?",

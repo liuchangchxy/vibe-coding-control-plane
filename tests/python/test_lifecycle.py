@@ -531,6 +531,80 @@ class LifecycleTests(unittest.TestCase):
             self.repo, {**fenced, "phase": "PR_BOUND", "pr_number": 44,
                         "branch": "implement/7"}))
 
+    def add_bound_attempt(self, attempt_id, pr_number, branch, phase="STOPPED_CANCELLED"):
+        """Add a second durable attempt for the same Issue, as a repaired flow can hold."""
+        with closing(self.core.store._connect()) as connection:
+            connection.execute(
+                "INSERT INTO attempts(attempt_id,repo,issue_number,owner_id,lease_token,kind,"
+                "pr_number,branch,phase,created_at,updated_at,phase_entered_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (attempt_id, self.repo, self.issue, "owner", "", "initial_dispatch",
+                 pr_number, branch, phase, 100, 100, 100))
+            connection.commit()
+
+    def phases(self):
+        return {row["attempt_id"]: row["phase"]
+                for row in self.core.store.attempts_for_repo(self.repo)}
+
+    def test_only_the_stopped_attempt_the_proof_establishes_is_recovered(self):
+        # Two fenced attempts on one Issue: only the one whose own bound PR/branch the
+        # exact-head proof established may be lifted.
+        self.core.store.set_lifecycle(self.repo, self.issue, "WAITING_MERGE", SHA, 100, 10)
+        self.workflow.merged[44] = {"headRefName": "implement/7", "headRefOid": SHA}
+        self.workflow.snapshots[(self.repo, self.issue)] = self.hidden_closing_link_snapshot()
+        self.add_bound_attempt("attempt-other-pr", 55, "other/7")
+        proven = next(row["attempt_id"] for row in self.core.store.attempts_for_repo(self.repo)
+                      if row["pr_number"] == 44)
+        for row in self.core.store.attempts_for_repo(self.repo):
+            self.core.store.local_terminal(row["attempt_id"], "STOPPED_CANCELLED", 100)
+
+        self.driver().advance_once(self.repo, "owner", 101)
+
+        self.assertEqual(self.phases(),
+                         {proven: "MERGED_SUCCESS", "attempt-other-pr": "STOPPED_CANCELLED"})
+        self.assertEqual(self.core.store.lifecycle_state(self.repo, self.issue)["outcome"], "merged")
+
+    def test_stopped_attempt_bound_to_a_different_pr_is_not_recovered(self):
+        # The Issue's closing PR is #44. A fenced attempt bound to another PR whose
+        # merged_closing_pr() proves nothing must stay fenced.
+        self.core.store.set_lifecycle(self.repo, self.issue, "WAITING_MERGE", SHA, 100, 10)
+        self.workflow.merged[44] = {"headRefName": "implement/7", "headRefOid": SHA}
+        self.workflow.snapshots[(self.repo, self.issue)] = self.hidden_closing_link_snapshot()
+        self.add_bound_attempt("attempt-other-pr", 55, "other/7")
+        proven = next(row["attempt_id"] for row in self.core.store.attempts_for_repo(self.repo)
+                      if row["pr_number"] == 44)
+
+        self.driver().advance_once(self.repo, "owner", 101)
+
+        self.assertEqual(self.phases(),
+                         {proven: "MERGED_SUCCESS", "attempt-other-pr": "STOPPED_CANCELLED"})
+
+    def test_stopped_attempt_without_a_bound_branch_is_not_recovered(self):
+        # The Issue is still observed (the original attempt is bound normally), so the only
+        # thing keeping the extra row fenced is that it records no bound branch.
+        self.core.store.set_lifecycle(self.repo, self.issue, "WAITING_MERGE", SHA, 100, 10)
+        self.workflow.merged[44] = {"headRefName": "implement/7", "headRefOid": SHA}
+        self.workflow.snapshots[(self.repo, self.issue)] = self.hidden_closing_link_snapshot()
+        for branch in (None, ""):
+            with self.subTest(branch=branch):
+                self.add_bound_attempt(f"attempt-nobranch-{branch!r}", 55, branch)
+                self.driver().advance_once(self.repo, "owner", 101)
+                self.assertEqual(self.phases()[f"attempt-nobranch-{branch!r}"],
+                                 "STOPPED_CANCELLED")
+
+    def test_stopped_attempt_with_a_mismatched_branch_is_not_recovered(self):
+        self.core.store.set_lifecycle(self.repo, self.issue, "WAITING_MERGE", SHA, 100, 10)
+        # Row 55's branch does not match the branch the merged closing PR reports.
+        self.workflow.merged[55] = {"headRefName": "implement/7", "headRefOid": SHA}
+        self.workflow.snapshots[(self.repo, self.issue)] = self.hidden_closing_link_snapshot()
+        self.add_bound_attempt("attempt-mismatch", 55, "other/7")
+
+        self.driver().advance_once(self.repo, "owner", 101)
+
+        self.assertEqual(self.phases()["attempt-mismatch"], "STOPPED_CANCELLED")
+        self.assertEqual(self.core.store.lifecycle_state(self.repo, self.issue)["phase"],
+                         "WAITING_MERGE")
+
     def test_a_different_canonical_merged_pr_cannot_complete_bound_flow(self):
         self.update(pr_number=99, pr_merged=True, pr_state="closed", pr_open=False)
         result = self.driver().advance_once(self.repo, "owner", 100)

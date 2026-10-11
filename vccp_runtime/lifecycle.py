@@ -101,7 +101,7 @@ class LifecycleDriver:
         return next(iter(failures)), evidence
 
     def _merged_bound_head(self, repo, issue, snapshot, bound):
-        """Return the merged head of a bound canonical PR, or None.
+        """Return ``(merged_head, recoverable_row)`` for a bound canonical PR, else ``(None, None)``.
 
         The Issue timeline stops reporting the closing relationship the moment GitHub
         auto-closes the Issue, which lands within seconds of the merge, so a merged PR
@@ -113,21 +113,27 @@ class LifecycleDriver:
         ``WAITING_MERGE`` already holds, which is only ever written after the required
         checks and a formal APPROVE were both observed at that head. A missing
         ``WAITING_MERGE`` or any other head fails closed.
+
+        ``recoverable_row`` names the single fenced attempt this proof belongs to, so only
+        the attempt whose own bound PR/branch the proof established can be lifted out of a
+        cancellation fence. A snapshot that still shows the canonical PR merged is not an
+        exact-head fence-lifting proof, so it never reports a row.
         """
         if snapshot.pr_merged and snapshot.pr_number in {row["pr_number"] for row in bound}:
-            return snapshot.pr_head_sha
+            return snapshot.pr_head_sha, None
         if snapshot.issue_open:
-            return None
+            return None, None
         state = self.core.store.lifecycle_state(repo, issue)
         if not state or state["phase"] != "WAITING_MERGE" or not state["head_sha"]:
-            return None
+            return None, None
         authorized = state["head_sha"].casefold()
         for row in sorted(bound, key=lambda item: item["pr_number"]):
             merged = self.core.workflow.merged_closing_pr(repo, issue, row["pr_number"])
             if merged and merged.get("headRefName") == row["branch"] \
                     and merged["headRefOid"].casefold() == authorized:
-                return merged["headRefOid"]
-        return None
+                recovered = row if row["phase"] == "STOPPED_CANCELLED" else None
+                return merged["headRefOid"], recovered
+        return None, None
 
     def _merge_observation_after_fence(self, repo, row):
         """Whether a fenced attempt may still be offered to merge observation.
@@ -172,16 +178,15 @@ class LifecycleDriver:
                 continue
             bound = [row for row in attempts if row["issue_number"] == issue
                      and row["pr_number"] is not None]
-            merged_head = self._merged_bound_head(repo_key, issue, snapshot, bound)
+            merged_head, recoverable = self._merged_bound_head(repo_key, issue, snapshot, bound)
             if merged_head is not None:
                 try:
                     labels_cleared = self.core.workflow.clear_active_coordination_labels(repo_key, issue)
                 except Exception:
                     labels_cleared = False
-                recovered = [row["attempt_id"] for row in bound
-                             if row["phase"] == "STOPPED_CANCELLED"]
                 self.core.store.complete_flow(repo_key, issue, current,
-                                              recovered_attempt_ids=recovered)
+                                              recovered_attempt_ids=(
+                                                  [recoverable["attempt_id"]] if recoverable else []))
                 self.core.store.set_lifecycle(repo_key, issue, "MERGED_SUCCESS",
                                               merged_head, current, 1,
                                               "merged" if labels_cleared else "merged_cleanup_pending")
