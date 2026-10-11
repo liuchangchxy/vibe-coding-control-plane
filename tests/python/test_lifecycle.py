@@ -3,9 +3,11 @@ import unittest
 from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 from vccp_runtime.core import (LaunchDisposition, LaunchResult, RuntimeCore, WorkflowSnapshot)
 from vccp_runtime.lifecycle import LifecycleDriver
+from vccp_runtime.orchestrator import run_once
 
 
 SHA = "a" * 40
@@ -27,9 +29,19 @@ class FakeWorkflow:
         self.cleared = []
         self.merged = {}
         self.clear_result = True
+        # GitHub is eventually consistent: one cycle can observe an Issue that is still open
+        # and then, moments later in the same cycle, observe the auto-close that followed the
+        # merge. observe_script replays exactly that ordering.
+        self.observe_script = []
+        self.ready = []
 
     def observe(self, repo, issue):
+        if self.observe_script:
+            self.snapshots[(repo, issue)] = self.observe_script.pop(0)
         return self.snapshots[(repo, issue)]
+
+    def discover_ready(self, repo):
+        return list(self.ready)
 
     def merged_closing_pr(self, repo, issue, pr_number):
         return self.merged.get(pr_number)
@@ -344,6 +356,180 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(result["items"][0]["status"], "unresolved_canonical_pr", (phase, head))
             self.assertNotIn((self.repo, self.issue), self.workflow.cleared)
             self.assertEqual(self.core.store.attempts_for_repo(self.repo)[0]["phase"], "PR_BOUND")
+
+    # --- proven merge must outrank a cancellation fence (VCCP #32) ---------------------
+
+    def hidden_closing_link_snapshot(self, **changes):
+        """The GitHub shape right after a native merge auto-closed the Issue.
+
+        The durable attempt and its bound PR survive, but the Issue timeline stops reporting
+        ``willCloseTarget``, so the snapshot loses the canonical PR (and, on a merged PR, the
+        formal review, because reviews are only read while the PR is open).
+        """
+        fields = dict(pr_number=None, pr_open=False, pr_state="closed", pr_merged=False,
+                      canonical_link_count=0, open_linked_pr_count=0, issue_open=False,
+                      coordination_state="invalid", active_labels=())
+        fields.update(changes)
+        return replace(self.workflow.snapshots[(self.repo, self.issue)], **fields)
+
+    def runtime(self, **overrides):
+        parts = {"core": self.core, "workflow": self.workflow, "lifecycle": self.driver(),
+                 "implementer": self.implementer}
+        parts.update(overrides)
+        return SimpleNamespace(**parts)
+
+    def fence_by_reconcile(self, snapshot=None):
+        """Fence the bound attempt exactly as production did, and prove it took effect."""
+        self.workflow.snapshots[(self.repo, self.issue)] = (
+            snapshot if snapshot is not None else self.hidden_closing_link_snapshot())
+        self.core.reconcile_once(self.repo, "owner", 100)
+        attempt = self.core.store.attempts_for_repo(self.repo)[0]
+        self.assertEqual(attempt["phase"], "STOPPED_CANCELLED")
+        return attempt
+
+    def assert_not_recovered(self):
+        self.assertEqual(self.core.store.attempts_for_repo(self.repo)[0]["phase"],
+                         "STOPPED_CANCELLED")
+        self.assertEqual(self.core.store.lifecycle_state(self.repo, self.issue)["phase"],
+                         "WAITING_MERGE")
+        self.assertNotIn((self.repo, self.issue), self.workflow.cleared)
+        self.assertEqual(len(self.implementer.launches), 1)
+
+    def test_merge_missed_by_the_lifecycle_pass_recovers_after_the_cancellation_fence(self):
+        # Production sequence, driven step by step so the fence itself is observable.
+        # run_once() orders a cycle as advance_once -> reconcile_once -> ... -> advance_once,
+        # so in production the recovery can land in the same cycle's second lifecycle pass;
+        # here the pieces are called directly to show the fenced state in between.
+        self.core.store.set_lifecycle(self.repo, self.issue, "WAITING_MERGE", SHA, 100, 10)
+        self.workflow.merged[44] = {"headRefName": "implement/7", "headRefOid": SHA}
+        stale = self.workflow.snapshots[(self.repo, self.issue)]
+        closed = self.hidden_closing_link_snapshot()
+        self.workflow.observe_script = [stale, closed]
+
+        # 1. The lifecycle pass still holds a pre-merge view and misses the merge.
+        missed = self.driver().advance_once(self.repo, "owner", 100)
+        self.assertNotIn("merged_success", [item.get("status") for item in missed["items"]])
+        self.assertEqual(self.core.store.attempts_for_repo(self.repo)[0]["phase"], "PR_BOUND")
+
+        # 2. reconcile observes the auto-close and fences the bound attempt.
+        self.workflow.observe_script = [closed, closed]
+        self.core.reconcile_once(self.repo, "owner", 100)
+        self.assertEqual(self.core.store.attempts_for_repo(self.repo)[0]["phase"],
+                         "STOPPED_CANCELLED")
+        self.assertEqual(self.core.store.lifecycle_state(self.repo, self.issue)["phase"],
+                         "WAITING_MERGE")
+
+        # 3. A later lifecycle observation must still reach the durable exact-head proof.
+        cycle = run_once(self.runtime(), self.repo, "owner", 101)
+        self.assertIn("merged_success",
+                      [item.get("status") for item in cycle["lifecycle"]["items"]])
+        self.assertEqual(self.core.store.attempts_for_repo(self.repo)[0]["phase"],
+                         "MERGED_SUCCESS")
+        state = self.core.store.lifecycle_state(self.repo, self.issue)
+        self.assertEqual(state["phase"], "MERGED_SUCCESS")
+        self.assertEqual(state["outcome"], "merged")
+        self.assertFalse(self.core.store.flow(self.repo, self.issue)["trusted"])
+        with closing(self.core.store._connect()) as connection:
+            self.assertIsNone(connection.execute(
+                "SELECT 1 FROM leases WHERE repo=? AND issue_number=?",
+                (self.repo, self.issue)).fetchone())
+        self.assertIn((self.repo, self.issue), self.workflow.cleared)
+        self.assertEqual(len(self.implementer.launches), 1)
+
+        # 4. Recovery is idempotent: another cycle never completes the flow a second time.
+        again = run_once(self.runtime(), self.repo, "owner", 102)
+        self.assertEqual(self.core.store.attempts_for_repo(self.repo)[0]["phase"],
+                         "MERGED_SUCCESS")
+        self.assertEqual(self.core.store.lifecycle_state(self.repo, self.issue)["outcome"], "merged")
+        self.assertNotIn("merged_success", [item.get("status") for item in again["lifecycle"]["items"]])
+        self.assertEqual(len(self.workflow.cleared), 1)
+
+    def test_fenced_attempt_without_merged_closing_evidence_does_not_recover(self):
+        self.core.store.set_lifecycle(self.repo, self.issue, "WAITING_MERGE", SHA, 100, 10)
+        self.fence_by_reconcile()
+        self.driver().advance_once(self.repo, "owner", 101)
+        self.assert_not_recovered()
+
+    def test_fenced_attempt_with_a_different_merged_head_does_not_recover(self):
+        self.core.store.set_lifecycle(self.repo, self.issue, "WAITING_MERGE", SHA, 100, 10)
+        self.workflow.merged[44] = {"headRefName": "implement/7", "headRefOid": SHA_B}
+        self.fence_by_reconcile()
+        self.driver().advance_once(self.repo, "owner", 101)
+        self.assert_not_recovered()
+
+    def test_fenced_attempt_with_a_different_branch_does_not_recover(self):
+        self.core.store.set_lifecycle(self.repo, self.issue, "WAITING_MERGE", SHA, 100, 10)
+        self.workflow.merged[44] = {"headRefName": "someone-elses/branch", "headRefOid": SHA}
+        self.fence_by_reconcile()
+        self.driver().advance_once(self.repo, "owner", 101)
+        self.assert_not_recovered()
+
+    def test_fenced_attempt_without_a_durable_waiting_merge_head_does_not_recover(self):
+        self.workflow.merged[44] = {"headRefName": "implement/7", "headRefOid": SHA}
+        for phase, head in (("WAITING_REVIEW", SHA), ("WAITING_MERGE", SHA_B), ("WAITING_MERGE", "")):
+            with self.subTest(phase=phase, head=head):
+                for attempt_id in [row["attempt_id"]
+                                   for row in self.core.store.attempts_for_repo(self.repo)]:
+                    self.core.store.local_terminal(attempt_id, "STOPPED_CANCELLED", 100)
+                self.core.store.set_lifecycle(self.repo, self.issue, phase, head, 100, 10)
+                result = self.driver().advance_once(self.repo, "owner", 101)
+                self.assertNotIn("merged_success",
+                                 [item.get("status") for item in result["items"]])
+                self.assertEqual(self.core.store.attempts_for_repo(self.repo)[0]["phase"],
+                                 "STOPPED_CANCELLED")
+
+    def test_manually_closed_issue_never_recovers_a_fenced_attempt(self):
+        # A human closing the Issue is not a merge, with or without a stale WAITING_MERGE.
+        for phase in ("WAITING_MERGE", None):
+            with self.subTest(lifecycle=phase):
+                for attempt_id in [row["attempt_id"]
+                                   for row in self.core.store.attempts_for_repo(self.repo)]:
+                    self.core.store.local_terminal(attempt_id, "STOPPED_CANCELLED", 100)
+                with closing(self.core.store._connect()) as connection:
+                    connection.execute("DELETE FROM lifecycle WHERE repo=? AND issue_number=?",
+                                       (self.repo, self.issue))
+                    connection.commit()
+                if phase is not None:
+                    self.core.store.set_lifecycle(self.repo, self.issue, phase, SHA, 100, 10)
+                self.workflow.snapshots[(self.repo, self.issue)] = \
+                    self.hidden_closing_link_snapshot(coordination_state="agent-working")
+                result = self.driver().advance_once(self.repo, "owner", 101)
+                self.assertNotIn("merged_success",
+                                 [item.get("status") for item in result["items"]])
+                self.assertEqual(self.core.store.attempts_for_repo(self.repo)[0]["phase"],
+                                 "STOPPED_CANCELLED")
+                self.assertNotIn((self.repo, self.issue), self.workflow.cleared)
+
+    def test_fenced_attempt_whose_issue_is_still_open_is_never_recovered(self):
+        self.core.store.set_lifecycle(self.repo, self.issue, "WAITING_MERGE", SHA, 100, 10)
+        self.workflow.merged[44] = {"headRefName": "implement/7", "headRefOid": SHA}
+        attempt_id = self.core.store.attempts_for_repo(self.repo)[0]["attempt_id"]
+        self.core.store.local_terminal(attempt_id, "STOPPED_CANCELLED", 100)
+        self.update(issue_open=True, coordination_state="agent-working", pr_merged=False)
+        result = self.driver().advance_once(self.repo, "owner", 101)
+        self.assertNotIn("merged_success", [item.get("status") for item in result["items"]])
+        self.assertEqual(self.core.store.attempts_for_repo(self.repo)[0]["phase"],
+                         "STOPPED_CANCELLED")
+        self.assertEqual(self.core.store.lifecycle_state(self.repo, self.issue)["phase"],
+                         "WAITING_MERGE")
+
+    def test_unbound_cancelled_attempt_never_enters_merge_observation(self):
+        # The fence also covers attempts with no bound PR/branch; those must never be
+        # re-offered, and neither may an attempt that is not fenced at all.
+        driver = self.driver()
+        self.core.store.set_lifecycle(self.repo, self.issue, "WAITING_MERGE", SHA, 100, 10)
+        fenced = {"phase": "STOPPED_CANCELLED", "issue_number": self.issue,
+                  "pr_number": None, "branch": None}
+        self.assertFalse(driver._merge_observation_after_fence(self.repo, fenced))
+        self.assertFalse(driver._merge_observation_after_fence(
+            self.repo, {**fenced, "pr_number": 44, "branch": None}))
+        self.assertFalse(driver._merge_observation_after_fence(
+            self.repo, {**fenced, "pr_number": None, "branch": "implement/7"}))
+        self.assertTrue(driver._merge_observation_after_fence(
+            self.repo, {**fenced, "pr_number": 44, "branch": "implement/7"}))
+        self.assertFalse(driver._merge_observation_after_fence(
+            self.repo, {**fenced, "phase": "PR_BOUND", "pr_number": 44,
+                        "branch": "implement/7"}))
 
     def test_a_different_canonical_merged_pr_cannot_complete_bound_flow(self):
         self.update(pr_number=99, pr_merged=True, pr_state="closed", pr_open=False)

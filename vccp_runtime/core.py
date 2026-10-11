@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 import sqlite3
 import time
-from typing import Protocol
+from typing import Iterable, Protocol
 from uuid import uuid4
 
 
@@ -675,21 +675,46 @@ class _Store:
         finally:
             connection.close()
 
-    def complete_flow(self, repo: str, issue: int, now: float):
+    def complete_flow(self, repo: str, issue: int, now: float,
+                      recovered_attempt_ids: Iterable[str] = ()):
+        """Record the terminal merged outcome of one bound flow.
+
+        ``recovered_attempt_ids`` names attempts the caller has already proven merged at the
+        durable ``WAITING_MERGE`` exact head. A cancellation fence can land between the merge
+        and the next lifecycle observation, so such an attempt is lifted out of
+        ``STOPPED_CANCELLED`` — but only when it still carries a bound PR, and only because
+        the caller supplied proof. Ordinary cancellations are never promoted from here.
+        """
+        repo_key = _repo_key(repo)
+        recovered = [value for value in recovered_attempt_ids
+                     if isinstance(value, str) and value]
         connection = self.transaction()
         try:
-            tokens = connection.execute("SELECT DISTINCT lease_token FROM attempts WHERE repo=? AND issue_number=? "
-                                        "AND phase IN ('PR_BOUND','LAUNCH_CONFIRMED') AND lease_token!=''",
-                                        (_repo_key(repo), issue)).fetchall()
+            tokens = list(connection.execute(
+                "SELECT DISTINCT lease_token FROM attempts WHERE repo=? AND issue_number=? "
+                "AND phase IN ('PR_BOUND','LAUNCH_CONFIRMED') AND lease_token!=''",
+                (repo_key, issue)).fetchall())
             connection.execute("UPDATE flows SET trusted=0,initial_confirmed=0 WHERE repo=? AND issue_number=?",
-                               (_repo_key(repo), issue))
+                               (repo_key, issue))
             connection.execute("UPDATE attempts SET phase='MERGED_SUCCESS',updated_at=?,phase_entered_at=?,"
                                "deadline_at=NULL WHERE repo=? AND issue_number=? AND phase IN "
                                "('PR_BOUND','LAUNCH_CONFIRMED')",
-                               (now, now, _repo_key(repo), issue))
+                               (now, now, repo_key, issue))
+            if recovered:
+                placeholders = ",".join("?" for _ in recovered)
+                tokens.extend(connection.execute(
+                    "SELECT DISTINCT lease_token FROM attempts WHERE repo=? AND issue_number=? "
+                    f"AND attempt_id IN ({placeholders}) AND phase='STOPPED_CANCELLED' "
+                    "AND pr_number IS NOT NULL AND lease_token!=''",
+                    (repo_key, issue, *recovered)).fetchall())
+                connection.execute(
+                    "UPDATE attempts SET phase='MERGED_SUCCESS',updated_at=?,phase_entered_at=?,deadline_at=NULL "
+                    f"WHERE repo=? AND issue_number=? AND attempt_id IN ({placeholders}) "
+                    "AND phase='STOPPED_CANCELLED' AND pr_number IS NOT NULL",
+                    (now, now, repo_key, issue, *recovered))
             for token in tokens:
                 connection.execute("DELETE FROM leases WHERE repo=? AND issue_number=? AND token=?",
-                                   (_repo_key(repo), issue, token["lease_token"]))
+                                   (repo_key, issue, token["lease_token"]))
             connection.commit()
         except Exception:
             connection.rollback()

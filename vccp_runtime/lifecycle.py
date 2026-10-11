@@ -129,6 +129,22 @@ class LifecycleDriver:
                 return merged["headRefOid"]
         return None
 
+    def _merge_observation_after_fence(self, repo, row):
+        """Whether a fenced attempt may still be offered to merge observation.
+
+        ``reconcile_once`` can fence a bound attempt to ``STOPPED_CANCELLED`` when its own
+        observation of an Issue auto-close arrives before the lifecycle pass observed the
+        merge that caused it. Re-offering every cancelled attempt would resurrect ordinary
+        cancellations, so re-entry requires both halves of the proof already on record: a
+        bound PR/branch, and a durable ``WAITING_MERGE`` carrying the exact head the required
+        checks and the formal APPROVE were observed at. Whether that PR really merged is
+        still decided only by ``_merged_bound_head``.
+        """
+        if row["phase"] != "STOPPED_CANCELLED" or not row["pr_number"] or not row["branch"]:
+            return False
+        state = self.core.store.lifecycle_state(repo, row["issue_number"])
+        return bool(state and state["phase"] == "WAITING_MERGE" and state["head_sha"])
+
     def advance_once(self, repo: str, owner_id: str, now: float | None = None):
         """Observe and advance only locally bound work; never schedules agent-ready Issues."""
         if not isinstance(owner_id, str) or not owner_id.strip():
@@ -137,8 +153,9 @@ class LifecycleDriver:
         repo_key = repo.casefold()
         attempts = self.core.store.attempts_for_repo(repo_key)
         issues = sorted({row["issue_number"] for row in attempts
-                         if row["pr_number"] and row["phase"] in {
-                             "PR_BOUND", "LAUNCH_CONFIRMED", "MERGED_SUCCESS"}})
+                         if row["pr_number"] and (row["phase"] in {
+                             "PR_BOUND", "LAUNCH_CONFIRMED", "MERGED_SUCCESS"}
+                             or self._merge_observation_after_fence(repo_key, row))})
         active_repair_phases = {"CLAIM_INTENT", "CLAIMED", "LAUNCH_INTENT", "LAUNCH_UNKNOWN",
                                 "LAUNCH_CONFIRMED"}
         issues_with_active_repair = {row["issue_number"] for row in attempts
@@ -161,7 +178,10 @@ class LifecycleDriver:
                     labels_cleared = self.core.workflow.clear_active_coordination_labels(repo_key, issue)
                 except Exception:
                     labels_cleared = False
-                self.core.store.complete_flow(repo_key, issue, current)
+                recovered = [row["attempt_id"] for row in bound
+                             if row["phase"] == "STOPPED_CANCELLED"]
+                self.core.store.complete_flow(repo_key, issue, current,
+                                              recovered_attempt_ids=recovered)
                 self.core.store.set_lifecycle(repo_key, issue, "MERGED_SUCCESS",
                                               merged_head, current, 1,
                                               "merged" if labels_cleared else "merged_cleanup_pending")
