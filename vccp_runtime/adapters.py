@@ -218,6 +218,24 @@ class GitHubWorkflowAdapter:
     }
     """
 
+    _MERGED_CLOSING_PR_QUERY = """
+    query MergedClosingPullRequest($owner: String!, $name: String!, $number: Int!) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $number) {
+          number
+          state
+          merged
+          baseRefName
+          headRefName
+          headRefOid
+          closingIssuesReferences(first: 10) {
+            nodes { number }
+          }
+        }
+      }
+    }
+    """
+
     def __init__(self, api, app_writer, manifest: dict):
         self.api, self.writer, self.manifest = api, app_writer, manifest
         if manifest.get("schema_version") != 2:
@@ -315,6 +333,35 @@ class GitHubWorkflowAdapter:
 
     def observe(self, repo, issue_number):
         return self._facts(repo, issue_number)
+
+    def merged_closing_pr(self, repo, issue_number, pr_number):
+        """Re-read one bound PR's merge through the PR itself.
+
+        GitHub stops reporting ``willCloseTarget`` on the Issue timeline as soon as the
+        merge auto-closes the Issue, which happens within seconds, so the very PR that
+        closed it can no longer be seen there. The PR's own merged state and closing
+        references survive closure. This read is only ever consulted for a PR number a
+        durable attempt already bound, and it is not used to authorize new work.
+        """
+        if not isinstance(pr_number, int) or pr_number < 1:
+            return None
+        owner, name = repo.split("/", 1)
+        data = self.api.graphql(self._MERGED_CLOSING_PR_QUERY,
+                                {"owner": owner, "name": name, "number": pr_number})
+        pr = ((data.get("repository") or {}).get("pullRequest")) or {}
+        if not isinstance(pr, dict) or pr.get("state") != "MERGED" or pr.get("merged") is not True:
+            return None
+        if pr.get("baseRefName") != self.base_branch:
+            return None
+        head_ref, head_sha = pr.get("headRefName"), pr.get("headRefOid")
+        if not isinstance(head_ref, str) or not head_ref or head_ref == self.base_branch \
+                or not isinstance(head_sha, str) or not head_sha:
+            return None
+        references = (pr.get("closingIssuesReferences") or {}).get("nodes")
+        if not isinstance(references, list) or not any(
+                isinstance(node, dict) and node.get("number") == issue_number for node in references):
+            return None
+        return pr
 
     def discover_active(self, repo):
         """List only already-active recovery candidates; agent-ready is never queried."""

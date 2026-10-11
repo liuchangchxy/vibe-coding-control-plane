@@ -115,6 +115,14 @@ class WorkflowPort(Protocol):
 
     def observe(self, repo: str, issue_number: int) -> WorkflowSnapshot: ...
 
+    def merged_closing_pr(self, repo: str, issue_number: int, pr_number: int) -> dict | None:
+        """Re-read one already-bound PR's merged state and closing references.
+
+        GitHub clears the Issue timeline's closing relationship when the merge
+        auto-closes the Issue, so the PR itself is the remaining merge evidence.
+        """
+        ...
+
     def transition_coordination_state(
         self, repo: str, issue_number: int, expected_state: str, new_state: str, expected_revision: str
     ) -> bool: ...

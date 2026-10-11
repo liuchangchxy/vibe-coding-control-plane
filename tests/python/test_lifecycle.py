@@ -25,9 +25,13 @@ class FakeWorkflow:
         self.snapshots = {}
         self.transitions = []
         self.cleared = []
+        self.merged = {}
 
     def observe(self, repo, issue):
         return self.snapshots[(repo, issue)]
+
+    def merged_closing_pr(self, repo, issue, pr_number):
+        return self.merged.get(pr_number)
 
     def transition_coordination_state(self, repo, issue, expected_state, new_state, expected_revision):
         snapshot = self.observe(repo, issue)
@@ -277,6 +281,54 @@ class LifecycleTests(unittest.TestCase):
                                                  (self.repo, self.issue)).fetchone())
         self.assertIn((self.repo, self.issue), self.workflow.cleared)
         self.assertEqual(self.core.store.attempts_for_repo(self.repo)[0]["phase"], "MERGED_SUCCESS")
+
+    def test_issue_auto_close_that_hides_the_closing_link_still_records_merge(self):
+        # GitHub clears willCloseTarget the moment the merge auto-closes the Issue, so the
+        # snapshot loses the canonical PR entirely before the next poll can read it.
+        self.update(pr_number=None, pr_open=False, pr_state="closed", pr_merged=False,
+                    canonical_link_count=0, open_linked_pr_count=0, issue_open=False,
+                    coordination_state="invalid", active_labels=())
+        self.core.store.set_lifecycle(self.repo, self.issue, "WAITING_MERGE", SHA, 100, 10)
+        self.workflow.merged[44] = {"headRefName": "implement/7", "headRefOid": SHA}
+        result = self.driver().advance_once(self.repo, "owner", 100)
+        self.assertEqual(result["items"][0]["status"], "merged_success")
+        self.assertEqual(result["items"][0]["head"], SHA)
+        self.assertIn((self.repo, self.issue), self.workflow.cleared)
+        self.assertEqual(self.core.store.attempts_for_repo(self.repo)[0]["phase"], "MERGED_SUCCESS")
+        self.assertEqual(self.core.store.lifecycle_state(self.repo, self.issue)["phase"], "MERGED_SUCCESS")
+
+    def test_hidden_link_for_a_different_branch_cannot_complete_the_bound_flow(self):
+        self.update(pr_number=None, pr_open=False, pr_state="closed", pr_merged=False,
+                    canonical_link_count=0, open_linked_pr_count=0, issue_open=False,
+                    coordination_state="invalid", active_labels=())
+        self.core.store.set_lifecycle(self.repo, self.issue, "WAITING_MERGE", SHA, 100, 10)
+        self.workflow.merged[44] = {"headRefName": "someone-elses/branch", "headRefOid": SHA}
+        result = self.driver().advance_once(self.repo, "owner", 100)
+        self.assertEqual(result["items"][0]["status"], "unresolved_canonical_pr")
+        self.assertNotIn((self.repo, self.issue), self.workflow.cleared)
+        self.assertEqual(self.core.store.lifecycle_state(self.repo, self.issue)["phase"], "WAITING_MERGE")
+        self.assertEqual(self.core.store.attempts_for_repo(self.repo)[0]["phase"], "PR_BOUND")
+
+    def test_hidden_link_needs_the_authorized_waiting_merge_head(self):
+        # A merged PR alone is not authorization: the head it reports must be the exact
+        # head the durable WAITING_MERGE already holds, i.e. the head the required checks
+        # and the formal APPROVE were observed at.
+        self.update(pr_number=None, pr_open=False, pr_state="closed", pr_merged=False,
+                    canonical_link_count=0, open_linked_pr_count=0, issue_open=False,
+                    coordination_state="invalid", active_labels=())
+        self.workflow.merged[44] = {"headRefName": "implement/7", "headRefOid": SHA}
+        for phase, head in ((None, None), ("WAITING_REVIEW", SHA), ("WAITING_CI", SHA),
+                            ("WAITING_MERGE", SHA_B), ("WAITING_MERGE", "")):
+            with closing(self.core.store._connect()) as connection:
+                connection.execute("DELETE FROM lifecycle WHERE repo=? AND issue_number=?",
+                                   (self.repo, self.issue))
+                connection.commit()
+            if phase is not None:
+                self.core.store.set_lifecycle(self.repo, self.issue, phase, head, 100, 10)
+            result = self.driver().advance_once(self.repo, "owner", 100)
+            self.assertEqual(result["items"][0]["status"], "unresolved_canonical_pr", (phase, head))
+            self.assertNotIn((self.repo, self.issue), self.workflow.cleared)
+            self.assertEqual(self.core.store.attempts_for_repo(self.repo)[0]["phase"], "PR_BOUND")
 
     def test_a_different_canonical_merged_pr_cannot_complete_bound_flow(self):
         self.update(pr_number=99, pr_merged=True, pr_state="closed", pr_open=False)

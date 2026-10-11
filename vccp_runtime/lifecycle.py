@@ -100,6 +100,35 @@ class LifecycleDriver:
             return "ambiguous", evidence
         return next(iter(failures)), evidence
 
+    def _merged_bound_head(self, repo, issue, snapshot, bound):
+        """Return the merged head of a bound canonical PR, or None.
+
+        The Issue timeline stops reporting the closing relationship the moment GitHub
+        auto-closes the Issue, which lands within seconds of the merge, so a merged PR
+        that used to be canonical disappears from the snapshot entirely. A closed Issue
+        therefore re-reads the PR a durable attempt already bound.
+
+        That re-read is only evidence of *which* PR merged, never of whether it was
+        authorized to: the head it reports must be the exact head this Issue's durable
+        ``WAITING_MERGE`` already holds, which is only ever written after the required
+        checks and a formal APPROVE were both observed at that head. A missing
+        ``WAITING_MERGE`` or any other head fails closed.
+        """
+        if snapshot.pr_merged and snapshot.pr_number in {row["pr_number"] for row in bound}:
+            return snapshot.pr_head_sha
+        if snapshot.issue_open:
+            return None
+        state = self.core.store.lifecycle_state(repo, issue)
+        if not state or state["phase"] != "WAITING_MERGE" or not state["head_sha"]:
+            return None
+        authorized = state["head_sha"].casefold()
+        for row in sorted(bound, key=lambda item: item["pr_number"]):
+            merged = self.core.workflow.merged_closing_pr(repo, issue, row["pr_number"])
+            if merged and merged.get("headRefName") == row["branch"] \
+                    and merged["headRefOid"].casefold() == authorized:
+                return merged["headRefOid"]
+        return None
+
     def advance_once(self, repo: str, owner_id: str, now: float | None = None):
         """Observe and advance only locally bound work; never schedules agent-ready Issues."""
         if not isinstance(owner_id, str) or not owner_id.strip():
@@ -124,19 +153,20 @@ class LifecycleDriver:
                 snapshot = self.core.workflow.observe(repo_key, issue)
             except Exception:
                 continue
-            bound_prs = {row["pr_number"] for row in attempts if row["issue_number"] == issue
-                         and row["pr_number"] is not None}
-            if snapshot.pr_merged and snapshot.pr_number in bound_prs:
+            bound = [row for row in attempts if row["issue_number"] == issue
+                     and row["pr_number"] is not None]
+            merged_head = self._merged_bound_head(repo_key, issue, snapshot, bound)
+            if merged_head is not None:
                 try:
                     labels_cleared = self.core.workflow.clear_active_coordination_labels(repo_key, issue)
                 except Exception:
                     labels_cleared = False
                 self.core.store.complete_flow(repo_key, issue, current)
                 self.core.store.set_lifecycle(repo_key, issue, "MERGED_SUCCESS",
-                                              snapshot.pr_head_sha or "", current, 1,
+                                              merged_head, current, 1,
                                               "merged" if labels_cleared else "merged_cleanup_pending")
                 merged_results.append({"issue": issue, "status": "merged_success",
-                                       "head": snapshot.pr_head_sha,
+                                       "head": merged_head,
                                        "active_labels_cleared": labels_cleared})
 
         # Reuse D1 only when durable dispatch attempts need recovery/binding. Calling it
