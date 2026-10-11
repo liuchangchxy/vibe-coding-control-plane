@@ -106,16 +106,26 @@ class LifecycleDriver:
         The Issue timeline stops reporting the closing relationship the moment GitHub
         auto-closes the Issue, which lands within seconds of the merge, so a merged PR
         that used to be canonical disappears from the snapshot entirely. A closed Issue
-        therefore re-reads the PR a durable attempt already bound, and only a merge whose
-        branch is the one that attempt recorded completes the flow.
+        therefore re-reads the PR a durable attempt already bound.
+
+        That re-read is only evidence of *which* PR merged, never of whether it was
+        authorized to: the head it reports must be the exact head this Issue's durable
+        ``WAITING_MERGE`` already holds, which is only ever written after the required
+        checks and a formal APPROVE were both observed at that head. A missing
+        ``WAITING_MERGE`` or any other head fails closed.
         """
         if snapshot.pr_merged and snapshot.pr_number in {row["pr_number"] for row in bound}:
             return snapshot.pr_head_sha
         if snapshot.issue_open:
             return None
+        state = self.core.store.lifecycle_state(repo, issue)
+        if not state or state["phase"] != "WAITING_MERGE" or not state["head_sha"]:
+            return None
+        authorized = state["head_sha"].casefold()
         for row in sorted(bound, key=lambda item: item["pr_number"]):
             merged = self.core.workflow.merged_closing_pr(repo, issue, row["pr_number"])
-            if merged and merged.get("headRefName") == row["branch"]:
+            if merged and merged.get("headRefName") == row["branch"] \
+                    and merged["headRefOid"].casefold() == authorized:
                 return merged["headRefOid"]
         return None
 
