@@ -172,7 +172,57 @@ class AdapterTests(unittest.TestCase):
         labels = {item["name"] for item in api.issue["labels"]}
         self.assertNotIn("changes-requested", labels)
         self.assertIn("needs-human", labels)
+        self.assertEqual(adapter.observe("o/r", 1).coordination_state, "needs-human")
         self.assertEqual(writer.calls[0][2:], (["changes-requested"], []))
+
+    def test_cleanup_succeeds_when_the_last_active_label_is_removed(self):
+        # The correct end state of a merged Issue is no coordination label at all, which
+        # the global state reports as "invalid" - that is not failed cleanup.
+        api = linked_api(review=False)
+        api.pr.update(state="closed", merged=True)
+        api.issue["state"] = "closed"
+        writer = MutatingWriter(api)
+        adapter = GitHubWorkflowAdapter(api, writer, MANIFEST)
+        self.assertTrue(adapter.clear_active_coordination_labels("o/r", 1))
+        self.assertEqual({item["name"] for item in api.issue["labels"]}, {"frozen-spec"})
+        self.assertEqual(adapter.observe("o/r", 1).coordination_state, "invalid")
+        self.assertEqual(writer.calls[0][2:], (["changes-requested"], []))
+
+    def test_cleanup_is_idempotent_when_no_active_label_remains(self):
+        api = linked_api(review=False)
+        api.pr.update(state="closed", merged=True)
+        api.issue["state"] = "closed"
+        api.issue["labels"] = [{"name": "frozen-spec"}]
+        writer = MutatingWriter(api)
+        self.assertTrue(GitHubWorkflowAdapter(api, writer, MANIFEST)
+                        .clear_active_coordination_labels("o/r", 1))
+        self.assertEqual(writer.calls, [])
+
+    def test_cleanup_fails_closed_when_the_writer_refuses(self):
+        api = linked_api(review=False)
+        api.issue["labels"].append({"name": "agent-working"})
+        writer = MutatingWriter(api)
+        writer.success = False
+        self.assertFalse(GitHubWorkflowAdapter(api, writer, MANIFEST)
+                         .clear_active_coordination_labels("o/r", 1))
+
+    def test_cleanup_fails_closed_when_an_active_label_survives(self):
+        api = linked_api(review=False)
+        api.issue["labels"].append({"name": "agent-working"})
+        # A writer that reports success without removing anything: the labels are the fact.
+        self.assertFalse(GitHubWorkflowAdapter(api, FakeWriter(), MANIFEST)
+                         .clear_active_coordination_labels("o/r", 1))
+        self.assertEqual({item["name"] for item in api.issue["labels"]},
+                         {"changes-requested", "frozen-spec", "agent-working"})
+
+    def test_cleanup_removes_every_contradictory_active_label_before_succeeding(self):
+        api = linked_api(review=False)
+        api.issue["labels"] = [{"name": x} for x in
+                               ["agent-ready", "agent-working", "changes-requested", "frozen-spec"]]
+        writer = MutatingWriter(api)
+        self.assertTrue(GitHubWorkflowAdapter(api, writer, MANIFEST)
+                        .clear_active_coordination_labels("o/r", 1))
+        self.assertEqual({item["name"] for item in api.issue["labels"]}, {"frozen-spec"})
 
     def test_ambiguous_wrong_base_and_author_fail_closed(self):
         for mutate in (lambda a: a.canonical_events.append({"willCloseTarget": True,

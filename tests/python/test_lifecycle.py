@@ -26,6 +26,7 @@ class FakeWorkflow:
         self.transitions = []
         self.cleared = []
         self.merged = {}
+        self.clear_result = True
 
     def observe(self, repo, issue):
         return self.snapshots[(repo, issue)]
@@ -51,7 +52,7 @@ class FakeWorkflow:
         self.cleared.append((repo, issue))
         snapshot = self.observe(repo, issue)
         self.snapshots[(repo, issue)] = replace(snapshot, active_labels=())
-        return True
+        return self.clear_result
 
 
 class FakeImplementer:
@@ -281,6 +282,19 @@ class LifecycleTests(unittest.TestCase):
                                                  (self.repo, self.issue)).fetchone())
         self.assertIn((self.repo, self.issue), self.workflow.cleared)
         self.assertEqual(self.core.store.attempts_for_repo(self.repo)[0]["phase"], "MERGED_SUCCESS")
+        self.assertEqual(self.core.store.lifecycle_state(self.repo, self.issue)["outcome"], "merged")
+
+    def test_cleanup_that_did_not_land_is_reported_as_pending(self):
+        self.update(pr_merged=True, pr_state="closed", pr_open=False, issue_open=False,
+                    coordination_state="agent-working")
+        self.workflow.clear_result = False
+        self.assertEqual(self.driver().advance_once(self.repo, "owner", 100)["items"][0]["status"],
+                         "merged_success")
+        state = self.core.store.lifecycle_state(self.repo, self.issue)
+        self.assertEqual(state["phase"], "MERGED_SUCCESS")
+        self.assertEqual(state["outcome"], "merged_cleanup_pending")
+        self.assertFalse(self.driver().advance_once(self.repo, "owner", 101)["items"][0]
+                         ["active_labels_cleared"])
 
     def test_issue_auto_close_that_hides_the_closing_link_still_records_merge(self):
         # GitHub clears willCloseTarget the moment the merge auto-closes the Issue, so the
@@ -296,6 +310,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn((self.repo, self.issue), self.workflow.cleared)
         self.assertEqual(self.core.store.attempts_for_repo(self.repo)[0]["phase"], "MERGED_SUCCESS")
         self.assertEqual(self.core.store.lifecycle_state(self.repo, self.issue)["phase"], "MERGED_SUCCESS")
+        self.assertEqual(self.core.store.lifecycle_state(self.repo, self.issue)["outcome"], "merged")
 
     def test_hidden_link_for_a_different_branch_cannot_complete_the_bound_flow(self):
         self.update(pr_number=None, pr_open=False, pr_state="closed", pr_merged=False,

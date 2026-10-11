@@ -414,16 +414,21 @@ class GitHubWorkflowAdapter:
         return after.issue_open and not after.canceled and target_verified
 
     def clear_active_coordination_labels(self, repo, issue_number):
-        """Remove active labels after a proven native merge; preserve terminal labels."""
+        """Remove active labels after a proven native merge; preserve terminal labels.
+
+        Success is the fact this method owns: no active coordination label is left. The
+        global coordination state reports a merged Issue's correct end state - no
+        coordination label at all - as ``invalid``, the same value it uses for a
+        contradictory label set, so that state cannot decide this result.
+        """
         before = self._facts(repo, issue_number)
         active = list(before.active_labels)
         if not active:
-            return before.coordination_state != "invalid"
+            return True
         if not self.writer.replace_labels(repo, issue_number, active, []):
             return False
         after = self._facts(repo, issue_number)
-        return after.coordination_state != "invalid" and \
-            after.coordination_state not in self.policy["active_coordination_labels"]
+        return not after.active_labels
 
 
 def generic_prompt(request: LaunchRequest, workspace: str, policy: dict,
