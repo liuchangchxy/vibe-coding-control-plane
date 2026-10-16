@@ -713,4 +713,36 @@ class AdapterTests(unittest.TestCase):
             self.assertIn("needs-human", commands.app_edits[-1])
 
 
+class TestCredentialProviderConstruction(unittest.TestCase):
+    def test_make_credential_provider_supports_posix_and_dpapi_types(self):
+        from vccp_runtime.adapters import _make_credential_provider
+        from vccp_runtime.github_app import DPAPIFileCredentialSource, POSIXFileCredentialSource
+        dpapi_config = {
+            "github_app": {
+                "app_id": "123456",
+                "credential_source": {"type": "windows_dpapi_file", "path": "/path/to/key.dpapi"}
+            }
+        }
+        provider = _make_credential_provider(dpapi_config, "owner/repo")
+        self.assertIsInstance(provider.source, DPAPIFileCredentialSource)
+
+        posix_config = {
+            "github_app": {
+                "app_id": "123456",
+                "credential_source": {"type": "posix_file", "path": "/path/to/key.pem"}
+            }
+        }
+        provider = _make_credential_provider(posix_config, "owner/repo")
+        self.assertIsInstance(provider.source, POSIXFileCredentialSource)
+
+        invalid_config = {
+            "github_app": {
+                "app_id": "123456",
+                "credential_source": {"type": "invalid_type", "path": "/path/to/key"}
+            }
+        }
+        with self.assertRaisesRegex(ValueError, "credential_source must identify"):
+            _make_credential_provider(invalid_config, "owner/repo")
+
+
 if __name__ == "__main__": unittest.main()

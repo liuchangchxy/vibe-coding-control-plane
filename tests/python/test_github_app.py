@@ -5,15 +5,19 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
+from unittest.mock import patch
+
 from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
 from vccp_runtime.adapters import GitHubAppWriter
 from vccp_runtime.github_app import (DPAPIFileCredentialSource, GitHubAppCredentialProvider,
                                      GitHubAppError, GitHubAppIdentityError,
                                      GitHubAppNotInstalled, GitHubAppPermissionError,
-                                     GitHubHTTPError, REQUIRED_PERMISSIONS, create_app_jwt)
+                                     GitHubHTTPError, POSIXFileCredentialSource,
+                                     REQUIRED_PERMISSIONS, create_app_jwt,
+                                     make_credential_source)
 
 
 APP_ID = "123456"
@@ -161,6 +165,87 @@ class GitHubAppProviderTests(unittest.TestCase):
             path.write_bytes(b"ciphertext")
             with self.assertRaisesRegex(GitHubAppError, "not a PEM"):
                 DPAPIFileCredentialSource(path, BadDPAPI).load_private_key()
+
+
+class POSIXFileCredentialSourceTests(unittest.TestCase):
+    def setUp(self):
+        self.key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        self.pem = self.key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+
+    def test_loads_pem_file_with_0600_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "key.pem"
+            path.write_bytes(self.pem)
+            path.chmod(0o600)
+            source = POSIXFileCredentialSource(path)
+            loaded = source.load_private_key()
+            self.assertIsNotNone(loaded)
+
+    def test_rejects_loose_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "key.pem"
+            path.write_bytes(self.pem)
+            path.chmod(0o644)
+            source = POSIXFileCredentialSource(path)
+            with self.assertRaisesRegex(GitHubAppError, "0600 or stricter"):
+                source.load_private_key()
+
+    def test_rejects_missing_empty_and_non_pem_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = POSIXFileCredentialSource(Path(directory) / "nonexistent.pem")
+            with self.assertRaisesRegex(GitHubAppError, "unavailable"):
+                source.load_private_key()
+
+            empty = Path(directory) / "empty.pem"
+            empty.write_bytes(b"")
+            empty.chmod(0o600)
+            with self.assertRaisesRegex(GitHubAppError, "empty"):
+                POSIXFileCredentialSource(empty).load_private_key()
+
+            bad = Path(directory) / "bad.pem"
+            bad.write_bytes(b"not-a-pem")
+            bad.chmod(0o600)
+            with self.assertRaisesRegex(GitHubAppError, "not a PEM"):
+                POSIXFileCredentialSource(bad).load_private_key()
+
+    def test_rejects_on_windows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "key.pem"
+            dest = Path(directory) / "dest.pem"
+            path.write_bytes(self.pem)
+            path.chmod(0o600)
+            source = POSIXFileCredentialSource(path)
+            with patch("vccp_runtime.github_app.os.name", "nt"):
+                with self.assertRaisesRegex(GitHubAppError, "unavailable on Windows"):
+                    source.load_private_key()
+                with self.assertRaisesRegex(GitHubAppError, "unavailable on Windows"):
+                    POSIXFileCredentialSource.protect_pem_file(str(path), str(dest))
+
+    def test_protect_pem_file_creates_0600_destination(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.pem"
+            dest = Path(directory) / "protected.pem"
+            source.write_bytes(self.pem)
+            POSIXFileCredentialSource.protect_pem_file(source, dest)
+            self.assertTrue(dest.is_file())
+            stat_info = dest.stat()
+            self.assertEqual(stat_info.st_mode & 0o077, 0)
+            loaded = POSIXFileCredentialSource(dest).load_private_key()
+            self.assertIsNotNone(loaded)
+
+    def test_make_credential_source_constructs_both_types(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "key.file")
+            dpapi_source = make_credential_source({"type": "windows_dpapi_file", "path": path})
+            self.assertIsInstance(dpapi_source, DPAPIFileCredentialSource)
+            posix_source = make_credential_source({"type": "posix_file", "path": path})
+            self.assertIsInstance(posix_source, POSIXFileCredentialSource)
+            with self.assertRaisesRegex(GitHubAppError, "unsupported"):
+                make_credential_source({"type": "invalid_type", "path": path})
 
 
 class GitHubAppWriterTests(unittest.TestCase):

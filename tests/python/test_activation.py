@@ -141,5 +141,30 @@ class ActivationTests(unittest.TestCase):
         result = self._qualify()
         self.assertNotIn(secret, json.dumps(result))
 
+    def test_posix_credential_source_qualifies_ready(self):
+        key_path = self.root / "key.pem"
+        key_path.write_bytes(b"key")
+        config = dict(self.config)
+        config["github_app"] = dict(self.config["github_app"], credential_source={
+            "type": "posix_file", "path": str(key_path)})
+        with patch("vccp_runtime.activation.POSIXFileCredentialSource") as source:
+            source.return_value.load_private_key.return_value = object()
+            result = qualify_activation(
+                MANIFEST, config, REPO,
+                credential_provider=self.provider,
+                api=self.api, writer=self.writer,
+                push_backend=self.push_backend,
+            )
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["credential_source"], {"type": "posix_file", "present": True})
+
+    def test_unsupported_credential_source_type_blocks_readiness(self):
+        config = dict(self.config)
+        config["github_app"] = dict(self.config["github_app"], credential_source={
+            "type": "unsupported_type", "path": str(self.credential_file)})
+        result = self._qualify(config=config)
+        self.assertEqual(result["status"], "not_ready")
+        self.assertTrue(any("credential_source must identify" in item for item in result["blockers"]))
+
 
 if __name__ == "__main__": unittest.main()
