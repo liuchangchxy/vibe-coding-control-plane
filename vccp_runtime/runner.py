@@ -6,12 +6,22 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
+import subprocess
+import sys
 import tempfile
 import time
 
 from .adapters import _workspace_repository, build_runtime
 from .orchestrator import run_once
+
+
+_REPORTED_CYCLE_STATUSES = frozenset({"needs-human", "infra-blocked", "implementer_stalled"})
+_TOKEN_PATTERN = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b")
+_PRIVATE_KEY_PATTERN = re.compile(
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----", re.DOTALL
+)
 
 
 class RuntimeAlreadyRunning(RuntimeError):
@@ -86,6 +96,84 @@ def run_continuous(runtime, repo: str, owner_id: str, poll_interval: float = 30.
             sleep(poll_interval)
 
 
+def _runtime_source_revision():
+    """Read the exact commit of the VCCP checkout providing this module."""
+    source_root = Path(__file__).resolve().parent.parent
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", "HEAD"], cwd=source_root,
+        check=True, capture_output=True, text=True,
+    )
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"], cwd=source_root,
+        check=True, capture_output=True, text=True,
+    )
+    if status.stdout.strip():
+        raise ValueError("running VCCP checkout has uncommitted changes")
+    return result.stdout.strip().lower()
+
+
+def _validate_runtime_revision(manifest):
+    vccp = manifest.get("vccp") if isinstance(manifest, dict) else None
+    pin = vccp.get("revision") if isinstance(vccp, dict) else None
+    if not isinstance(pin, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", pin):
+        raise ValueError("consumer manifest must pin a full 40-character VCCP revision")
+    try:
+        current = _runtime_source_revision()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError("cannot determine the running VCCP checkout revision") from error
+    if current != pin.lower():
+        raise ValueError(
+            f"running VCCP checkout revision {current} does not match consumer manifest pin {pin.lower()}"
+        )
+
+
+def _safe_detail(value):
+    detail = str(value)
+    detail = _PRIVATE_KEY_PATTERN.sub("[REDACTED]", detail)
+    detail = _TOKEN_PATTERN.sub("[REDACTED]", detail)
+    return detail[:1000]
+
+
+def _cycle_failures(result):
+    failures = []
+
+    def visit(value, path):
+        if isinstance(value, dict):
+            status = value.get("status")
+            if isinstance(status, str) and (
+                "unavailable" in status or "error" in status or "failed" in status
+                or "blocked" in status or "stalled" in status
+                or status in _REPORTED_CYCLE_STATUSES
+            ):
+                failure = {"component": path, "status": status}
+                if "detail" in value:
+                    failure["detail"] = _safe_detail(value["detail"])
+                if isinstance(value.get("issue"), int):
+                    failure["issue"] = value["issue"]
+                failures.append(failure)
+            for key, child in value.items():
+                if key not in {"status", "detail"}:
+                    visit(child, f"{path}.{key}" if path else key)
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                visit(child, f"{path}[{index}]")
+
+    visit(result, "")
+    return failures
+
+
+def _report_cycle(result, repo: str, stream=None):
+    """Emit only actionable machine-readable cycle failures; ordinary idle stays quiet."""
+    stream = stream or sys.stderr
+    for failure in _cycle_failures(result):
+        event = ("ready_discovery_unavailable"
+                 if failure["component"] == "ready_discovery"
+                 and failure["status"] == "discovery_unavailable"
+                 else "runtime_cycle_issue")
+        record = {"event": event, "repo": repo, **failure}
+        stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+
 def _load(path):
     with open(path, encoding="utf-8") as stream:
         text = stream.read()
@@ -107,6 +195,10 @@ def main(argv=None):
     parser.add_argument("--poll-interval", type=float, default=30.0)
     args = parser.parse_args(argv)
     manifest, local = _load(args.manifest), _load(args.runtime_config)
+    try:
+        _validate_runtime_revision(manifest)
+    except ValueError as error:
+        parser.error(str(error))
     target_repo = local.get("target_repository")
     enrollment = local.get("enrollment")
     if not isinstance(target_repo, str) or target_repo.casefold() != args.repo.casefold():
@@ -125,7 +217,8 @@ def main(argv=None):
         with lock:
             runtime = build_runtime(manifest, local)
             if args.continuous:
-                run_continuous(runtime, args.repo, local["owner_id"], args.poll_interval)
+                run_continuous(runtime, args.repo, local["owner_id"], args.poll_interval,
+                               on_cycle=lambda result: _report_cycle(result, args.repo))
             else:
                 print(json.dumps(run_cycle(runtime, args.repo, local["owner_id"]), ensure_ascii=False))
     except RuntimeAlreadyRunning as error:
