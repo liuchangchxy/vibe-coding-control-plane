@@ -81,3 +81,15 @@ Use GitHub native `APPROVE`, `REQUEST_CHANGES`, branch protection, and Auto-merg
 ## Consumer-owned configuration
 
 Every consumer specifies its own base branch, allowed Implementer identities, required check names and accepted conclusions, and native merge method. Do not copy another repository's application checks by default. The manifest template and onboarding guide define the fields.
+
+## Evidence and scope decisions
+
+Use evidence in this order: current GitHub/source/runtime evidence; the formal contract and current documentation; current machine observation; historical reports; chat memory; AI inference. Chat history is not authority. A Worker must verify Controller-provided claims against current evidence instead of promoting a prompt's guess into a system fact.
+
+Before calling a problem a VCCP architecture blocker, the Controller records concise answers to: (1) what outcome the user needs; (2) which existing VCCP capability was checked; (3) whether the blocker is observed at runtime or inferred; (4) whether current GitHub, Runtime, or OS capabilities can meet the goal; and (5) why new infrastructure is necessary. If an existing capability meets the goal, do not expand scope for architectural preference.
+
+Consumer onboarding and revision-upgrade Workers use a branch and PR. They do not push directly to `main` without explicit authorization. Infrastructure maintenance PRs are not product PRs: use an independent human review where available, do not invent a Frozen Issue or enable self-review, and require explicit maintainer authorization for any exceptional administrator merge. Re-read the full diff, expected files, current head SHA, and exact-head checks before that operation; use the GitHub CLI head guard documented in [Consumer deployment and host migration](ONBOARDING.md#production-deployment-and-host-migration).
+
+Reports read every SHA from current GitHub or Git state. Name the PR head SHA and merge commit SHA separately; never infer either from memory or a previous report. Historical SHA values are context, not current revision evidence.
+
+Classify a GitHub EOF from direct command output as an interrupted request/stream. Do not infer that VCCP must manage proxy, DNS, or TLS, and do not add retry infrastructure unless current source and repeated runtime evidence establish that need.

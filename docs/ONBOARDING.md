@@ -113,3 +113,115 @@ For future new projects, `vibe-coding-starter` calls this same CLI/API after cre
 `vibe-coding-control-plane` is the canonical source for these automation contracts and templates. `vibe-coding-starter` is a consumer/bootstrapper that may automate future onboarding. Existing projects such as EasyExam, DaySpark, and Zhanghui can migrate through this guide. Control Plane does not depend on the starter.
 
 Node tooling owns PLAN, APPLY, AUDIT, manifest generation/validation, and Reviewer contract installation. Python owns activation qualification and construction of the Generic Runtime, plus claim/ownership, discovery, dispatch, repair admission, durable execution state, reconciliation, Implementer and lifecycle watchdogs, and exact-head CI / Review / native-merge observation. The shared manifest holds consumer policy; local JSON holds machine configuration. These boundaries prevent host-specific paths and credential data from becoming shared repository contract.
+
+## 6. Production deployment and host migration
+
+### Readiness states are separate
+
+Use these states as evidence levels; reaching one does not prove the next:
+
+1. **Repository onboarded** — the schema v2 manifest, installation lock, cleanup capability, labels, PLAN/APPLY/AUDIT contract, and repository-level checks agree.
+2. **Machine qualified** — `readiness` reports `machine_activation_ready` after repository identity, local config, credential availability, App installation and permissions, a harmless GitHub read, runtime graph construction, and local process-lock eligibility succeed. This is pre-start qualification. It does not mean a production Dispatcher is running.
+3. **Dispatcher installed** — the host's native resident mechanism is configured (for example, a macOS LaunchAgent or an already validated Windows Sidecar mechanism). A local file alone does not prove it is loaded.
+4. **Dispatcher running** — the process is alive, it acquired the local RuntimeLock before constructing the graph, its logs are accessible, and restart behavior has been observed. The continuous Runner retains that lock while it runs.
+5. **Production verified** — a real product Issue labeled `frozen-spec` and `agent-ready` completes Claim → Implementer → PR → CI → Reviewer → repair if needed → GitHub native merge → Issue closeout. Only this proves full zero-touch product E2E for that host. Do not claim Level 5 from readiness or process-running evidence.
+
+### Consumer upgrade and start sequence
+
+1. Read the Consumer's current default branch, manifest, installation lock, and pinned VCCP revision. Independently verify the external Reviewer Task state and whether a production Dispatcher owner already exists. A local prompt file does not prove a Reviewer Task exists or is enabled; if the execution context cannot inspect Work Tasks, report `Reviewer external status requires verification`.
+2. Select a full 40-character VCCP commit SHA. Never pin a branch name.
+3. From the VCCP checkout at that exact SHA, run `node scripts/onboard-consumer.mjs plan --repo OWNER/REPO --path /path/to/consumer --input onboarding.json`. Inspect the desired revision, file diffs, required checks, artifacts, and external steps.
+4. Apply only the saved PLAN, using `node scripts/onboard-consumer.mjs apply --repo OWNER/REPO --path /path/to/consumer --plan /path/to/plan.json`. APPLY revalidates observed state and rejects a stale plan.
+5. Commit the Consumer changes on a branch and open an upgrade PR. Do not push to `main` without explicit authorization. Merge the Consumer revision PR through its authorized review path; then confirm Consumer `main` contains the manifest and lock update.
+6. Stop the production Runner. Check out/sync VCCP to the exact SHA now pinned by Consumer `main`. The production Runner compares its own VCCP checkout SHA with `vccp.revision` and refuses to start on a mismatch. Do not run a production manifest from an unmerged Consumer PR branch as authority.
+7. With the resident Runner stopped, run `node scripts/onboard-consumer.mjs readiness --repo OWNER/REPO --path /path/to/consumer --runtime-config /absolute/path/to/consumer-runtime.json`. Resolve blockers, and only then start the resident host.
+
+An infrastructure or VCCP-revision PR is a maintenance change, not automatically a product PR. The product Reviewer requires its normal Implementer author and linked Frozen Issue preconditions; when those do not fit, it should skip without formal review. Do not create another Reviewer, invent a Frozen Issue, allow a Bot to review itself, or alter the product Reviewer contract to force maintenance through product automation. Prefer an independent human review. GitHub does not allow a PR author to approve their own PR; do not retry an `APPROVE` that GitHub rejects with HTTP 422 as if it were a plugin failure.
+
+If the repository permissions make independent review impossible, a one-time administrator maintenance merge is allowed only when the maintainer explicitly authorizes it and the PR diff, expected files, exact current head SHA, and checks on that SHA have been re-read. Guard the merge with GitHub CLI's `--match-head-commit` option, for example:
+
+```sh
+gh pr merge 123 --squash --admin --match-head-commit EXPECTED_HEAD_SHA
+```
+
+Use `--admin` only when the explicitly authorized maintenance operation must bypass an unmet repository requirement. This exception is not a product-flow merge mechanism and does not change the normal-flow rule forbidding admin bypass. See the [GitHub CLI `gh pr merge` reference](https://cli.github.com/manual/gh_pr_merge).
+
+### Reviewer and Dispatcher are different paths
+
+The Dispatcher discovers Frozen Issues through the production Runtime's 30-second polling loop and launches the Implementer. Reviewer is a separate ChatGPT Work GitHub Webhook Task triggered by PR `opened`, `ready_for_review`, and `synchronize` events. VCCP does not require a fully webhook-driven lifecycle: Reviewer events do not imply that Dispatcher polling must be replaced. Do not add a webhook receiver, public endpoint, tunnel, queue, event gateway, or cloud function to this deployment path.
+
+The Reviewer Task is an external state. Reuse an existing Task for this repository when verified; create one only when none exists. If it cannot be inspected, leave its status unverified. An empty repository webhook listing does not prove that a ChatGPT Work Task is absent.
+
+### Readiness, Runner modes, and logs
+
+Run readiness only while the production Runner is stopped. Readiness is a pre-start qualification and attempts the same local process lock; if a running Dispatcher owns that lock, readiness may report not ready. That lock is single-machine exclusion only; it does not coordinate a Windows host with a Mac host.
+
+The Runner supports `--manifest`, `--runtime-config`, `--repo`, `--one-cycle`, `--continuous`, and `--poll-interval`. `--one-cycle` performs real production orchestration: it can claim an Issue, change coordination labels, dispatch work, and advance recovery/lifecycle state. It is not a dry-run or a harmless health check. Use `readiness` for pre-start qualification.
+
+Continuous idle cycles do not emit routine logs. Actionable discovery and lifecycle failures are emitted to stderr as JSON while the loop remains alive and retries on a later cycle. Production acceptance should verify: the expected process is alive; it holds the local RuntimeLock (the Runner acquires it before building the runtime and holds it throughout the loop); discovery failures appear in stderr; and the process can restart and resume polling. A `RUNNING` label or a successful readiness result alone is insufficient evidence of discovery or end-to-end work.
+
+### macOS LaunchAgent environment
+
+A GUI or `launchd` process does not inherit the same shell environment as an interactive Terminal. Configure the absolute Python executable, `WorkingDirectory`, `PYTHONPATH`/module import path, required `PATH`, manifest path, and runtime-config path explicitly. Use machine-local paths and credentials; never copy a user's path into the Consumer repository. A generic per-user LaunchAgent template is:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>org.example.vccp.consumer</string>
+  <key>ProgramArguments</key><array>
+    <string>/absolute/path/to/python3</string>
+    <string>-m</string><string>vccp_runtime.runner</string>
+    <string>--manifest</string><string>/absolute/path/to/consumer/.github/control-plane.yml</string>
+    <string>--runtime-config</string><string>/absolute/path/to/consumer-runtime.json</string>
+    <string>--repo</string><string>OWNER/REPO</string>
+    <string>--continuous</string><string>--poll-interval</string><string>30</string>
+  </array>
+  <key>WorkingDirectory</key><string>/absolute/path/to/vccp-checkout</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/absolute/path/to/provider-bin:/usr/bin:/bin</string>
+    <key>PYTHONPATH</key><string>/absolute/path/to/vccp-checkout</string>
+  </dict>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/absolute/path/to/logs/vccp.stdout.log</string>
+  <key>StandardErrorPath</key><string>/absolute/path/to/logs/vccp.stderr.log</string>
+</dict></plist>
+```
+
+Replace every example value. Confirm the job is loaded and its process/logs are the expected ones after installation. `WorkingDirectory` and `ProgramArguments` are `launchd.plist` settings; see the [launchd property-list reference](https://keith.github.io/xcode-man-pages/launchd.plist.5.html).
+
+### Windows host
+
+Use the Consumer's existing, verified resident host mechanism. This repository does not define a standard Windows service/Sidecar installer; do not copy another project's historical Sidecar setup or build a cross-platform installer. The minimum process command boundary is:
+
+```powershell
+& "C:\absolute\path\to\python.exe" -m vccp_runtime.runner `
+  --manifest "C:\absolute\path\to\consumer\.github\control-plane.yml" `
+  --runtime-config "C:\absolute\path\to\consumer-runtime.json" `
+  --repo OWNER/REPO --continuous --poll-interval 30
+```
+
+The resident host must preserve the configured working directory, import path, and required `PATH`, and must expose stdout/stderr for operations.
+
+### Host migration and single-owner rule
+
+One Consumer has one authorized production Dispatcher owner. RuntimeLock prevents two VCCP processes from using the same local runtime identity on one machine; it is not a distributed lock and does not protect a Mac-to-Windows migration.
+
+Perform takeover in this order:
+
+1. Stop the old host's Dispatcher through its resident host mechanism.
+2. Confirm no old resident Runner process remains.
+3. Inspect active leases, attempts, and in-flight PR/Issue work using the existing runtime state and current GitHub facts.
+4. Resolve or wait for in-flight work before takeover. Continue only when no active work remains or its ownership has been safely resolved.
+5. Configure the new host and its machine-local credentials and paths.
+6. Keep the new production Runner stopped and run readiness against the Consumer's merged main and exact pinned VCCP revision.
+7. Start the new resident Dispatcher.
+8. Verify one expected process owns the local lock, logs are accessible, and restart behavior is understood.
+
+Never run old and new hosts as simultaneous owners, and do not add distributed election or cross-machine locking as a migration shortcut.
+
+### Identity and production evidence
+
+The GitHub App ID identifies the App and belongs in machine-local runtime config. The Bot User ID is a GitHub account identifier; the manifest's `repository.implementer_authors` instead takes author login text such as `some-app[bot]`. A human infrastructure operator account is a separate identity. Do not substitute one for another.
+
+Record production evidence by level: **1** repository ready; **2** machine ready; **3** Dispatcher running; **4** Issue discovery observed; **5** full zero-touch E2E through native merge and closeout. Do not promote Level 2 or Level 3 evidence to Level 5. Do not create a fake product Issue to claim Level 5; record full Mac zero-touch E2E as `PENDING_REAL_PRODUCT_ISSUE` until a real product request exercises it.

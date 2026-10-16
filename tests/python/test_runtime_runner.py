@@ -1,11 +1,13 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 
 from vccp_runtime import runner
+from vccp_runtime.core import RuntimeConfig
 from vccp_runtime.runner import RuntimeAlreadyRunning, RuntimeLock, run_continuous
 
 
@@ -56,6 +58,108 @@ class RuntimeRunnerTests(unittest.TestCase):
         self.assertEqual(observed, [[], []])
         self.assertEqual(sleeps, [5])
 
+    def test_continuous_cli_reports_discovery_failure_without_exiting(self):
+        manifest = {"vccp": {"revision": "0f267f23183b17d800364da034da2c845728ce72"}}
+        local = {"database_path": "state.db", "owner_id": "owner", "workspace": ".",
+                 "target_repository": "owner/repo", "enrollment": {"authorized_repository": "owner/repo"}}
+        failure = {"ready_discovery": {"status": "discovery_unavailable",
+                                        "detail": "GitHub API temporarily unavailable"}}
+
+        class Lock:
+            def __init__(self, *_): pass
+            def __enter__(self): return self
+            def __exit__(self, *_): pass
+
+        def continuous(runtime, repo, owner_id, poll_interval, on_cycle=None):
+            self.assertEqual((repo, owner_id, poll_interval), ("owner/repo", "owner", 30.0))
+            on_cycle(failure)
+
+        stderr = StringIO()
+        with patch.object(runner, "_load", side_effect=[manifest, local]), \
+             patch.object(runner, "_workspace_repository", return_value="owner/repo"), \
+             patch.object(runner, "RuntimeLock", Lock), \
+             patch.object(runner, "build_runtime", return_value=object()), \
+             patch.object(runner, "run_continuous", side_effect=continuous), \
+             redirect_stderr(stderr):
+            runner.main(["--manifest", "manifest.yml", "--runtime-config", "runtime.json",
+                         "--repo", "owner/repo", "--continuous"])
+
+        event = json.loads(stderr.getvalue())
+        self.assertEqual(event["event"], "ready_discovery_unavailable")
+        self.assertEqual(event["repo"], "owner/repo")
+        self.assertEqual(event["detail"], "GitHub API temporarily unavailable")
+
+    def test_continuous_loop_reports_failure_then_recovers_on_next_cycle(self):
+        class Runtime:
+            def __init__(self):
+                self.discovery_calls = 0
+                self.workflow = self
+                self.core = self
+                self.lifecycle = self
+
+            def advance_once(self, *_): return {"status": "ok", "items": []}
+            def reconcile_once(self, *_): return {"status": "reconciled", "items": []}
+            def observe_implementer_progress(self, *_): return {"status": "observed", "items": []}
+            def discover_ready(self, _repo):
+                self.discovery_calls += 1
+                if self.discovery_calls == 1:
+                    raise RuntimeError("temporary GitHub read failure")
+                return []
+
+        runtime = Runtime()
+        stderr = StringIO()
+        cycles = []
+        sleeps = []
+        run_continuous(
+            runtime, "owner/repo", "owner", poll_interval=5, sleep=sleeps.append,
+            stop=lambda: runtime.discovery_calls >= 2,
+            on_cycle=lambda result: (cycles.append(result), runner._report_cycle(result, "owner/repo", stderr)),
+        )
+
+        self.assertEqual(len(cycles), 2)
+        self.assertEqual(cycles[0]["ready_discovery"]["status"], "discovery_unavailable")
+        self.assertEqual(cycles[1]["ready_discovery"], {"status": "discovered", "count": 0})
+        self.assertEqual(sleeps, [5])
+        events = [json.loads(line) for line in stderr.getvalue().splitlines()]
+        self.assertEqual([event["event"] for event in events], ["ready_discovery_unavailable"])
+
+    def test_cycle_reporter_is_quiet_for_normal_idle_cycle(self):
+        stderr = StringIO()
+        runner._report_cycle({
+            "ready_discovery": {"status": "discovered", "count": 0},
+            "dispatches": [],
+            "recovery": {"status": "reconciled", "items": []},
+            "progress": {"status": "observed", "items": []},
+            "lifecycle": {"status": "ok", "items": []},
+            "lifecycle_after_dispatch": {"status": "ok", "items": []},
+        }, "owner/repo", stderr)
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_cycle_reporter_redacts_github_token_and_private_key_material(self):
+        token = "ghp_" + "A" * 36
+        private_key = "-----BEGIN PRIVATE KEY-----\nprivate credential bytes\n-----END PRIVATE KEY-----"
+        stderr = StringIO()
+        runner._report_cycle({"ready_discovery": {
+            "status": "discovery_unavailable", "detail": f"{token} {private_key}"}},
+            "owner/repo", stderr)
+        output = stderr.getvalue()
+        self.assertNotIn(token, output)
+        self.assertNotIn(private_key, output)
+        self.assertIn("[REDACTED]", output)
+
+    def test_cli_rejects_manifest_revision_mismatch_before_runtime_construction(self):
+        manifest = {"vccp": {"revision": "a" * 40}}
+        local = {"database_path": "state.db", "owner_id": "owner", "workspace": ".",
+                 "target_repository": "owner/repo", "enrollment": {"authorized_repository": "owner/repo"}}
+        with patch.object(runner, "_load", side_effect=[manifest, local]), \
+             patch.object(runner, "_workspace_repository", return_value="owner/repo"), \
+             patch.object(runner, "_runtime_source_revision", return_value="b" * 40), \
+             patch.object(runner, "build_runtime", side_effect=AssertionError("must fail before build")):
+            with self.assertRaises(SystemExit) as error:
+                runner.main(["--manifest", "manifest.yml", "--runtime-config", "runtime.json",
+                             "--repo", "owner/repo", "--one-cycle"])
+        self.assertEqual(error.exception.code, 2)
+
     def test_cli_acquires_lock_before_building_runtime(self):
         events = []
 
@@ -78,7 +182,8 @@ class RuntimeRunnerTests(unittest.TestCase):
 
         local = {"database_path": "state.db", "owner_id": "owner", "workspace": ".",
                  "target_repository": "owner/repo", "enrollment": {"authorized_repository": "owner/repo"}}
-        with patch.object(runner, "_load", side_effect=[{}, local]), \
+        manifest = {"vccp": {"revision": "0f267f23183b17d800364da034da2c845728ce72"}}
+        with patch.object(runner, "_load", side_effect=[manifest, local]), \
              patch.object(runner, "_workspace_repository", return_value="owner/repo"), \
              patch.object(runner, "RuntimeLock", Lock), \
              patch.object(runner, "build_runtime", side_effect=build), \
@@ -88,9 +193,10 @@ class RuntimeRunnerTests(unittest.TestCase):
         self.assertEqual(events, [("identity", "owner/repo", "state.db"), "lock", "build", "cycle", "release"])
 
     def test_cli_rejects_target_or_enrollment_mismatch_before_runtime_construction(self):
+        manifest = {"vccp": {"revision": "0f267f23183b17d800364da034da2c845728ce72"}}
         local = {"database_path": "state.db", "owner_id": "owner", "workspace": ".",
                  "target_repository": "other/repo", "enrollment": {"authorized_repository": "owner/repo"}}
-        with patch.object(runner, "_load", side_effect=[{}, local]), \
+        with patch.object(runner, "_load", side_effect=[manifest, local]), \
              patch.object(runner, "build_runtime", side_effect=AssertionError("must not construct runtime")):
             with self.assertRaises(SystemExit) as error:
                 runner.main(["--manifest", "manifest.json", "--runtime-config", "runtime.json",
@@ -105,6 +211,19 @@ class RuntimeRunnerTests(unittest.TestCase):
             yaml_file = Path(folder) / "control-plane.yml"
             yaml_file.write_text("schema_version: 2\nkey: value_yaml\n", encoding="utf-8")
             self.assertEqual(runner._load(str(yaml_file)), {"schema_version": 2, "key": "value_yaml"})
+
+    def test_onboarding_schema_v2_manifest_crosses_production_runner_boundary(self):
+        fixture = Path(__file__).parent / "fixtures" / "consumer-control-plane-v2.yml"
+        manifest = runner._load(str(fixture))
+
+        self.assertEqual(manifest["schema_version"], 2)
+        self.assertEqual(manifest["vccp"]["source"], "liuchangchxy/vibe-coding-control-plane")
+        self.assertEqual(manifest["repository"]["base_branch"], "main")
+        self.assertEqual(manifest["issue_contract"]["max_automated_repairs"], 3)
+        self.assertTrue(manifest["reviewer"]["exact_head_sha_required"])
+        self.assertEqual(manifest["reviewer"]["required_checks"][0]["name"], "test")
+        self.assertEqual(manifest["merge"]["method"], "squash")
+        self.assertEqual(RuntimeConfig.from_manifest(manifest).max_automated_repairs, 3)
 
 if __name__ == "__main__":
     unittest.main()
