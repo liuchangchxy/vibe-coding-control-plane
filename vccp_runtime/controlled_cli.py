@@ -9,7 +9,7 @@ import sys
 
 from .adapters import GitHubAppWriter
 from .github_app import (DPAPIFileCredentialSource, GitHubAppCredentialProvider,
-                         GitHubAppError)
+                         GitHubAppError, POSIXFileCredentialSource)
 from .github_push import GitHubAppPushBackend
 
 
@@ -28,10 +28,16 @@ def _load_context(path: str) -> dict:
 def _provider(context):
     app = context["github_app"]
     source = app.get("credential_source") or {}
-    if source.get("type") != "windows_dpapi_file":
+    source_type = source.get("type")
+    if source_type not in ("windows_dpapi_file", "posix_file"):
         raise GitHubAppError("runtime credential source type is unsupported")
+    source_obj = (
+        DPAPIFileCredentialSource(source["path"])
+        if source_type == "windows_dpapi_file"
+        else POSIXFileCredentialSource(source["path"])
+    )
     return GitHubAppCredentialProvider(
-        app["app_id"], DPAPIFileCredentialSource(source["path"]), context["repo"],
+        app["app_id"], source_obj, context["repo"],
         app.get("expected_app_slug"), app.get("api_url", "https://api.github.com"),
     )
 

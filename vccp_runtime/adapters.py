@@ -18,7 +18,8 @@ from .core import (LaunchDisposition, LaunchRequest, LaunchResult, RuntimeCore,
                    WorkflowSnapshot)
 from .github_app import (DPAPIFileCredentialSource, GitHubAppCredentialProvider,
                          GitHubAppError, GitHubAppIdentityError, GitHubAppPermissionError,
-                         GitHubHTTPError, repository_from_remote)
+                         GitHubHTTPError, POSIXFileCredentialSource, make_credential_source,
+                         repository_from_remote)
 from .github_push import GitHubAppPushBackend
 from .providers import ANTIGRAVITY_PROVIDER, CLAUDE_CODE_PROVIDER, ProviderRouter, normalize_provider_key
 
@@ -896,13 +897,18 @@ def _make_credential_provider(local_config: dict, target_repo: str):
     if not isinstance(app, dict) or not app.get("app_id"):
         raise ValueError("machine-local github_app configuration is required")
     source = app.get("credential_source")
-    if not isinstance(source, dict) or source.get("type") != "windows_dpapi_file" or not source.get("path"):
-        raise ValueError("github_app.credential_source must identify a Windows DPAPI file")
+    if not isinstance(source, dict) or source.get("type") not in ("windows_dpapi_file", "posix_file") or not source.get("path"):
+        raise ValueError("github_app.credential_source must identify a Windows DPAPI file or POSIX file")
     configured_repo = app.get("target_repository")
     if configured_repo and str(configured_repo).casefold() != target_repo.casefold():
         raise ValueError("GitHub App target_repository does not match workspace origin")
+    source_obj = (
+        DPAPIFileCredentialSource(source["path"])
+        if source.get("type") == "windows_dpapi_file"
+        else POSIXFileCredentialSource(source["path"])
+    )
     return GitHubAppCredentialProvider(
-        app["app_id"], DPAPIFileCredentialSource(source["path"]), target_repo,
+        app["app_id"], source_obj, target_repo,
         app.get("expected_app_slug"), app.get("api_url", "https://api.github.com"),
     )
 

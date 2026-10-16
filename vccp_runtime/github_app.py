@@ -141,6 +141,78 @@ class DPAPIFileCredentialSource:
             raise GitHubAppError("could not protect GitHub App private key") from error
 
 
+class POSIXFileCredentialSource:
+    """Loads a PEM private key from a machine-local, current-user POSIX file with 0600 permissions."""
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path).expanduser()
+
+    def load_private_key(self):
+        if os.name == "nt":
+            raise GitHubAppError("POSIX file credential storage is unavailable on Windows hosts")
+        try:
+            if not self.path.is_file():
+                raise GitHubAppError("protected GitHub App credential source is unavailable")
+            stat_info = self.path.stat()
+            if stat_info.st_mode & 0o077 != 0:
+                raise GitHubAppError("protected GitHub App credential file permissions must be 0600 or stricter")
+            if hasattr(os, "getuid") and stat_info.st_uid != os.getuid():
+                raise GitHubAppError("protected GitHub App credential file must be owned by the current user")
+            pem = self.path.read_bytes()
+            if not pem:
+                raise GitHubAppError("protected GitHub App credential source is empty")
+            if not pem.startswith(b"-----BEGIN ") or b"PRIVATE KEY-----" not in pem[:100]:
+                raise GitHubAppError("protected GitHub App credential source is not a PEM private key")
+            return serialization.load_pem_private_key(pem, password=None)
+        except GitHubAppError:
+            raise
+        except (OSError, ValueError, TypeError) as error:
+            raise GitHubAppError("protected GitHub App credential source is unreadable") from error
+
+    @classmethod
+    def protect_pem_file(cls, source: str | Path, destination: str | Path):
+        """Explicit human-run bootstrap operation on POSIX hosts: copies PEM with atomic 0600 permissions."""
+        if os.name == "nt":
+            raise GitHubAppError("POSIX file credential storage is unavailable on Windows hosts")
+        source_path, destination_path = Path(source).expanduser(), Path(destination).expanduser()
+        try:
+            pem = source_path.read_bytes()
+            serialization.load_pem_private_key(pem, password=None)
+            destination_path.parent.mkdir(parents=True, exist_ok=True)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            fd = os.open(destination_path, flags, 0o600)
+            try:
+                with open(fd, "wb") as handle:
+                    handle.write(pem)
+            except Exception:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+        except FileExistsError as error:
+            raise GitHubAppError("protected credential destination already exists") from error
+        except GitHubAppError:
+            raise
+        except (OSError, ValueError, TypeError) as error:
+            raise GitHubAppError("could not protect GitHub App private key") from error
+
+
+def make_credential_source(source: dict) -> DPAPIFileCredentialSource | POSIXFileCredentialSource:
+    if not isinstance(source, dict):
+        raise GitHubAppError("github_app.credential_source must identify a credential source")
+    source_type = source.get("type")
+    source_path = source.get("path")
+    if not source_path:
+        raise GitHubAppError("github_app.credential_source must specify a path")
+    if source_type == "windows_dpapi_file":
+        return DPAPIFileCredentialSource(source_path)
+    if source_type == "posix_file":
+        return POSIXFileCredentialSource(source_path)
+    raise GitHubAppError(f"unsupported github_app credential_source type: {source_type}")
+
+
+
 def _b64url(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
 
@@ -328,16 +400,21 @@ def repository_from_remote(remote: str, api_url: str = "https://api.github.com")
 
 def protect_key_main(argv=None) -> int:
     import argparse
-    parser = argparse.ArgumentParser(description="Protect a GitHub App PEM for the current Windows user.")
+    parser = argparse.ArgumentParser(description="Protect a GitHub App PEM for the current user.")
     parser.add_argument("source_pem")
-    parser.add_argument("destination_dpapi_file")
+    parser.add_argument("destination_file")
+    parser.add_argument("--type", choices=["windows_dpapi_file", "posix_file"],
+                        default="windows_dpapi_file" if os.name == "nt" else "posix_file")
     args = parser.parse_args(argv)
     try:
-        DPAPIFileCredentialSource.protect_pem_file(args.source_pem, args.destination_dpapi_file)
+        if args.type == "windows_dpapi_file":
+            DPAPIFileCredentialSource.protect_pem_file(args.source_pem, args.destination_file)
+        else:
+            POSIXFileCredentialSource.protect_pem_file(args.source_pem, args.destination_file)
     except GitHubAppError as error:
         print(str(error), file=sys.stderr)
         return 2
-    print("GitHub App credential protected for the current user.")
+    print(f"GitHub App credential protected for the current user ({args.type}).")
     return 0
 
 

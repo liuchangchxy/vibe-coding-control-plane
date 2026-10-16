@@ -13,7 +13,8 @@ from .adapters import (GitHubAPI, GitHubAppWriter, _PROVIDER_ADAPTERS, _configur
                        _make_credential_provider, _workspace_repository, build_runtime)
 from .core import RuntimeConfig
 from .github_app import (DPAPIFileCredentialSource, GitHubAppError,
-                         GitHubAppNotInstalled, GitHubAppPermissionError)
+                         GitHubAppNotInstalled, GitHubAppPermissionError,
+                         POSIXFileCredentialSource, make_credential_source)
 from .github_push import GitHubAppPushBackend
 from .runner import RuntimeAlreadyRunning, RuntimeLock
 
@@ -100,15 +101,19 @@ def qualify_activation(manifest: dict, local_config: dict, repo: str, environ=No
         blockers.append("machine-local github_app.app_id is required")
         app_config = {}
     credential_source = app_config.get("credential_source") or {}
-    if credential_source.get("type") != "windows_dpapi_file" or not credential_source.get("path"):
-        blockers.append("github_app.credential_source must identify a Windows DPAPI file")
+    source_type = credential_source.get("type")
+    if source_type not in ("windows_dpapi_file", "posix_file") or not credential_source.get("path"):
+        blockers.append("github_app.credential_source must identify a Windows DPAPI file or POSIX file")
     else:
         source_path = Path(credential_source["path"]).expanduser()
         if not source_path.is_file():
             blockers.append("protected GitHub App credential source is unavailable")
         else:
             try:
-                DPAPIFileCredentialSource(source_path).load_private_key()
+                if source_type == "windows_dpapi_file":
+                    DPAPIFileCredentialSource(source_path).load_private_key()
+                else:
+                    POSIXFileCredentialSource(source_path).load_private_key()
             except GitHubAppError as error:
                 blockers.append(str(error))
 
@@ -168,7 +173,7 @@ def qualify_activation(manifest: dict, local_config: dict, repo: str, environ=No
     except (OSError, RuntimeAlreadyRunning, TypeError, ValueError) as error:
         return {"status": "not_ready", "blockers": [f"production runtime qualification failed: {error}"]}
     return {"status": "ready", "blockers": [],
-            "credential_source": {"type": "windows_dpapi_file", "present": True},
+            "credential_source": {"type": source_type, "present": True},
             "installation": {"installed": True, "permissions_sufficient": True,
                              "missing_permissions": []},
             "repository_read": "passed", "writer_constructed": True,
