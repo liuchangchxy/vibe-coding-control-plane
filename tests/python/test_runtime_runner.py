@@ -96,7 +96,15 @@ class RuntimeRunnerTests(unittest.TestCase):
                 runner.main(["--manifest", "manifest.json", "--runtime-config", "runtime.json",
                              "--repo", "owner/repo"])
         self.assertEqual(error.exception.code, 2)
+    def test_load_supports_json_and_yaml(self):
+        with tempfile.TemporaryDirectory() as folder:
+            json_file = Path(folder) / "config.json"
+            json_file.write_text('{"key": "value_json"}', encoding="utf-8")
+            self.assertEqual(runner._load(str(json_file)), {"key": "value_json"})
 
+            yaml_file = Path(folder) / "control-plane.yml"
+            yaml_file.write_text("schema_version: 2\nkey: value_yaml\n", encoding="utf-8")
+            self.assertEqual(runner._load(str(yaml_file)), {"schema_version": 2, "key": "value_yaml"})
 
 if __name__ == "__main__":
     unittest.main()

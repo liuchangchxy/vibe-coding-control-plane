@@ -88,7 +88,12 @@ def run_continuous(runtime, repo: str, owner_id: str, poll_interval: float = 30.
 
 def _load(path):
     with open(path, encoding="utf-8") as stream:
-        return json.load(stream)
+        text = stream.read()
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        import yaml
+        return yaml.safe_load(text)
 
 
 def main(argv=None):

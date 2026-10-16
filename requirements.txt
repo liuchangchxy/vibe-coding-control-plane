@@ -1,1 +1,2 @@
 cryptography>=44,<51
+PyYAML>=6.0
