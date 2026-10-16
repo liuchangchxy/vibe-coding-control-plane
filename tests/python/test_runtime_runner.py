@@ -1,4 +1,5 @@
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,12 @@ from io import StringIO
 from vccp_runtime import runner
 from vccp_runtime.core import RuntimeConfig
 from vccp_runtime.runner import RuntimeAlreadyRunning, RuntimeLock, run_continuous
+
+
+def _checkout_head():
+    source_root = Path(runner.__file__).resolve().parent.parent
+    return subprocess.run(["git", "rev-parse", "--verify", "HEAD"], cwd=source_root,
+                          check=True, capture_output=True, text=True).stdout.strip()
 
 
 class RuntimeRunnerTests(unittest.TestCase):
@@ -59,7 +66,7 @@ class RuntimeRunnerTests(unittest.TestCase):
         self.assertEqual(sleeps, [5])
 
     def test_continuous_cli_reports_discovery_failure_without_exiting(self):
-        manifest = {"vccp": {"revision": runner._runtime_source_revision()}}
+        manifest = {"vccp": {"revision": _checkout_head()}}
         local = {"database_path": "state.db", "owner_id": "owner", "workspace": ".",
                  "target_repository": "owner/repo", "enrollment": {"authorized_repository": "owner/repo"}}
         failure = {"ready_discovery": {"status": "discovery_unavailable",
@@ -76,6 +83,7 @@ class RuntimeRunnerTests(unittest.TestCase):
 
         stderr = StringIO()
         with patch.object(runner, "_load", side_effect=[manifest, local]), \
+             patch.object(runner, "_runtime_source_revision", return_value=_checkout_head()), \
              patch.object(runner, "_workspace_repository", return_value="owner/repo"), \
              patch.object(runner, "RuntimeLock", Lock), \
              patch.object(runner, "build_runtime", return_value=object()), \
@@ -147,6 +155,25 @@ class RuntimeRunnerTests(unittest.TestCase):
         self.assertNotIn(private_key, output)
         self.assertIn("[REDACTED]", output)
 
+    def test_runtime_source_revision_rejects_dirty_checkout(self):
+        head = type("Result", (), {"stdout": "a" * 40 + "\n"})()
+        dirty = type("Result", (), {"stdout": " M vccp_runtime/runner.py\n"})()
+        with patch.object(runner.subprocess, "run", side_effect=[head, dirty]):
+            with self.assertRaisesRegex(ValueError, "uncommitted changes"):
+                runner._runtime_source_revision()
+
+    def test_cli_rejects_dirty_checkout_before_runtime_construction(self):
+        manifest = {"vccp": {"revision": "a" * 40}}
+        local = {"database_path": "state.db", "owner_id": "owner", "workspace": ".",
+                 "target_repository": "owner/repo", "enrollment": {"authorized_repository": "owner/repo"}}
+        with patch.object(runner, "_load", side_effect=[manifest, local]), \
+             patch.object(runner, "_runtime_source_revision", side_effect=ValueError("running VCCP checkout has uncommitted changes")), \
+             patch.object(runner, "build_runtime", side_effect=AssertionError("must fail before build")):
+            with self.assertRaises(SystemExit) as error:
+                runner.main(["--manifest", "manifest.yml", "--runtime-config", "runtime.json",
+                             "--repo", "owner/repo", "--one-cycle"])
+        self.assertEqual(error.exception.code, 2)
+
     def test_cli_rejects_manifest_revision_mismatch_before_runtime_construction(self):
         manifest = {"vccp": {"revision": "a" * 40}}
         local = {"database_path": "state.db", "owner_id": "owner", "workspace": ".",
@@ -182,8 +209,9 @@ class RuntimeRunnerTests(unittest.TestCase):
 
         local = {"database_path": "state.db", "owner_id": "owner", "workspace": ".",
                  "target_repository": "owner/repo", "enrollment": {"authorized_repository": "owner/repo"}}
-        manifest = {"vccp": {"revision": runner._runtime_source_revision()}}
+        manifest = {"vccp": {"revision": _checkout_head()}}
         with patch.object(runner, "_load", side_effect=[manifest, local]), \
+             patch.object(runner, "_runtime_source_revision", return_value=_checkout_head()), \
              patch.object(runner, "_workspace_repository", return_value="owner/repo"), \
              patch.object(runner, "RuntimeLock", Lock), \
              patch.object(runner, "build_runtime", side_effect=build), \
@@ -193,10 +221,11 @@ class RuntimeRunnerTests(unittest.TestCase):
         self.assertEqual(events, [("identity", "owner/repo", "state.db"), "lock", "build", "cycle", "release"])
 
     def test_cli_rejects_target_or_enrollment_mismatch_before_runtime_construction(self):
-        manifest = {"vccp": {"revision": runner._runtime_source_revision()}}
+        manifest = {"vccp": {"revision": _checkout_head()}}
         local = {"database_path": "state.db", "owner_id": "owner", "workspace": ".",
                  "target_repository": "other/repo", "enrollment": {"authorized_repository": "owner/repo"}}
         with patch.object(runner, "_load", side_effect=[manifest, local]), \
+             patch.object(runner, "_runtime_source_revision", return_value=_checkout_head()), \
              patch.object(runner, "build_runtime", side_effect=AssertionError("must not construct runtime")):
             with self.assertRaises(SystemExit) as error:
                 runner.main(["--manifest", "manifest.json", "--runtime-config", "runtime.json",

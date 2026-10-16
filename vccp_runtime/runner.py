@@ -103,6 +103,12 @@ def _runtime_source_revision():
         ["git", "rev-parse", "--verify", "HEAD"], cwd=source_root,
         check=True, capture_output=True, text=True,
     )
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"], cwd=source_root,
+        check=True, capture_output=True, text=True,
+    )
+    if status.stdout.strip():
+        raise ValueError("running VCCP checkout has uncommitted changes")
     return result.stdout.strip().lower()
 
 

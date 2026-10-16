@@ -118,13 +118,15 @@ Node tooling owns PLAN, APPLY, AUDIT, manifest generation/validation, and Review
 
 ### Readiness states are separate
 
-Use these states as evidence levels; reaching one does not prove the next:
+Track these distinct readiness states in order; reaching one does not prove the next:
 
 1. **Repository onboarded** — the schema v2 manifest, installation lock, cleanup capability, labels, PLAN/APPLY/AUDIT contract, and repository-level checks agree.
 2. **Machine qualified** — `readiness` reports `machine_activation_ready` after repository identity, local config, credential availability, App installation and permissions, a harmless GitHub read, runtime graph construction, and local process-lock eligibility succeed. This is pre-start qualification. It does not mean a production Dispatcher is running.
 3. **Dispatcher installed** — the host's native resident mechanism is configured (for example, a macOS LaunchAgent or an already validated Windows Sidecar mechanism). A local file alone does not prove it is loaded.
 4. **Dispatcher running** — the process is alive, it acquired the local RuntimeLock before constructing the graph, its logs are accessible, and restart behavior has been observed. The continuous Runner retains that lock while it runs.
-5. **Production verified** — a real product Issue labeled `frozen-spec` and `agent-ready` completes Claim → Implementer → PR → CI → Reviewer → repair if needed → GitHub native merge → Issue closeout. Only this proves full zero-touch product E2E for that host. Do not claim Level 5 from readiness or process-running evidence.
+5. **Production verified** — a real product Issue labeled `frozen-spec` and `agent-ready` completes Claim → Implementer → PR → CI → Reviewer → repair if needed → GitHub native merge → Issue closeout. Only this proves full zero-touch product E2E for that host.
+
+For evidence reporting, use the operational levels below: Level 1 repository ready, Level 2 machine ready, Level 3 Dispatcher running, Level 4 Issue discovery observed, and Level 5 full zero-touch E2E. Installation is a distinct prerequisite state between machine qualification and running.
 
 ### Consumer upgrade and start sequence
 
