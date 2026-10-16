@@ -59,7 +59,7 @@ class RuntimeRunnerTests(unittest.TestCase):
         self.assertEqual(sleeps, [5])
 
     def test_continuous_cli_reports_discovery_failure_without_exiting(self):
-        manifest = {"vccp": {"revision": "0f267f23183b17d800364da034da2c845728ce72"}}
+        manifest = {"vccp": {"revision": runner._runtime_source_revision()}}
         local = {"database_path": "state.db", "owner_id": "owner", "workspace": ".",
                  "target_repository": "owner/repo", "enrollment": {"authorized_repository": "owner/repo"}}
         failure = {"ready_discovery": {"status": "discovery_unavailable",
@@ -182,7 +182,7 @@ class RuntimeRunnerTests(unittest.TestCase):
 
         local = {"database_path": "state.db", "owner_id": "owner", "workspace": ".",
                  "target_repository": "owner/repo", "enrollment": {"authorized_repository": "owner/repo"}}
-        manifest = {"vccp": {"revision": "0f267f23183b17d800364da034da2c845728ce72"}}
+        manifest = {"vccp": {"revision": runner._runtime_source_revision()}}
         with patch.object(runner, "_load", side_effect=[manifest, local]), \
              patch.object(runner, "_workspace_repository", return_value="owner/repo"), \
              patch.object(runner, "RuntimeLock", Lock), \
@@ -193,7 +193,7 @@ class RuntimeRunnerTests(unittest.TestCase):
         self.assertEqual(events, [("identity", "owner/repo", "state.db"), "lock", "build", "cycle", "release"])
 
     def test_cli_rejects_target_or_enrollment_mismatch_before_runtime_construction(self):
-        manifest = {"vccp": {"revision": "0f267f23183b17d800364da034da2c845728ce72"}}
+        manifest = {"vccp": {"revision": runner._runtime_source_revision()}}
         local = {"database_path": "state.db", "owner_id": "owner", "workspace": ".",
                  "target_repository": "other/repo", "enrollment": {"authorized_repository": "owner/repo"}}
         with patch.object(runner, "_load", side_effect=[manifest, local]), \
