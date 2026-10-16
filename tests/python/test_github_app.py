@@ -237,6 +237,45 @@ class POSIXFileCredentialSourceTests(unittest.TestCase):
             loaded = POSIXFileCredentialSource(dest).load_private_key()
             self.assertIsNotNone(loaded)
 
+    def test_protect_pem_file_creates_file_with_0600_before_writing(self):
+        """Regression test: file must never be exposed with loose permissions before writing."""
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.pem"
+            dest = Path(directory) / "protected.pem"
+            source.write_bytes(self.pem)
+
+            permissions_during_write = []
+            real_open = open
+
+            def spy_open(file, *args, **kwargs):
+                handle = real_open(file, *args, **kwargs)
+                original_write = handle.write
+
+                def spied_write(data):
+                    if dest.exists():
+                        permissions_during_write.append(dest.stat().st_mode & 0o077)
+                    return original_write(data)
+
+                handle.write = spied_write
+                return handle
+
+            with patch("vccp_runtime.github_app.open", side_effect=spy_open):
+                POSIXFileCredentialSource.protect_pem_file(source, dest)
+
+            self.assertTrue(dest.is_file())
+            self.assertTrue(len(permissions_during_write) > 0)
+            for mode_bits in permissions_during_write:
+                self.assertEqual(mode_bits, 0, "file must have 0600 permissions at creation time before writing")
+
+    def test_protect_pem_file_rejects_existing_destination(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.pem"
+            dest = Path(directory) / "protected.pem"
+            source.write_bytes(self.pem)
+            dest.write_bytes(b"already-exists")
+            with self.assertRaisesRegex(GitHubAppError, "already exists"):
+                POSIXFileCredentialSource.protect_pem_file(source, dest)
+
     def test_make_credential_source_constructs_both_types(self):
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / "key.file")

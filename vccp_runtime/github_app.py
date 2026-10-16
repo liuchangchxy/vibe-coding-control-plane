@@ -171,7 +171,7 @@ class POSIXFileCredentialSource:
 
     @classmethod
     def protect_pem_file(cls, source: str | Path, destination: str | Path):
-        """Explicit human-run bootstrap operation on POSIX hosts: copies PEM and sets 0600."""
+        """Explicit human-run bootstrap operation on POSIX hosts: copies PEM with atomic 0600 permissions."""
         if os.name == "nt":
             raise GitHubAppError("POSIX file credential storage is unavailable on Windows hosts")
         source_path, destination_path = Path(source).expanduser(), Path(destination).expanduser()
@@ -179,9 +179,17 @@ class POSIXFileCredentialSource:
             pem = source_path.read_bytes()
             serialization.load_pem_private_key(pem, password=None)
             destination_path.parent.mkdir(parents=True, exist_ok=True)
-            with destination_path.open("xb") as handle:
-                handle.write(pem)
-            destination_path.chmod(0o600)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            fd = os.open(destination_path, flags, 0o600)
+            try:
+                with open(fd, "wb") as handle:
+                    handle.write(pem)
+            except Exception:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
         except FileExistsError as error:
             raise GitHubAppError("protected credential destination already exists") from error
         except GitHubAppError:
