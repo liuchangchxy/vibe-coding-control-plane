@@ -571,6 +571,7 @@ class AntiGravityImplementer(_GuardedProvider):
         self.environ = os.environ if environ is None else environ
         self.write_guard = write_guard or WorkspaceWriteGuard()
         self.runtime_context = runtime_context
+        self.launch_context_override: dict | None = None
         self.provider = provider
         self.conversation_roots = [Path(p).expanduser() for p in (conversation_roots or [])]
         self.project_config_root = Path(project_config_root).expanduser() if project_config_root else (
@@ -709,6 +710,7 @@ class ClaudeCodeImplementer(_GuardedProvider):
         self.environ = os.environ if environ is None else environ
         self.write_guard = write_guard or WorkspaceWriteGuard()
         self.runtime_context = runtime_context
+        self.launch_context_override: dict | None = None
         self.provider = provider
         self.permission_mode = permission_mode
         self.session_lookup_attempts = session_lookup_attempts

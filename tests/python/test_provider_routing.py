@@ -130,6 +130,26 @@ class ProviderRouterTests(unittest.TestCase):
         self.assertEqual((result.disposition, result.provider), (LaunchDisposition.UNKNOWN, "primary"))
         self.assertEqual(fallback.requests, [])
 
+    def test_runtime_context_reaches_provider_and_is_cleared_after_exception(self):
+        context = {"workspace_baseline": "baseline"}
+
+        class ContextProvider(StubProvider):
+            def __init__(self):
+                super().__init__("primary", failure=RuntimeError("adapter exploded"))
+                self.launch_context_override = None
+                self.context_seen = None
+
+            def launch(self, request):
+                self.context_seen = self.launch_context_override
+                return super().launch(request)
+
+        primary = ContextProvider()
+        request = replace(launch_request(), runtime_context=context)
+        result = ProviderRouter([("primary", primary)]).launch(request)
+        self.assertEqual((result.disposition, result.provider), (LaunchDisposition.UNKNOWN, "primary"))
+        self.assertEqual(primary.context_seen, context)
+        self.assertIsNone(primary.launch_context_override)
+
     def test_activity_is_observed_only_through_the_named_provider(self):
         primary = StubProvider("primary", activity=99.0)
         owner = StubProvider("owner", activity=5.0)

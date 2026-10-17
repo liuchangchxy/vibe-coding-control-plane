@@ -62,11 +62,13 @@ class ProviderRouter:
         for key, adapter in self._ordered:
             try:
                 context = getattr(request, "runtime_context", None)
-                if context and hasattr(adapter, "launch_context_override"):
-                    adapter.launch_context_override = context
-                result = adapter.launch(request)
                 if hasattr(adapter, "launch_context_override"):
-                    adapter.launch_context_override = None
+                    adapter.launch_context_override = context
+                try:
+                    result = adapter.launch(request)
+                finally:
+                    if hasattr(adapter, "launch_context_override"):
+                        adapter.launch_context_override = None
             except Exception:
                 # An adapter that raised cannot prove the external work did not start, so
                 # the uncertainty belongs to that provider and must never reroute.

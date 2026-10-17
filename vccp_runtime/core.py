@@ -232,6 +232,7 @@ class _Store:
                     ,frozen_spec_digest TEXT
                     ,workspace_baseline TEXT
                     ,closeout_pending INTEGER NOT NULL DEFAULT 0
+                    ,no_op_closeout_intent INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS completion_receipts (
                     attempt_id TEXT PRIMARY KEY, repo TEXT NOT NULL, issue_number INTEGER NOT NULL,
@@ -254,7 +255,8 @@ class _Store:
                 connection.execute("ALTER TABLE attempts ADD COLUMN progress_deadline_at REAL")
             for name, declaration in (("no_change_authorized", "INTEGER NOT NULL DEFAULT 0"),
                                       ("frozen_spec_digest", "TEXT"), ("workspace_baseline", "TEXT"),
-                                      ("closeout_pending", "INTEGER NOT NULL DEFAULT 0")):
+                                      ("closeout_pending", "INTEGER NOT NULL DEFAULT 0"),
+                                      ("no_op_closeout_intent", "INTEGER NOT NULL DEFAULT 0")):
                 if name not in columns:
                     connection.execute(f"ALTER TABLE attempts ADD COLUMN {name} {declaration}")
             migrating_bound_head = "resulting_head_sha" not in columns
@@ -507,12 +509,41 @@ class _Store:
             row = connection.execute("SELECT * FROM completion_receipts WHERE attempt_id=?", (attempt_id,)).fetchone()
             return dict(row) if row else None
 
+    def begin_noop_closeout(self, attempt_id: str, now: float | None = None):
+        """Durably record Runtime ownership before attempting the external Issue close."""
+        connection = self.transaction()
+        try:
+            row = connection.execute(
+                "SELECT a.repo,a.issue_number,a.phase,a.launch_outcome,a.implementer_provider,a.execution_id,"
+                "a.no_change_authorized,a.frozen_spec_digest,r.source,r.repo AS receipt_repo,"
+                "r.issue_number AS receipt_issue,r.provider,r.execution_id AS receipt_execution,"
+                "r.authorization_digest FROM attempts a LEFT JOIN completion_receipts r USING(attempt_id) "
+                "WHERE a.attempt_id=?", (attempt_id,),
+            ).fetchone()
+            if (row is None or row["phase"] != "LAUNCH_CONFIRMED" or row["launch_outcome"] != "confirmed"
+                    or not row["no_change_authorized"] or row["source"] != "implementer"
+                    or row["receipt_repo"] != row["repo"] or row["receipt_issue"] != row["issue_number"]
+                    or row["provider"] != row["implementer_provider"]
+                    or row["receipt_execution"] != row["execution_id"]
+                    or row["authorization_digest"] != row["frozen_spec_digest"]):
+                connection.rollback()
+                return False
+            connection.execute("UPDATE attempts SET no_op_closeout_intent=1,updated_at=? WHERE attempt_id=?",
+                               (time.time() if now is None else float(now), attempt_id))
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def no_op_terminal(self, attempt_id: str, now: float, pending: bool = False):
         connection = self.transaction()
         try:
-            row = connection.execute("SELECT repo,issue_number,lease_token FROM attempts WHERE attempt_id=?",
+            row = connection.execute("SELECT repo,issue_number,lease_token,no_op_closeout_intent FROM attempts WHERE attempt_id=?",
                                      (attempt_id,)).fetchone()
-            if row is None:
+            if row is None or not row["no_op_closeout_intent"]:
                 connection.rollback()
                 return False
             connection.execute("UPDATE attempts SET phase=?,closeout_pending=?,updated_at=?,phase_entered_at=?,deadline_at=NULL "
@@ -1066,6 +1097,9 @@ class RuntimeCore:
             if not receipt or row["phase"] == "SUCCESS_NO_OP":
                 continue
             if row["phase"] == "SUCCESS_NO_OP_CLEANUP_PENDING":
+                if not row["no_op_closeout_intent"]:
+                    items.append({"issue": row["issue_number"], "status": "no_op_deferred"})
+                    continue
                 try:
                     if self.workflow.clear_noop_coordination_labels(row["repo"], row["issue_number"]):
                         self.store.no_op_terminal(row["attempt_id"], current)
@@ -1102,6 +1136,7 @@ class RuntimeCore:
                         items.append({"issue": 37, "status": "historical_recovery_closeout_pending"})
                     continue
                 if not snapshot.issue_open and snapshot.frozen_spec \
+                        and row["no_op_closeout_intent"] \
                         and snapshot.coordination_state in {"invalid", "agent-working"} \
                         and receipt["repo"] == row["repo"] and receipt["issue_number"] == row["issue_number"] \
                         and receipt["provider"] == row["implementer_provider"] \
@@ -1140,6 +1175,9 @@ class RuntimeCore:
                     items.append({"issue": row["issue_number"], "status": "workspace_mutated"})
                     continue
                 # Issue close and active-label cleanup are independently retryable.
+                if not self.store.begin_noop_closeout(row["attempt_id"], current):
+                    items.append({"issue": row["issue_number"], "status": "no_op_deferred"})
+                    continue
                 if self.workflow.close_noop_issue(row["repo"], row["issue_number"]):
                     if self.workflow.clear_active_coordination_labels(row["repo"], row["issue_number"]):
                         self.store.no_op_terminal(row["attempt_id"], current)

@@ -2,6 +2,7 @@ import hashlib
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from dataclasses import replace
 from pathlib import Path
 
@@ -19,6 +20,8 @@ class Workflow:
                                          allow_no_change=True, frozen_spec_digest=DIGEST)
         self.closes = 0
         self.clears = 0
+        self.closeout_intent_at_close = None
+        self.store = None
 
     def observe(self, repo, issue):
         return self.snapshot
@@ -29,6 +32,8 @@ class Workflow:
 
     def close_noop_issue(self, repo, issue):
         self.closes += 1
+        self.closeout_intent_at_close = self.store.attempt(self.attempt_id)["no_op_closeout_intent"]
+        self.snapshot = replace(self.snapshot, issue_open=False, coordination_state="invalid", active_labels=())
         return True
 
     def clear_active_coordination_labels(self, repo, issue):
@@ -59,6 +64,8 @@ class NoOpCompletionTests(unittest.TestCase):
         self.workflow = Workflow()
         self.core = RuntimeCore(self.db, MANIFEST, self.workflow, Implementer())
         self.attempt = self.core.dispatch_initial("acme/repo", 7, "worker")["attempt_id"]
+        self.workflow.store = self.core.store
+        self.workflow.attempt_id = self.attempt
 
     def tearDown(self):
         self.temp.cleanup()
@@ -75,12 +82,24 @@ class NoOpCompletionTests(unittest.TestCase):
 
     def test_restart_after_github_close_before_sqlite_terminal_write(self):
         self.assertTrue(self.receipt())
-        self.workflow.snapshot = replace(self.workflow.snapshot, issue_open=False,
-                                          coordination_state="invalid", active_labels=())
+        with mock.patch.object(self.core.store, "no_op_terminal", side_effect=RuntimeError("simulated crash")):
+            first_result = self.core.reconcile_no_change("acme/repo")
+        self.assertEqual(self.workflow.closeout_intent_at_close, 1)
+        self.assertEqual(self.core.store.attempt(self.attempt)["phase"], "LAUNCH_CONFIRMED")
+        self.assertEqual(self.workflow.snapshot.issue_open, False)
         restarted = RuntimeCore(self.db, MANIFEST, self.workflow, Implementer())
         result = restarted.reconcile_no_change("acme/repo")
         self.assertEqual(result["items"][0]["status"], "success_no_op")
         self.assertEqual(restarted.store.attempt(self.attempt)["phase"], "SUCCESS_NO_OP")
+
+    def test_external_close_before_runtime_close_intent_is_not_successful_noop(self):
+        self.assertTrue(self.receipt())
+        self.workflow.snapshot = replace(self.workflow.snapshot, issue_open=False,
+                                          coordination_state="invalid", active_labels=())
+        result = self.core.reconcile_no_change("acme/repo")
+        self.assertEqual(result["items"][0]["status"], "no_op_deferred")
+        self.assertEqual(self.core.store.attempt(self.attempt)["phase"], "LAUNCH_CONFIRMED")
+        self.assertEqual(self.core.store.attempt(self.attempt)["no_op_closeout_intent"], 0)
 
     def test_no_receipt_does_not_prevent_existing_stall_timeout(self):
         row = self.core.store.attempt(self.attempt)

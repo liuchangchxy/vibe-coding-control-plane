@@ -687,6 +687,60 @@ class AdapterTests(unittest.TestCase):
                                                      capture_output=True, text=True, check=True).stdout.strip())
                                .glob("vccp-control/*/*/app-gh*")))
 
+    def test_production_completion_wrapper_records_receipt_and_reconciles(self):
+        with tempfile.TemporaryDirectory() as temp:
+            api = FakeAPI()
+            api.issue["body"] = "completion_policy: allow_no_change=true\nFrozen task"
+            workspace = init_git_repo(Path(temp) / "repo")
+            subprocess.run(["git", "-C", str(workspace), "remote", "add", "origin",
+                            "https://github.com/o/r.git"], check=True, capture_output=True)
+
+            class Provider:
+                api_url = "https://api.github.com"
+                target_repository = "o/r"
+                def get_token(self, repo): raise AssertionError("launch must not mint a token")
+                def request(self, *args, **kwargs): raise AssertionError("launch must not call GitHub")
+
+            class PushBackend:
+                def push(self, *args, **kwargs): raise AssertionError("completion must not push")
+
+            class ClosingWriter(MutatingWriter):
+                def close_issue(self, repo, issue):
+                    self.api.issue["state"] = "closed"
+                    return True
+
+            launches = []
+            def agent_runner(args, **kwargs):
+                launches.append((args, kwargs))
+                return SimpleNamespace(returncode=0, stdout=json.dumps({"conversation_id": CONVERSATION_ID}))
+
+            local = {"database_path": str(Path(temp) / "runtime.sqlite"), "workspace": str(workspace),
+                     "owner_id": "worker", "antigravity_executable": "language_server.exe",
+                     "github_app": {"app_id": "123456", "credential_source": {
+                         "type": "windows_dpapi_file", "path": str(Path(temp) / "key.dpapi")}}}
+            runtime = build_runtime(MANIFEST, local, api=api, writer=ClosingWriter(api),
+                                    runner=agent_runner, credential_provider=Provider(), push_backend=PushBackend())
+            result = runtime.core.dispatch_initial("o/r", 1, "worker")
+            attempt = runtime.core.store.attempt(result["attempt_id"])
+            completion = list(Path(subprocess.run(
+                ["git", "-C", str(workspace), "rev-parse", "--absolute-git-dir"],
+                capture_output=True, text=True, check=True).stdout.strip()
+            ).glob("vccp-control/*/*/complete-no-change*"))[0]
+            runtime_context = json.loads(completion.parent.joinpath("runtime-context.json").read_text())
+            self.assertEqual(runtime_context["workspace_baseline"], attempt["workspace_baseline"])
+            env = dict(launches[0][1]["env"])
+            self.assertIn(str(Path(__file__).resolve().parents[2]), env["PYTHONPATH"].split(os.pathsep))
+            self.assertIsNone(runtime.router._by_key["antigravity"].launch_context_override)
+            command = [str(completion)] if os.name != "nt" else ["cmd", "/c", str(completion)]
+            completed = subprocess.run(command, cwd=workspace, env=env, capture_output=True, text=True)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            receipt = runtime.core.store.receipt(result["attempt_id"])
+            self.assertIsNotNone(receipt)
+            self.assertEqual(receipt["workspace_evidence"], attempt["workspace_baseline"])
+            reconciliation = runtime.core.reconcile_no_change("o/r")
+            self.assertEqual(reconciliation["items"][0]["status"], "success_no_op")
+            self.assertEqual(runtime.core.store.attempt(result["attempt_id"])["phase"], "SUCCESS_NO_OP")
+
     def test_exact_head_repair_and_stale_review_launch_counts(self):
         with tempfile.TemporaryDirectory() as temp:
             api = FakeAPI(); writer = FakeWriter(); launches = []
