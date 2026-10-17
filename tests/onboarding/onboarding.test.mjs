@@ -922,6 +922,99 @@ test("deploy binds explicitly selected providers once then delegates the ready r
   });
 });
 
+test("deploy requires explicit repository enrollment and saves it with the provider binding", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
+    await applyOnboardingPlan({ plan, root, github });
+    const configPath = path.join(root, "runtime.json");
+    const config = { ...localEnrollment(root), enrollment: {}, providers: [
+      { key: "antigravity", type: "antigravity", executable: "/bin/true" },
+      { key: "claude_code", type: "claude_code", executable: "/bin/true" },
+    ] };
+    await writeFile(configPath, JSON.stringify(config));
+    let deployed;
+    let output = "";
+    const code = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root,
+      "--runtime-config", configPath, "--propose-revision", REV_A,
+      "--authorize-repository", REPO,
+      "--implementer-provider", "antigravity", "--reviewer-provider", "claude_code",
+      "--reviewer-identity", "reviewer-user"], {
+      stdout: { write: (text) => { output += text; } },
+      stderr: { write: (text) => assert.fail(text) }, githubFactory: () => github,
+      runtimeRevision: REV_A,
+      hostDeployer: async (request) => { deployed = request; return { status: "running", revision: REV_A }; },
+    });
+    const report = JSON.parse(output);
+    const written = JSON.parse(await readFile(configPath, "utf8"));
+    assert.equal(code, 0);
+    assert.equal(report.overall_status, "RUNNING");
+    assert.equal(written.enrollment.authorized_repository, REPO);
+    assert.equal(written.implementer_provider, "antigravity");
+    assert.equal(written.reviewer_provider, "claude_code");
+    assert.equal(deployed.localConfig.enrollment.authorized_repository, REPO);
+  });
+});
+
+test("deploy does not create machine enrollment without an explicit authorization", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
+    await applyOnboardingPlan({ plan, root, github });
+    const configPath = path.join(root, "runtime.json");
+    const config = { ...localEnrollment(root), enrollment: {}, providers: [
+      { key: "antigravity", type: "antigravity", executable: "/bin/true" },
+      { key: "claude_code", type: "claude_code", executable: "/bin/true" },
+    ] };
+    await writeFile(configPath, JSON.stringify(config));
+    let output = "";
+    const code = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root,
+      "--runtime-config", configPath, "--propose-revision", REV_A,
+      "--implementer-provider", "antigravity", "--reviewer-provider", "claude_code",
+      "--reviewer-identity", "reviewer-user"], {
+      stdout: { write: (text) => { output += text; } },
+      stderr: { write: (text) => assert.fail(text) }, githubFactory: () => github,
+      runtimeRevision: REV_A,
+      hostDeployer: async () => assert.fail("must not deploy without human enrollment authorization"),
+    });
+    const report = JSON.parse(output);
+    assert.equal(code, 2);
+    assert.equal(report.next_action.type, "authorize_machine_enrollment");
+    assert.match(report.next_action.detail, /--authorize-repository example\/consumer/);
+    assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), config);
+  });
+});
+
+test("deploy refuses an enrollment authorization for a different repository", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
+    await applyOnboardingPlan({ plan, root, github });
+    const configPath = path.join(root, "runtime.json");
+    const config = { ...localEnrollment(root), enrollment: {}, providers: [
+      { key: "antigravity", type: "antigravity", executable: "/bin/true" },
+      { key: "claude_code", type: "claude_code", executable: "/bin/true" },
+    ] };
+    await writeFile(configPath, JSON.stringify(config));
+    let output = "";
+    const code = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root,
+      "--runtime-config", configPath, "--propose-revision", REV_A,
+      "--authorize-repository", "another/repository",
+      "--implementer-provider", "antigravity", "--reviewer-provider", "claude_code",
+      "--reviewer-identity", "reviewer-user"], {
+      stdout: { write: (text) => { output += text; } },
+      stderr: { write: (text) => assert.fail(text) }, githubFactory: () => github,
+      runtimeRevision: REV_A,
+      hostDeployer: async () => assert.fail("must not deploy a differently authorized repository"),
+    });
+    const report = JSON.parse(output);
+    assert.equal(code, 2);
+    assert.equal(report.next_action.type, "authorize_machine_enrollment");
+    assert.match(report.next_action.detail, /must match the requested Consumer/);
+    assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), config);
+  });
+});
+
 test("CLI rejects a runtime revision mismatch before APPLY mutates files or GitHub", async () => {
   await withRepo(async (root) => {
     const github = new FakeGitHub();
