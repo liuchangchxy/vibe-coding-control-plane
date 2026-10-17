@@ -41,7 +41,7 @@ class Workflow:
         self.clears += 1
         return True
 
-    def remove_coordination_labels_and_close(self, repo, issue):
+    def close_historical_dayspark37_noop(self, repo, issue):
         self.historical_closeout_intent_at_close = self.store.historical_closeout_intent(
             self.historical_attempt_id)
         self.snapshot = replace(self.snapshot, issue_open=False, coordination_state="invalid",
