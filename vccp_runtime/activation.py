@@ -35,7 +35,8 @@ def _remote_repository(workspace: Path, host: str) -> str | None:
 
 
 def qualify_activation(manifest: dict, local_config: dict, repo: str, environ=None, host="github.com",
-                       credential_provider=None, api=None, writer=None, push_backend=None) -> dict:
+                       credential_provider=None, api=None, writer=None, push_backend=None,
+                       check_runtime_lock=True) -> dict:
     """Read-only production qualification: verify App access, read target repo, and construct the graph."""
     blockers: list[str] = []
     try:
@@ -180,8 +181,9 @@ def qualify_activation(manifest: dict, local_config: dict, repo: str, environ=No
                                     push_backend=push_backend)
             if runtime.core is None or runtime.workflow is None or runtime.router is None or runtime.lifecycle is None:
                 raise ValueError("runtime component construction was incomplete")
-        with RuntimeLock(repo, str(database_path)):
-            pass
+        if check_runtime_lock:
+            with RuntimeLock(repo, str(database_path)):
+                pass
         if reviewer_settings:
             from .local_reviewer import GitHubUserReviewerProvider
             reviewer_identity = local_config["reviewer_github_identity"]

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 from pathlib import Path
 import plistlib
 import re
@@ -44,6 +45,28 @@ def reconcile_macos_launch_agent(*, repo: str, runtime_root: str, manifest_path:
     if loaded:
         if not destination.is_file() or not _valid_existing_job(destination, label, repo):
             return {"status": "blocked", "reason": "loaded LaunchAgent is not the configured Consumer Runner"}
+        with destination.open("rb") as stream:
+            current = plistlib.load(stream)
+        expected_args = [python_executable, "-u", "-m", "vccp_runtime.runner", "--manifest",
+                         str(Path(manifest_path).expanduser().resolve()), "--runtime-config",
+                         str(Path(runtime_config_path).expanduser().resolve()), "--repo", repo,
+                         "--continuous", "--poll-interval", "30"]
+        manifest_digest = hashlib.sha256(Path(manifest_path).expanduser().read_bytes()).hexdigest()
+        config_digest = hashlib.sha256(Path(runtime_config_path).expanduser().read_bytes()).hexdigest()
+        if (current.get("WorkingDirectory") == str(runtime)
+                and current.get("ProgramArguments") == expected_args
+                and current.get("EnvironmentVariables", {}).get("PYTHONPATH") == str(runtime)
+                and current.get("VCCPManifestSHA256") == manifest_digest
+                and current.get("VCCPRuntimeConfigSHA256") == config_digest):
+            active, detail = _loaded(label, user_id, runner)
+            match = re.search(r"\bpid\s*=\s*(\d+)", detail)
+            pid = int(match.group(1)) if match else None
+            if active and pid:
+                process = _run(["ps", "-p", str(pid), "-o", "command="], runner)
+                if process.returncode == 0 and "vccp_runtime.runner" in (process.stdout or ""):
+                    return {"status": "running", "no_op": True, "mechanism": "launchd",
+                            "label": label, "pid": pid, "revision": runtime.name,
+                            "runtime_root": str(runtime)}
         stopped = _run(["launchctl", "bootout", f"gui/{user_id}/{label}"], runner)
         if stopped.returncode != 0:
             return {"status": "blocked", "reason": "existing Consumer Runner could not be stopped"}
@@ -79,6 +102,8 @@ def reconcile_macos_launch_agent(*, repo: str, runtime_root: str, manifest_path:
         "StandardOutPath": old.get("StandardOutPath", str(destination.parent / f"{label}.out.log")),
         "StandardErrorPath": old.get("StandardErrorPath", str(destination.parent / f"{label}.err.log")),
         "ProcessType": "Standard",
+        "VCCPManifestSHA256": hashlib.sha256(Path(manifest_path).expanduser().read_bytes()).hexdigest(),
+        "VCCPRuntimeConfigSHA256": hashlib.sha256(Path(runtime_config_path).expanduser().read_bytes()).hexdigest(),
     }
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(destination.name + f".{os.getpid()}.tmp")

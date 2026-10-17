@@ -45,7 +45,10 @@ class FakeGitHub {
   }
 
   async getRepository() { return this.repository; }
-  async getBranch(_repo, name) { return name === "main" ? { name, commit: { sha: "c".repeat(40) } } : null; }
+  async getBranch(repo, name) {
+    if (repo === SOURCE && name === "main") return { name, commit: { sha: REV_B } };
+    return repo === REPO && name === "main" ? { name, commit: { sha: "c".repeat(40) } } : null;
+  }
   async getCommit(source, sha) { return source === SOURCE && this.reachableRevisions.has(sha); }
   async listLabels() { return structuredClone(this.labels); }
   async createLabel(_repo, label) {
@@ -743,13 +746,90 @@ test("status provides one read-only READY view over repository audit and machine
     const report = JSON.parse(output);
     assert.equal(code, 0);
     assert.equal(report.command, "status");
-    assert.equal(report.overall_status, "READY");
+    assert.equal(report.overall_status, "READY_TO_START");
     assert.equal(report.repository_status, "ready");
     assert.equal(report.machine_activation.status, "ready");
     assert.equal(report.desired_revision, REV_A);
     assert.equal(report.installation_lock.status, "satisfied");
     assert.equal(report.machine_runtime.implementer_provider, null);
     assert.ok(["launchd", "unsupported", "windows_sidecar"].includes(report.host_runner.mechanism));
+  });
+});
+
+test("status trusts only an exact running clean host and avoids a lock-conflicting readiness probe", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
+    await applyOnboardingPlan({ plan, root, github });
+    const configPath = path.join(root, "runtime-config.json");
+    await writeFile(configPath, JSON.stringify(localEnrollment(root)));
+    let output = "";
+    const code = await runOnboardingCli(["status", "--repo", REPO, "--path", root, "--runtime-config", configPath], {
+      stdout: { write: (text) => { output += text; } }, stderr: { write: (text) => assert.fail(text) },
+      githubFactory: () => github, runtimeRevision: REV_A,
+      hostInspector: () => ({ status: "running", running_revision: REV_A, running_checkout_clean: true,
+        config_matches: true, pid: 1234 }),
+      runtimeQualifier: async () => assert.fail("status must not contend with the running RuntimeLock"),
+    });
+    const report = JSON.parse(output);
+    assert.equal(code, 0);
+    assert.equal(report.overall_status, "RUNNING");
+    assert.equal(report.host_runner.pid, 1234);
+    assert.equal(report.machine_activation.source, "verified_running_runtime");
+  });
+});
+
+test("deploy reuses PLAN and opens a structured maintenance PR without changing the base checkout", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    await writeFile(path.join(root, "input.json"), JSON.stringify(validInput()));
+    await writeFile(path.join(root, "runtime.json"), JSON.stringify(localEnrollment(root)));
+    let output = "";
+    const code = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root, "--input", path.join(root, "input.json"), "--runtime-config", path.join(root, "runtime.json")], {
+      stdout: { write: (text) => { output += text; } },
+      stderr: { write: (text) => assert.fail(text) },
+      githubFactory: () => github,
+      maintenancePublisher: async () => ({ status: "open", number: 7, url: "https://github.com/example/consumer/pull/7" }),
+      runtimeRevision: REV_A,
+    });
+    const report = JSON.parse(output);
+    assert.equal(code, 2);
+    assert.equal(report.command, "deploy");
+    assert.equal(report.repository_status, "changes_planned");
+    assert.equal(report.overall_status, "MAINTENANCE_PR_OPEN");
+    assert.equal(report.next_action.type, "maintenance_pr_review_and_merge");
+    assert.equal(github.labelCreates.length, 0);
+    await assert.rejects(readFile(path.join(root, ".github/control-plane.yml")));
+  });
+});
+
+test("deploy binds configured providers once then delegates the ready repository to host reconciliation", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
+    await applyOnboardingPlan({ plan, root, github });
+    const configPath = path.join(root, "runtime.json");
+    const config = { ...localEnrollment(root), providers: [
+      { key: "antigravity", type: "antigravity", executable: "/bin/true" },
+      { key: "claude_code", type: "claude_code", executable: "/bin/true" },
+    ] };
+    await writeFile(configPath, JSON.stringify(config));
+    let deployed;
+    let output = "";
+    const code = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root,
+      "--runtime-config", configPath, "--propose-revision", REV_A, "--reviewer-identity", "reviewer-user"], {
+      stdout: { write: (text) => { output += text; } },
+      stderr: { write: (text) => assert.fail(text) }, githubFactory: () => github,
+      runtimeRevision: REV_A, hostDeployer: async (request) => { deployed = request; return { status: "running", no_op: true, revision: REV_A }; },
+    });
+    const report = JSON.parse(output);
+    const written = JSON.parse(await readFile(configPath, "utf8"));
+    assert.equal(code, 0);
+    assert.equal(report.overall_status, "RUNNING");
+    assert.equal(written.implementer_provider, "antigravity");
+    assert.equal(written.reviewer_provider, "claude_code");
+    assert.equal(written.reviewer_github_identity, "reviewer-user");
+    assert.equal(deployed.manifest.vccp.revision, REV_A);
   });
 });
 
