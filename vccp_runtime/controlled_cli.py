@@ -6,8 +6,10 @@ import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 
 from .adapters import GitHubAppWriter
+from .core import _Store
 from .github_app import (DPAPIFileCredentialSource, GitHubAppCredentialProvider,
                          GitHubAppError, POSIXFileCredentialSource)
 from .github_push import GitHubAppPushBackend
@@ -65,6 +67,7 @@ def _parser():
     push = commands.add_parser("git-push")
     push.add_argument("--branch", required=True)
     push.add_argument("--expected-sha", required=True)
+    commands.add_parser("complete-no-change")
     return parser
 
 
@@ -74,6 +77,33 @@ def run(argv=None) -> int:
         context = _load_context(args.context)
         provider = _provider(context)
         repo = context["repo"]
+        if args.command == "complete-no-change":
+            if not context.get("allow_no_change") or not context.get("attempt_id"):
+                raise GitHubAppError("no-change completion is not authorized for this attempt")
+            if context.get("repo") != repo:
+                raise GitHubAppError("attempt repository provenance is invalid")
+            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=context["workspace"],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+            status = subprocess.run(["git", "status", "--porcelain=v1", "--untracked-files=all", "--", "."],
+                                    cwd=context["workspace"], check=True, capture_output=True,
+                                    text=True).stdout
+            evidence = json.dumps({"head": head, "status": status}, sort_keys=True)
+            baseline = context.get("workspace_baseline")
+            if baseline and evidence != baseline:
+                raise GitHubAppError("workspace differs from launch baseline")
+            if not context.get("database_path"):
+                raise GitHubAppError("runtime receipt store is unavailable")
+            store = _Store(context["database_path"])
+            attempt = store.attempt(context["attempt_id"])
+            if (not attempt or attempt["repo"] != repo.casefold() or attempt["implementer_provider"] != context.get("provider")
+                    or attempt["frozen_spec_digest"] != context.get("authorization_digest")):
+                raise GitHubAppError("attempt provenance does not authorize completion")
+            if store.has_controlled_push(context["attempt_id"]):
+                raise GitHubAppError("no-change completion is unavailable after controlled push")
+            if not store.record_completion(context["attempt_id"], attempt["implementer_provider"],
+                                           attempt["execution_id"], evidence):
+                raise GitHubAppError("attempt provenance does not authorize completion")
+            return 0
         if args.command == "app-gh":
             labels = context.get("coordination_labels") or []
             writer = GitHubAppWriter(credential_provider=provider, target_repository=repo,
@@ -90,13 +120,25 @@ def run(argv=None) -> int:
                 writer.create_pull_request(repo, context["issue_number"], args.title, args.body,
                                             args.head, args.base, args.draft)
                 return 0
+            if args.operation == "issue" and args.issue_operation == "close":
+                raise GitHubAppError("only Runtime may close a Frozen Issue")
             raise GitHubAppError("GitHub App operation is not allowed")
         if args.command == "git-push":
             if os.environ.get("VCCP_CONTROLLED_PUSH") != "1":
                 raise GitHubAppError("push is available only through its attempt-scoped wrapper")
+            if not context.get("attempt_id") or not context.get("provider") or not context.get("database_path"):
+                raise GitHubAppError("attempt-scoped push audit is unavailable")
+            store = _Store(context["database_path"])
             backend = GitHubAppPushBackend(provider, context["workspace"], repo,
                                            context["base_branch"])
-            backend.push(repo, args.branch, args.expected_sha, args.branch, controlled=True)
+            push_id = store.begin_controlled_push(context["attempt_id"], repo, context["provider"],
+                                                  args.branch, args.expected_sha)
+            if push_id is None:
+                raise GitHubAppError("attempt provenance does not authorize controlled push")
+            result = backend.push(repo, args.branch, args.expected_sha, args.branch, controlled=True)
+            if (not isinstance(result, dict) or result.get("status") != "pushed"
+                    or not store.complete_controlled_push(push_id, result.get("sha"))):
+                raise GitHubAppError("controlled push result could not be durably recorded")
             return 0
         raise GitHubAppError("controlled operation is not allowed")
     except GitHubAppError as error:

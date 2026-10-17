@@ -10,6 +10,8 @@ def run_once(runtime, repo: str, owner_id: str, issue_number: int | None = None,
     require it and always rechecks eligibility through ``dispatch_initial``.
     """
     # Native merge is observed before Issue auto-closure is treated as cancellation.
+    no_op = (runtime.core.reconcile_no_change(repo, now)
+             if hasattr(runtime.core, "reconcile_no_change") else {"status": "not_applicable", "items": []})
     lifecycle = runtime.lifecycle.advance_once(repo, owner_id, now)
     recovery = runtime.core.reconcile_once(repo, owner_id, now)
     progress = runtime.core.observe_implementer_progress(repo, now)
@@ -26,6 +28,6 @@ def run_once(runtime, repo: str, owner_id: str, issue_number: int | None = None,
     lifecycle_after_dispatch = runtime.lifecycle.advance_once(repo, owner_id, now)
     diagnostic_dispatch = (dispatches[0] if issue_number is not None and dispatches
                            else {"status": "not_requested"})
-    return {"dispatch": diagnostic_dispatch, "recovery": recovery, "progress": progress,
+    return {"dispatch": diagnostic_dispatch, "no_op": no_op, "recovery": recovery, "progress": progress,
             "ready_discovery": ready_discovery, "lifecycle": lifecycle,
             "dispatches": dispatches, "lifecycle_after_dispatch": lifecycle_after_dispatch}

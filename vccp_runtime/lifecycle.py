@@ -158,6 +158,8 @@ class LifecycleDriver:
         current = time.time() if now is None else float(now)
         repo_key = repo.casefold()
         attempts = self.core.store.attempts_for_repo(repo_key)
+        attempts = [row for row in attempts if not (row["phase"] == "LAUNCH_CONFIRMED"
+                    and self.core.store.receipt(row["attempt_id"]))]
         issues = sorted({row["issue_number"] for row in attempts
                          if row["pr_number"] and (row["phase"] in {
                              "PR_BOUND", "LAUNCH_CONFIRMED", "MERGED_SUCCESS"}
