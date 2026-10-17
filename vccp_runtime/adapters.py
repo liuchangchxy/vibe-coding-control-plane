@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -199,6 +200,22 @@ class GitHubAppWriter:
             raise GitHubAppError("controlled pull request creation failed")
         return result["number"]
 
+    def close_issue(self, repo: str, issue: int):
+        if self.provider is None or repo.casefold() != self.target_repository:
+            raise GitHubAppIdentityError("controlled Issue close requires the enrolled GitHub App provider")
+        if not isinstance(issue, int) or issue < 1:
+            raise ValueError("controlled Issue identity is invalid")
+        owner, name = repo.split("/", 1)
+        path = f"/repos/{owner}/{name}/issues/{issue}"
+        status, current = self.provider.request("GET", path, repo)
+        if status != 200 or current.get("number") != issue or current.get("state") != "open":
+            return current.get("state") == "closed" if isinstance(current, dict) else False
+        code, _ = self.provider.request("PATCH", path, repo, {"state": "closed", "state_reason": "completed"})
+        if code not in (200, 201):
+            return False
+        verified_status, verified = self.provider.request("GET", path, repo)
+        return verified_status == 200 and verified.get("number") == issue and verified.get("state") == "closed"
+
 
 class GitHubWorkflowAdapter:
     _CANONICAL_LINKS_QUERY = """
@@ -261,6 +278,11 @@ class GitHubWorkflowAdapter:
         else:
             state = "invalid"
         frozen = self.policy["frozen_spec_label"] in labels
+        body = issue.get("body") or ""
+        marker_lines = [line.strip() for line in body.splitlines()
+                        if line.strip().startswith("completion_policy:")]
+        allow_no_change = marker_lines == ["completion_policy: allow_no_change=true"]
+        spec_digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
         revision = str(issue.get("updated_at", ""))
         owner, name = repo.split("/", 1)
         data = self.api.graphql(self._CANONICAL_LINKS_QUERY,
@@ -330,7 +352,35 @@ class GitHubWorkflowAdapter:
             pr_merged=bool(valid_pr and pr.get("merged") is True),
             check_runs=check_runs if valid_pr else (),
             active_labels=tuple(label for label in self.policy["active_coordination_labels"] if label in labels),
+            allow_no_change=allow_no_change, frozen_spec_digest=spec_digest,
+            issue_title=str(issue.get("title") or ""),
         )
+
+    def close_noop_issue(self, repo, issue_number):
+        # Freshly prove no canonical relationship and retain only coordination labels
+        # until the Issue close itself is verified. Cleanup is a separate idempotent pass.
+        fresh = self._facts(repo, issue_number)
+        if (not fresh.issue_open or not fresh.frozen_spec or fresh.canceled or fresh.terminal_labels
+                or not fresh.canonical_relationship_valid or fresh.canonical_link_count
+                or fresh.open_linked_pr_count or "needs-human" in fresh.terminal_labels):
+            return False
+        return bool(self.writer.close_issue(repo, issue_number))
+
+    def remove_coordination_labels_and_close(self, repo, issue_number):
+        fresh = self._facts(repo, issue_number)
+        if (not fresh.issue_open or not fresh.frozen_spec or not fresh.canonical_relationship_valid
+                or fresh.canonical_link_count or fresh.open_linked_pr_count):
+            return False
+        if fresh.active_labels and not self.writer.replace_labels(repo, issue_number, list(fresh.active_labels), []):
+            return False
+        return bool(self.writer.close_issue(repo, issue_number))
+
+    def clear_noop_coordination_labels(self, repo, issue_number):
+        fresh = self._facts(repo, issue_number)
+        if fresh.issue_open or not fresh.frozen_spec or fresh.canceled or not fresh.canonical_relationship_valid:
+            return False
+        return not fresh.active_labels or bool(self.writer.replace_labels(
+            repo, issue_number, list(fresh.active_labels), []))
 
     def observe(self, repo, issue_number):
         return self._facts(repo, issue_number)
@@ -454,7 +504,10 @@ def generic_prompt(request: LaunchRequest, workspace: str, policy: dict,
                          f"The exact supplied baseline is {request.expected_head_sha}; repair ordinal "
                          f"{request.repair_ordinal} is authoritative. {cause_guidance}Do not create another PR/branch, "
                          "count reviews, or calculate repair budget.\n")
-    return common + (f"Implement on a non-base branch and open one PR linked to this Frozen Issue, "
+    no_op = ("This Frozen Issue authorizes a legitimate no-change result. If no repository change is needed, "
+             "run the attempt-scoped command `vccp-controlled --context <context> complete-no-change` once "
+             "after verifying your work. Do not describe a no-op in prose as completion. " if request.allow_no_change else "")
+    return common + no_op + (f"Implement on a non-base branch and open one PR linked to this Frozen Issue, "
                      f"using base branch {policy['repository']['base_branch']}.\n")
 
 
@@ -472,7 +525,13 @@ class _GuardedProvider:
         """Install this provider's guard and return it with the controlled app-gh command."""
         if self.runtime_context is not None:
             context = dict(self.runtime_context)
+            context.update(getattr(self, "launch_context_override", {}) or {})
             context.update({"repo": request.repo, "issue_number": request.issue_number,
+                            "attempt_id": request.attempt_id, "provider": self.provider,
+                            "allow_no_change": request.allow_no_change,
+                            "authorization_digest": request.frozen_spec_digest,
+                            "workspace_baseline": context.get("workspace_baseline"),
+                            "database_path": context.get("database_path"),
                             "python_executable": self.runtime_context["python_executable"]})
             guard = self.write_guard.install(self.workspace, request.attempt_id, None, env,
                                              provider=self.provider, launch_context=context)
@@ -488,6 +547,13 @@ class _GuardedProvider:
             else self.app_git_push
         )
         return guard, app_gh_command
+
+    def _workspace_baseline(self):
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.workspace,
+                              check=True, capture_output=True, text=True).stdout.strip()
+        status = subprocess.run(["git", "status", "--porcelain=v1", "--untracked-files=all", "--", "."],
+                                cwd=self.workspace, check=True, capture_output=True, text=True).stdout
+        return json.dumps({"head": head, "status": status}, sort_keys=True)
 
 
 class AntiGravityImplementer(_GuardedProvider):
@@ -1015,6 +1081,7 @@ def build_runtime(manifest: dict, local_config: dict, api=None, writer=None,
             "coordination_labels": (manifest["issue_contract"]["active_coordination_labels"]
                                     + manifest["issue_contract"]["terminal_coordination_labels"]),
             "python_executable": sys.executable,
+            "database_path": str(Path(local_config["database_path"]).expanduser().resolve()),
         }
         app_gh = app_git_push = None
     elif api is not None and legacy_fields:

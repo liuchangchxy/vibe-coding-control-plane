@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 import re
+import json
 import sqlite3
 import time
 from typing import Iterable, Protocol
@@ -67,6 +68,9 @@ class WorkflowSnapshot:
     pr_merged: bool = False
     check_runs: tuple[dict, ...] = ()
     active_labels: tuple[str, ...] = ()
+    allow_no_change: bool = False
+    frozen_spec_digest: str | None = None
+    issue_title: str = ""
 
 
 @dataclass(frozen=True)
@@ -108,6 +112,9 @@ class LaunchRequest:
     expected_head_sha: str | None = None
     pr_number: int | None = None
     branch: str | None = None
+    allow_no_change: bool = False
+    frozen_spec_digest: str | None = None
+    runtime_context: dict | None = None
 
 
 class WorkflowPort(Protocol):
@@ -220,6 +227,16 @@ class _Store:
                     deadline_at REAL,
                     implementer_activity_at REAL,
                     progress_deadline_at REAL
+                    ,no_change_authorized INTEGER NOT NULL DEFAULT 0
+                    ,frozen_spec_digest TEXT
+                    ,workspace_baseline TEXT
+                    ,closeout_pending INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS completion_receipts (
+                    attempt_id TEXT PRIMARY KEY, repo TEXT NOT NULL, issue_number INTEGER NOT NULL,
+                    provider TEXT NOT NULL, execution_id TEXT NOT NULL, source TEXT NOT NULL,
+                    authorization_digest TEXT NOT NULL, workspace_evidence TEXT NOT NULL,
+                    evidence_reference TEXT, evidence_digest TEXT, created_at REAL NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS attempts_flow_idx
                     ON attempts(repo, issue_number, kind, repair_ordinal);
@@ -234,6 +251,11 @@ class _Store:
                 connection.execute("ALTER TABLE attempts ADD COLUMN implementer_activity_at REAL")
             if "progress_deadline_at" not in columns:
                 connection.execute("ALTER TABLE attempts ADD COLUMN progress_deadline_at REAL")
+            for name, declaration in (("no_change_authorized", "INTEGER NOT NULL DEFAULT 0"),
+                                      ("frozen_spec_digest", "TEXT"), ("workspace_baseline", "TEXT"),
+                                      ("closeout_pending", "INTEGER NOT NULL DEFAULT 0")):
+                if name not in columns:
+                    connection.execute(f"ALTER TABLE attempts ADD COLUMN {name} {declaration}")
             migrating_bound_head = "resulting_head_sha" not in columns
             if migrating_bound_head:
                 connection.execute("ALTER TABLE attempts ADD COLUMN resulting_head_sha TEXT")
@@ -402,6 +424,125 @@ class _Store:
                     (row["repo"], row["issue_number"], row["lease_token"]),
                 )
             connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def bind_noop_authorization(self, attempt_id: str, authorized: bool, digest: str | None, baseline: str):
+        with closing(self._connect()) as connection:
+            connection.execute("UPDATE attempts SET no_change_authorized=?,frozen_spec_digest=?,workspace_baseline=? WHERE attempt_id=? "
+                               "AND phase='CLAIM_INTENT'",
+                               (int(authorized), digest if authorized else None, baseline, attempt_id))
+            connection.commit()
+
+    def record_completion(self, attempt_id: str, provider: str, execution_id: str,
+                          workspace_evidence: str, source: str = "implementer",
+                          evidence_reference: str | None = None, evidence_digest: str | None = None):
+        connection = self.transaction()
+        try:
+            row = connection.execute("SELECT repo,issue_number,phase,launch_outcome,implementer_provider,execution_id,"
+                                     "no_change_authorized,frozen_spec_digest FROM attempts WHERE attempt_id=?",
+                                     (attempt_id,)).fetchone()
+            if (row is None or row["phase"] != "LAUNCH_CONFIRMED" or row["launch_outcome"] != "confirmed"
+                    or not row["no_change_authorized"] or row["implementer_provider"] != provider
+                    or row["execution_id"] != execution_id or not row["frozen_spec_digest"]):
+                connection.rollback()
+                return False
+            prior = connection.execute("SELECT repo,issue_number,provider,execution_id,source,authorization_digest,workspace_evidence "
+                                       "FROM completion_receipts WHERE attempt_id=?", (attempt_id,)).fetchone()
+            expected = (row["repo"], row["issue_number"], provider, execution_id, source,
+                        row["frozen_spec_digest"], workspace_evidence)
+            if prior and tuple(prior) != expected:
+                connection.rollback()
+                return False
+            connection.execute("INSERT OR IGNORE INTO completion_receipts(attempt_id,repo,issue_number,provider,execution_id,"
+                               "source,authorization_digest,workspace_evidence,evidence_reference,evidence_digest,created_at) "
+                               "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                               (attempt_id,row["repo"],row["issue_number"],provider,execution_id,source,
+                                row["frozen_spec_digest"],workspace_evidence,evidence_reference,evidence_digest,time.time()))
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def record_historical_recovery(self, attempt_id: str, expected: dict, evidence_reference: str,
+                                  evidence_digest: str):
+        connection = self.transaction()
+        try:
+            row = connection.execute("SELECT repo,issue_number,phase,implementer_provider,execution_id FROM attempts WHERE attempt_id=?",
+                                     (attempt_id,)).fetchone()
+            if (not row or tuple(row) != ("liuchangchxy/dayspark", 37, "TERMINAL_UNRESOLVED",
+                                         "antigravity", "c6d4791b-419b-4800-a83d-f229761a8dab")
+                    or expected.get("expected_head") != expected.get("head")
+                    or not re.fullmatch(r"[0-9a-f]{64}", evidence_digest or "") or not evidence_reference):
+                connection.rollback()
+                return False
+            prior = connection.execute("SELECT source,evidence_reference,evidence_digest,workspace_evidence FROM completion_receipts WHERE attempt_id=?",
+                                       (attempt_id,)).fetchone()
+            evidence = json.dumps(expected, sort_keys=True)
+            if prior and tuple(prior) != ("operator_recovery", evidence_reference, evidence_digest, evidence):
+                connection.rollback()
+                return False
+            connection.execute("INSERT OR IGNORE INTO completion_receipts(attempt_id,repo,issue_number,provider,execution_id,"
+                               "source,authorization_digest,workspace_evidence,evidence_reference,evidence_digest,created_at) "
+                               "VALUES(?,?,37,?,?,'operator_recovery','historical-dayspark37',?,?,?,?)",
+                               (attempt_id,row["repo"],row["implementer_provider"],row["execution_id"],evidence,
+                                evidence_reference,evidence_digest,time.time()))
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def receipt(self, attempt_id):
+        with closing(self._connect()) as connection:
+            row = connection.execute("SELECT * FROM completion_receipts WHERE attempt_id=?", (attempt_id,)).fetchone()
+            return dict(row) if row else None
+
+    def no_op_terminal(self, attempt_id: str, now: float, pending: bool = False):
+        connection = self.transaction()
+        try:
+            row = connection.execute("SELECT repo,issue_number,lease_token FROM attempts WHERE attempt_id=?",
+                                     (attempt_id,)).fetchone()
+            if row is None:
+                connection.rollback()
+                return False
+            connection.execute("UPDATE attempts SET phase=?,closeout_pending=?,updated_at=?,phase_entered_at=?,deadline_at=NULL "
+                               "WHERE attempt_id=?", ("SUCCESS_NO_OP_CLEANUP_PENDING" if pending else "SUCCESS_NO_OP",
+                                int(pending),now,now,attempt_id))
+            connection.execute("DELETE FROM leases WHERE repo=? AND issue_number=? AND token=?",
+                               (row["repo"],row["issue_number"],row["lease_token"]))
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def success_noop_recovery(self, attempt_id: str, now: float):
+        connection = self.transaction()
+        try:
+            row = connection.execute("SELECT repo,issue_number,lease_token FROM attempts WHERE attempt_id=?",
+                                     (attempt_id,)).fetchone()
+            if not row:
+                connection.rollback()
+                return False
+            connection.execute("UPDATE attempts SET phase='SUCCESS_NO_OP',closeout_pending=0,updated_at=?,phase_entered_at=?,deadline_at=NULL WHERE attempt_id=?",
+                               (now,now,attempt_id))
+            connection.execute("UPDATE flows SET trusted=0,initial_confirmed=0 WHERE repo=? AND issue_number=?",
+                               (row["repo"],row["issue_number"]))
+            connection.execute("DELETE FROM leases WHERE repo=? AND issue_number=? AND token=?",
+                               (row["repo"],row["issue_number"],row["lease_token"]))
+            connection.commit()
+            return True
         except Exception:
             connection.rollback()
             raise
@@ -722,6 +863,9 @@ class _Store:
         finally:
             connection.close()
 
+    def complete_noop_flow(self, attempt_id: str, now: float):
+        return self.no_op_terminal(attempt_id, now)
+
 class RuntimeCore:
     def __init__(
         self,
@@ -735,8 +879,10 @@ class RuntimeCore:
     ):
         self.config = RuntimeConfig.from_manifest(manifest)
         self.store = _Store(database_path)
+        self.database_path = str(Path(database_path).expanduser().resolve())
         self.workflow = workflow
         self.implementer = implementer
+        self.workspace_path = getattr(implementer, "workspace", None)
         self.lease_ttl_seconds = lease_ttl_seconds
         if recovery_timeout_seconds <= 0:
             raise ValueError("recovery_timeout_seconds must be positive")
@@ -751,6 +897,9 @@ class RuntimeCore:
         items = []
         for row in self.store.attempts_for_repo(repo):
             if row["phase"] != "LAUNCH_CONFIRMED" or not row.get("execution_id"):
+                continue
+            if self.store.receipt(row["attempt_id"]):
+                items.append({"issue": row["issue_number"], "status": "completion_receipt_pending"})
                 continue
             # The durable attempt owns its provider; the current primary never substitutes.
             activity = self.implementer.latest_activity_for(row["implementer_provider"], row["execution_id"])
@@ -844,10 +993,19 @@ class RuntimeCore:
         if created is None:
             return {"status": reason}
         attempt_id, _token = created
+        baseline = self._workspace_baseline(self.workspace_path)
+        self.store.bind_noop_authorization(attempt_id, observed.allow_no_change,
+                                           observed.frozen_spec_digest, baseline)
+        bound_attempt = self.store.attempt(attempt_id)
+        if not bound_attempt or bound_attempt["no_change_authorized"] != int(observed.allow_no_change):
+            self.store.mark_phase(attempt_id, "CLAIM_FAILED", outcome="authorization_binding_failed")
+            return {"status": "claim_failed", "attempt_id": attempt_id}
 
         try:
             fresh = self.workflow.observe(repo_key, issue_number)
-            if not self._eligible_initial(fresh, repo_key, issue_number):
+            if (not self._eligible_initial(fresh, repo_key, issue_number)
+                    or fresh.allow_no_change != observed.allow_no_change
+                    or fresh.frozen_spec_digest != observed.frozen_spec_digest):
                 self.store.mark_phase(attempt_id, "CLAIM_FAILED", outcome="workflow_changed")
                 return {"status": "claim_failed", "attempt_id": attempt_id}
             transitioned = self.workflow.transition_coordination_state(
@@ -862,9 +1020,150 @@ class RuntimeCore:
 
         self.store.mark_phase(attempt_id, "CLAIMED", recovery_timeout=self.recovery_timeout_seconds)
         self.store.mark_phase(attempt_id, "LAUNCH_INTENT", recovery_timeout=self.recovery_timeout_seconds)
-        return self._launch(
-            LaunchRequest(repo_key, issue_number, attempt_id, "initial_dispatch"),
-        )
+        request = LaunchRequest(repo_key, issue_number, attempt_id, "initial_dispatch")
+        # Older injected ImplementerPort fakes accept only the stable request shape.
+        # Production routers expose the provider-neutral completion contract.
+        if hasattr(self.implementer, "_by_key"):
+            request = LaunchRequest(repo_key, issue_number, attempt_id, "initial_dispatch",
+                                    allow_no_change=observed.allow_no_change,
+                                    frozen_spec_digest=observed.frozen_spec_digest,
+                                    runtime_context={"database_path": self.database_path,
+                                                     "workspace_baseline": baseline})
+        return self._launch(request)
+
+    @staticmethod
+    def _workspace_baseline(workspace: str | None = None):
+        """Baseline is injected by production adapter; tests may use a stable empty baseline."""
+        if workspace is None:
+            return "{}"
+        import subprocess
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=workspace, capture_output=True, text=True, check=True).stdout.strip()
+        status = subprocess.run(["git", "status", "--porcelain=v1", "--untracked-files=all", "--", "."],
+                                cwd=workspace, capture_output=True, text=True, check=True).stdout
+        return json.dumps({"head": head, "status": status}, sort_keys=True)
+
+    def submit_no_change(self, attempt_id: str, provider: str, execution_id: str):
+        """Called only by the controlled local CLI; it records, but never closes, an Issue."""
+        row = self.store.attempt(attempt_id)
+        if not row or not row.get("no_change_authorized") or row.get("phase") != "LAUNCH_CONFIRMED":
+            return False
+        baseline = json.loads(row["workspace_baseline"] or "{}")
+        current = self._workspace_baseline(self.workspace_path)
+        if current != json.dumps(baseline, sort_keys=True):
+            return False
+        return self.store.record_completion(attempt_id, provider, execution_id, current)
+
+    def reconcile_no_change(self, repo: str, now: float | None = None):
+        """Complete durable receipts only after fresh provider-neutral GitHub checks."""
+        current = time.time() if now is None else float(now)
+        items = []
+        for row in self.store.attempts_for_repo(repo):
+            receipt = self.store.receipt(row["attempt_id"])
+            if not receipt or row["phase"] == "SUCCESS_NO_OP":
+                continue
+            if row["phase"] == "SUCCESS_NO_OP_CLEANUP_PENDING":
+                try:
+                    if self.workflow.clear_noop_coordination_labels(row["repo"], row["issue_number"]):
+                        self.store.no_op_terminal(row["attempt_id"], current)
+                        items.append({"issue": row["issue_number"], "status": "success_no_op"})
+                    else:
+                        items.append({"issue": row["issue_number"], "status": "closeout_pending"})
+                except Exception:
+                    items.append({"issue": row["issue_number"], "status": "closeout_pending"})
+                continue
+            if row["phase"] == "TERMINAL_UNRESOLVED" and receipt["source"] != "operator_recovery":
+                items.append({"issue": row["issue_number"], "status": "no_op_deferred_terminal"})
+                continue
+            try:
+                snapshot = self.workflow.observe(row["repo"], row["issue_number"])
+                if receipt["source"] == "operator_recovery":
+                    historical_ok = (row["repo"] == "liuchangchxy/dayspark" and row["issue_number"] == 37
+                                     and row["attempt_id"] == "8dc7fdbc-39c2-4fc1-9193-aab3d060f2a0"
+                                     and receipt["provider"] == "antigravity"
+                                     and receipt["execution_id"] == "c6d4791b-419b-4800-a83d-f229761a8dab"
+                                     and bool(receipt["evidence_reference"])
+                                     and bool(re.fullmatch(r"[0-9a-f]{64}", receipt["evidence_digest"] or ""))
+                                     and snapshot.issue_open and snapshot.frozen_spec
+                                     and "infra-blocked" in snapshot.terminal_labels
+                                     and snapshot.coordination_state == "infra-blocked"
+                                     and not snapshot.canonical_link_count and not snapshot.open_linked_pr_count
+                                     and snapshot.canonical_relationship_valid)
+                    if not historical_ok or not self._workspace_baseline_matches(json.loads(receipt["workspace_evidence"])):
+                        items.append({"issue": row["issue_number"], "status": "historical_recovery_deferred"})
+                        continue
+                    if self.workflow.remove_coordination_labels_and_close(row["repo"], row["issue_number"]):
+                        self.store.success_noop_recovery(row["attempt_id"], current)
+                        items.append({"issue": 37, "status": "success_no_op"})
+                    else:
+                        items.append({"issue": 37, "status": "historical_recovery_closeout_pending"})
+                    continue
+                if (row["phase"] != "LAUNCH_CONFIRMED" or not row["no_change_authorized"]
+                        or row["launch_outcome"] != "confirmed" or not row["execution_id"]
+                        or receipt["repo"] != row["repo"] or receipt["issue_number"] != row["issue_number"]
+                        or receipt["provider"] != row["implementer_provider"]
+                        or receipt["execution_id"] != row["execution_id"]
+                        or receipt["authorization_digest"] != row["frozen_spec_digest"]
+                        or not snapshot.issue_open or snapshot.canceled or not snapshot.frozen_spec
+                        or "needs-human" in snapshot.terminal_labels or "infra-blocked" in snapshot.terminal_labels
+                        or snapshot.coordination_state != "agent-working" or not snapshot.allow_no_change
+                        or snapshot.frozen_spec_digest != row["frozen_spec_digest"]
+                        or not snapshot.canonical_relationship_valid or snapshot.canonical_link_count
+                        or snapshot.open_linked_pr_count or row["pr_number"]):
+                    items.append({"issue": row["issue_number"], "status": "no_op_deferred"})
+                    continue
+                baseline = json.loads(row["workspace_baseline"] or "{}")
+                if receipt["source"] == "implementer" and receipt["workspace_evidence"] != json.dumps(baseline, sort_keys=True):
+                    items.append({"issue": row["issue_number"], "status": "workspace_evidence_invalid"})
+                    continue
+                if not self._workspace_baseline_matches(baseline):
+                    items.append({"issue": row["issue_number"], "status": "workspace_mutated"})
+                    continue
+                # Issue close and active-label cleanup are independently retryable.
+                if self.workflow.close_noop_issue(row["repo"], row["issue_number"]):
+                    if self.workflow.clear_active_coordination_labels(row["repo"], row["issue_number"]):
+                        self.store.no_op_terminal(row["attempt_id"], current)
+                        items.append({"issue": row["issue_number"], "status": "success_no_op"})
+                    else:
+                        self.store.no_op_terminal(row["attempt_id"], current, pending=True)
+                        items.append({"issue": row["issue_number"], "status": "closeout_pending"})
+                else:
+                    items.append({"issue": row["issue_number"], "status": "no_op_deferred"})
+            except Exception as error:
+                items.append({"issue": row["issue_number"], "status": "no_op_reconciliation_unavailable",
+                              "detail": str(error)})
+        return {"status": "reconciled", "items": items}
+
+    def _workspace_baseline_matches(self, baseline):
+        if not self.workspace_path:
+            return True
+        return json.loads(self._workspace_baseline(self.workspace_path)) == baseline
+
+    def recover_historical_dayspark37(self, repo: str, attempt_id: str, expected_head: str,
+                                     evidence_reference: str, evidence_digest: str):
+        """Evidence-bound one-off recovery for the fixed pre-contract historical attempt."""
+        if (repo.casefold() != "liuchangchxy/dayspark" or attempt_id != "8dc7fdbc-39c2-4fc1-9193-aab3d060f2a0"
+                or not _SHA_RE.fullmatch(expected_head or "") or not evidence_reference
+                or not re.fullmatch(r"[0-9a-f]{64}", evidence_digest or "")):
+            return {"status": "invalid_historical_recovery_request"}
+        row = self.store.attempt(attempt_id)
+        if (not row or row["repo"] != repo.casefold() or row["issue_number"] != 37
+                or row["phase"] != "TERMINAL_UNRESOLVED" or row["implementer_provider"] != "antigravity"
+                or row["execution_id"] != "c6d4791b-419b-4800-a83d-f229761a8dab"):
+            return {"status": "historical_attempt_identity_mismatch"}
+        try:
+            snapshot = self.workflow.observe(repo, 37)
+        except Exception:
+            return {"status": "workflow_unavailable"}
+        if (not snapshot.issue_open or not snapshot.frozen_spec or "infra-blocked" not in snapshot.terminal_labels
+                or snapshot.canonical_link_count or snapshot.open_linked_pr_count
+                or not snapshot.canonical_relationship_valid or not self.workspace_path):
+            return {"status": "historical_github_state_mismatch"}
+        current = json.loads(self._workspace_baseline(self.workspace_path))
+        if current["head"].lower() != expected_head.lower():
+            return {"status": "historical_head_mismatch"}
+        current["expected_head"] = expected_head.lower()
+        ok = self.store.record_historical_recovery(attempt_id, current, evidence_reference, evidence_digest)
+        return {"status": "receipt_recorded" if ok else "historical_receipt_rejected"}
 
     def dispatch_repair(self, candidate: RepairCandidate):
         if candidate.cause_type not in _REPAIR_CAUSES or not isinstance(candidate.cause_id, str) or not candidate.cause_id.strip():
@@ -1006,6 +1305,8 @@ class RuntimeCore:
         except Exception as error:
             return {"status": "recovery_discovery_unavailable", "detail": str(error), "items": []}
         attempts = self.store.attempts_for_repo(repo_key)
+        attempts = [row for row in attempts if not (row["phase"] == "LAUNCH_CONFIRMED"
+                    and self.store.receipt(row["attempt_id"]))]
         issue_numbers = set(discovered)
         issue_numbers.update(row["issue_number"] for row in attempts)
         output = []
@@ -1017,6 +1318,9 @@ class RuntimeCore:
                 output.append({"issue": issue, "status": "workflow_unavailable", "detail": str(error)})
                 continue
             rows = [row for row in attempts if row["issue_number"] == issue]
+            if any(row["phase"] in {"SUCCESS_NO_OP", "SUCCESS_NO_OP_CLEANUP_PENDING"} for row in rows):
+                output.append({"issue": issue, "status": "success_no_op"})
+                continue
             if any(row["phase"] == "MERGED_SUCCESS" for row in rows):
                 output.append({"issue": issue, "status": "merged_success"})
                 continue

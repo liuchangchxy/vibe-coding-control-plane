@@ -124,6 +124,14 @@ class AdapterTests(unittest.TestCase):
         snap = adapter.observe("o/r", 1)
         self.assertTrue(snap.issue_open and snap.frozen_spec)
         self.assertEqual(snap.coordination_state, "agent-ready")
+        api.issue["body"] = "completion_policy: allow_no_change=true\nTask"
+        authorized = adapter.observe("o/r", 1)
+        self.assertTrue(authorized.allow_no_change)
+        api.issue["body"] = "Task says no changes are needed."
+        self.assertFalse(adapter.observe("o/r", 1).allow_no_change)
+        api.issue["body"] = "completion_policy: allow_no_change=true\ncompletion_policy: allow_no_change=true"
+        self.assertFalse(adapter.observe("o/r", 1).allow_no_change)
+        api.issue["body"] = ""
         api.issue["state"] = "closed"
         self.assertFalse(adapter.observe("o/r", 1).issue_open)
         api.issue["state"] = "open"
