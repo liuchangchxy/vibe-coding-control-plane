@@ -103,9 +103,10 @@ class LifecycleTests(unittest.TestCase):
         snap = WorkflowSnapshot(repo, issue, "r1", True, "agent-ready", True)
         self.workflow.snapshots[(repo, issue)] = replace(snap, **changes)
 
-    def driver(self, manifest=None, timeouts=None, core=None):
+    def driver(self, manifest=None, timeouts=None, core=None, local_reviewer=None):
         return LifecycleDriver(core or self.core, manifest or self.manifest,
-                               timeouts or {"waiting_ci": 10, "waiting_review": 10, "waiting_merge": 10})
+                               timeouts or {"waiting_ci": 10, "waiting_review": 10, "waiting_merge": 10},
+                               local_reviewer=local_reviewer)
 
     def test_empty_required_check_configuration_cannot_advance_ci(self):
         with self.assertRaisesRegex(ValueError, "required_checks"):
@@ -134,6 +135,21 @@ class LifecycleTests(unittest.TestCase):
         self.update(check_runs=self.accepted())
         result = self.driver().advance_once(self.repo, "owner", 100)
         self.assertEqual(result["items"][0]["status"], "WAITING_REVIEW")
+
+    def test_exact_head_accepted_ci_launches_bound_local_reviewer(self):
+        class Reviewer:
+            def __init__(self): self.calls = []
+            def advance(self, repo, issue, pr, head):
+                self.calls.append((repo, issue, pr, head))
+                return {"status": "reviewer_running"}
+
+        reviewer = Reviewer()
+        self.update(check_runs=self.accepted())
+        result = self.driver(local_reviewer=reviewer).advance_once(self.repo, "owner", 100)
+
+        self.assertEqual(result["items"][0]["status"], "WAITING_REVIEW")
+        self.assertEqual(result["items"][0]["reviewer"]["status"], "reviewer_running")
+        self.assertEqual(reviewer.calls, [(self.repo, self.issue, 44, SHA)])
 
     def test_every_consumer_required_check_must_be_accepted_and_conflicting_failures_are_ambiguous(self):
         manifest = {**self.manifest, "reviewer": {"required_checks": [

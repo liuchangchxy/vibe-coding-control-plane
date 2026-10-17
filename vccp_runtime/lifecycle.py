@@ -14,9 +14,11 @@ _PHASES = {
 
 
 class LifecycleDriver:
-    def __init__(self, core, manifest: dict, timeouts: dict | None = None):
+    def __init__(self, core, manifest: dict, timeouts: dict | None = None,
+                 local_reviewer=None):
         self.core = core
         self.manifest = manifest
+        self.local_reviewer = local_reviewer
         required_checks = (manifest.get("reviewer") or {}).get("required_checks")
         if not isinstance(required_checks, list) or not required_checks:
             raise ValueError("reviewer.required_checks must contain consumer-defined checks")
@@ -318,5 +320,9 @@ class LifecycleDriver:
                 results.append(self._terminal(repo_key, issue, snapshot, label, current,
                                               f"{phase.lower()}_timeout"))
                 continue
-            results.append({"issue": issue, "status": phase, "head": head, "deadline_at": deadline})
+            result = {"issue": issue, "status": phase, "head": head, "deadline_at": deadline}
+            if phase == "WAITING_REVIEW" and self.local_reviewer is not None:
+                result["reviewer"] = self.local_reviewer.advance(
+                    repo_key, issue, snapshot.pr_number, head)
+            results.append(result)
         return {"status": "ok", "items": results}

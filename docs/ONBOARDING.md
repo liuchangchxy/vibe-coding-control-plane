@@ -98,6 +98,14 @@ Run qualification explicitly:
 node scripts/onboard-consumer.mjs readiness --repo OWNER/REPO --path /path/to/consumer --runtime-config /path/to/consumer-runtime.json
 ```
 
+For one read-only view of the repository audit, pinned revision, explicit machine provider bindings, readiness, and the native host runner, use:
+
+```sh
+node scripts/vccp.mjs status --repo OWNER/REPO --path /path/to/consumer --runtime-config /path/to/consumer-runtime.json
+```
+
+`status` reports `READY`, `NEEDS_ACTION`, or `BLOCKED`. A running-revision mismatch or missing provider binding remains visible in the component evidence and does not get repaired by this read-only command.
+
 Readiness first runs the same canonical repository AUDIT used by the `audit` command, including capability inspection, cleanup conflict detection, and managed artifact drift checks. It then independently qualifies machine authorization and activation. The report preserves all three states; machine wiring can be technically ready while the overall result remains blocked if AUDIT reports repository changes, drift, or conflict. Readiness does not APPLY the plan.
 
 Machine qualification validates explicit enrollment, matching repository identities, workspace and SQLite locations, executable and configured conversation roots, reads the protected private key, verifies App installation and permissions, mints a short-lived token, performs a harmless repository read, constructs the production writer/push/runtime graph using temporary SQLite, and tries then releases the machine process lock. It does not dispatch Issues, mutate GitHub labels, create PRs, push, start repairs, or launch AntiGravity conversations. Installation/token/read calls are read-only and never report credential material.
@@ -137,6 +145,14 @@ For evidence reporting, use the operational levels below: Level 1 repository rea
 5. Commit the Consumer changes on a branch and open an upgrade PR. Do not push to `main` without explicit authorization. Merge the Consumer revision PR through its authorized review path; then confirm Consumer `main` contains the manifest and lock update.
 6. Stop the production Runner. Check out/sync VCCP to the exact SHA now pinned by Consumer `main`. The production Runner compares its own VCCP checkout SHA with `vccp.revision` and refuses to start on a mismatch. Do not run a production manifest from an unmerged Consumer PR branch as authority.
 7. With the resident Runner stopped, run `node scripts/onboard-consumer.mjs readiness --repo OWNER/REPO --path /path/to/consumer --runtime-config /absolute/path/to/consumer-runtime.json`. Resolve blockers, and only then start the resident host.
+
+### Unified `vccp deploy`
+
+Use `node scripts/vccp.mjs deploy --repo OWNER/REPO --path /path/to/consumer --runtime-config /absolute/path/to/consumer-runtime.json [--input onboarding.json]`. `deploy` reads canonical VCCP `main`, the Consumer checkout, its manifest/installation lock, machine config, exact runtime checkout, and host state, then delegates repository planning to PLAN and host qualification to readiness. First install and revision upgrade use the same path. Existing provider bindings are immutable. For a new binding, explicitly pass `--implementer-provider`, `--reviewer-provider`, and `--reviewer-identity`; deploy never chooses an Agent based on configuration order.
+
+Repository changes are published on a deterministic maintenance branch and opened as a PR when the configured GitHub client has the required write permission. The command never writes the Consumer base branch. If the GitHub App cannot publish the PR, output contains the complete PLAN and a structured `maintenance_pr_required` action; finish that exact PLAN through an authorized GitHub connector, merge the maintenance PR, and rerun `deploy`. Repeated runs adopt the same open PR and use existing repository/runtime/launcher facts to resume. Once the manifest is merged, `deploy` prepares `~/.vccp/runtimes/<full-sha>/`, performs a non-locking machine preflight, then stops/reconciles/qualifies/starts/verifies the native host. An unchanged running macOS LaunchAgent is a no-op; its embedded manifest/config digests must still match the current local files.
+
+`node scripts/vccp.mjs status --repo OWNER/REPO --path /path/to/consumer --runtime-config /absolute/path/to/consumer-runtime.json` is the read-only deployment view. Its overall status is `READY`, `NEEDS_ACTION`, or `BLOCKED`; repository, machine, and runtime facts explain the result. A stopped or uninstalled Consumer needs action. A running owner on the wrong revision or a blocked repository is blocked. `READY` requires the exact clean runtime to be running with matching manifest/config digests and successful machine qualification. External Reviewer Tasks and repository policies remain explicitly `unverified` when the current GitHub connection cannot read them.
 
 An infrastructure or VCCP-revision PR is a maintenance change, not automatically a product PR. The product Reviewer requires its normal Implementer author and linked Frozen Issue preconditions; when those do not fit, it should skip without formal review. Do not create another Reviewer, invent a Frozen Issue, allow a Bot to review itself, or alter the product Reviewer contract to force maintenance through product automation. Prefer an independent human review. GitHub does not allow a PR author to approve their own PR; do not retry an `APPROVE` that GitHub rejects with HTTP 422 as if it were a plugin failure.
 

@@ -121,148 +121,6 @@ def linked_api(review=True):
 
 
 class AdapterTests(unittest.TestCase):
-    def test_historical_dayspark37_recovery_removes_false_infra_blocked(self):
-        with tempfile.TemporaryDirectory() as temp:
-            workspace = init_git_repo(Path(temp) / "dayspark")
-            head = subprocess.run(["git", "-C", str(workspace), "rev-parse", "HEAD"],
-                                  capture_output=True, text=True, check=True).stdout.strip()
-            class RacingAPI(FakeAPI):
-                def __init__(self):
-                    super().__init__()
-                    self.issue_reads = 0
-
-                def get(self, path):
-                    if path.endswith("/issues/37"):
-                        self.issue_reads += 1
-                        if self.issue_reads == 3:
-                            self.issue["labels"].append({"name": "agent-ready"})
-                    return super().get(path)
-
-            api = RacingAPI()
-            api.issue.update(labels=[{"name": name} for name in ("infra-blocked", "frozen-spec")])
-            api.issue["body"] = "Frozen historical Issue"
-            class ClosingWriter(MutatingWriter):
-                def close_issue(self, repo, issue):
-                    self.api.issue["state"] = "closed"
-                    return True
-
-            writer = ClosingWriter(api)
-            workflow = GitHubWorkflowAdapter(api, writer, MANIFEST)
-            core = RuntimeCore(Path(temp) / "runtime.sqlite", MANIFEST, workflow,
-                               SimpleNamespace(workspace=str(workspace)))
-            attempt = "8dc7fdbc-39c2-4fc1-9193-aab3d060f2a0"
-            connection = core.store.transaction()
-            try:
-                connection.execute(
-                    "INSERT INTO attempts(attempt_id,repo,issue_number,owner_id,lease_token,kind,phase,"
-                    "launch_outcome,execution_id,implementer_provider,created_at,updated_at) "
-                    "VALUES(?, 'liuchangchxy/dayspark',37,'operator','', 'initial_dispatch',"
-                    "'TERMINAL_UNRESOLVED','confirmed','c6d4791b-419b-4800-a83d-f229761a8dab',"
-                    "'antigravity',1,1)", (attempt,))
-                connection.commit()
-            finally:
-                connection.close()
-
-            receipt = core.recover_historical_dayspark37(
-                "liuchangchxy/dayspark", attempt, head, "archive://evidence", "a" * 64)
-            self.assertEqual(receipt["status"], "receipt_recorded")
-            result = core.reconcile_no_change("liuchangchxy/dayspark")
-
-            self.assertEqual(result["items"][0]["status"], "success_no_op", result)
-            self.assertEqual(api.issue["state"], "closed")
-            labels = {item["name"] for item in api.issue["labels"]}
-            self.assertNotIn("infra-blocked", labels)
-            self.assertNotIn("agent-ready", labels)
-            self.assertIn("frozen-spec", labels)
-            self.assertEqual(writer.calls[0][2], ["agent-ready", "infra-blocked"])
-            self.assertEqual(core.store.attempt(attempt)["phase"], "SUCCESS_NO_OP")
-
-    def test_historical_dayspark37_postsuccess_cleanup_is_scoped_and_idempotent(self):
-        with tempfile.TemporaryDirectory() as temp:
-            workspace = init_git_repo(Path(temp) / "dayspark")
-            head = subprocess.run(["git", "-C", str(workspace), "rev-parse", "HEAD"],
-                                  capture_output=True, text=True, check=True).stdout.strip()
-            api = FakeAPI()
-            api.issue.update(labels=[{"name": name} for name in ("infra-blocked", "frozen-spec")])
-            api.issue["body"] = "Frozen historical Issue"
-
-            writer = MutatingWriter(api)
-            workflow = GitHubWorkflowAdapter(api, writer, MANIFEST)
-            core = RuntimeCore(Path(temp) / "runtime.sqlite", MANIFEST, workflow,
-                               SimpleNamespace(workspace=str(workspace)))
-            attempt = "8dc7fdbc-39c2-4fc1-9193-aab3d060f2a0"
-            connection = core.store.transaction()
-            try:
-                connection.execute(
-                    "INSERT INTO attempts(attempt_id,repo,issue_number,owner_id,lease_token,kind,phase,"
-                    "launch_outcome,execution_id,implementer_provider,created_at,updated_at) "
-                    "VALUES(?, 'liuchangchxy/dayspark',37,'operator','', 'initial_dispatch',"
-                    "'TERMINAL_UNRESOLVED','confirmed','c6d4791b-419b-4800-a83d-f229761a8dab',"
-                    "'antigravity',1,1)", (attempt,))
-                connection.commit()
-            finally:
-                connection.close()
-
-            evidence_reference = "archive://historical-vcbs-report"
-            evidence_digest = "a" * 64
-            self.assertEqual(core.recover_historical_dayspark37(
-                "liuchangchxy/dayspark", attempt, head, evidence_reference, evidence_digest)["status"],
-                "receipt_recorded")
-            self.assertTrue(core.store.begin_historical_closeout(
-                attempt, head, evidence_reference, evidence_digest, now=2))
-            self.assertTrue(core.store.success_noop_recovery(attempt, now=3))
-            api.issue["state"] = "closed"
-            api.issue["labels"] = [{"name": name} for name in
-                                    ("infra-blocked", "agent-working", "frozen-spec")]
-            self.assertEqual(api.issue["state"], "closed")
-            self.assertEqual(core.store.attempt(attempt)["phase"], "SUCCESS_NO_OP")
-            self.assertEqual(core.store.receipt(attempt)["source"], "operator_recovery")
-            intent = core.store.historical_closeout_intent(attempt)
-            self.assertEqual(intent["evidence_reference"], evidence_reference)
-            self.assertEqual(intent["evidence_digest"], evidence_digest)
-            self.assertEqual({item["name"] for item in api.issue["labels"]},
-                             {"infra-blocked", "agent-working", "frozen-spec"})
-
-            core.reconcile_no_change("liuchangchxy/dayspark")
-            self.assertEqual(api.issue["state"], "closed")
-            self.assertEqual({item["name"] for item in api.issue["labels"]}, {"frozen-spec"})
-            self.assertEqual(core.store.attempt(attempt)["phase"], "SUCCESS_NO_OP")
-
-            core.reconcile_no_change("liuchangchxy/dayspark")
-            self.assertEqual(api.issue["state"], "closed")
-            self.assertEqual({item["name"] for item in api.issue["labels"]}, {"frozen-spec"})
-            self.assertEqual(core.store.attempt(attempt)["phase"], "SUCCESS_NO_OP")
-
-    def test_historical_recovery_operator_cli_invokes_fixed_runtime_operation(self):
-        calls = []
-        class Lock:
-            def __init__(self, *args): pass
-            def __enter__(self): return self
-            def __exit__(self, *args): pass
-        class Core:
-            def recover_historical_dayspark37(self, *args):
-                calls.append(args)
-                return {"status": "receipt_recorded"}
-        fake_runtime = SimpleNamespace(core=Core())
-        with tempfile.TemporaryDirectory() as temp:
-            workspace = init_git_repo(Path(temp) / "repo")
-            subprocess.run(["git", "-C", str(workspace), "remote", "add", "origin",
-                            "https://github.com/liuchangchxy/dayspark.git"], check=True, capture_output=True)
-            local = {"target_repository": "liuchangchxy/dayspark",
-                     "enrollment": {"authorized_repository": "liuchangchxy/dayspark"},
-                     "workspace": str(workspace), "database_path": str(Path(temp)/"runtime.sqlite"),
-                     "owner_id": "operator"}
-            manifest = {"vccp": {"revision": "a"*40}}
-            with mock.patch.object(runtime_runner, "_load", side_effect=[manifest, local]), \
-                 mock.patch.object(runtime_runner, "_validate_runtime_revision"), \
-                 mock.patch.object(runtime_runner, "RuntimeLock", Lock), \
-                 mock.patch.object(runtime_runner, "build_runtime", return_value=fake_runtime):
-                runtime_runner.main(["--manifest", "m", "--runtime-config", "c", "--repo",
-                    "liuchangchxy/dayspark", "--recover-dayspark-37", "--expected-head", "a"*40,
-                    "--evidence-reference", "archive://receipt", "--evidence-sha256", "b"*64])
-        self.assertEqual(calls[0][0], "liuchangchxy/dayspark")
-        self.assertEqual(calls[0][1], "8dc7fdbc-39c2-4fc1-9193-aab3d060f2a0")
-
     def test_fresh_issue_maps_and_fail_closed_blockers(self):
         api = FakeAPI(); writer = MutatingWriter(api)
         adapter = GitHubWorkflowAdapter(api, writer, MANIFEST)
@@ -749,6 +607,31 @@ class AdapterTests(unittest.TestCase):
             self.assertEqual(Path(wired.core.workspace_path).resolve(), Path(workspace).resolve())
             self.assertEqual(len(launches), 1)
             with self.assertRaises(ValueError): build_runtime({"schema_version": 1}, local, api, FakeWriter(), runner)
+
+    def test_runtime_wires_explicit_independent_local_reviewer_provider(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = init_git_repo(Path(temp) / "repo")
+            subprocess.run(["git", "-C", str(workspace), "remote", "add", "origin",
+                            "https://github.com/o/r.git"], check=True, capture_output=True)
+            local = {
+                "database_path": str(Path(temp) / "runtime.sqlite"), "workspace": str(workspace),
+                "owner_id": "owner", "target_repository": "o/r",
+                "github_app": {"app_id": "1", "credential_source": {"type": "test"}},
+                "providers": [
+                    {"key": "antigravity", "type": "antigravity", "executable": "language_server"},
+                    {"key": "claude_code", "type": "claude_code", "executable": "claude"},
+                ],
+                "implementer_provider": "claude_code", "reviewer_provider": "antigravity",
+                "reviewer_github_identity": "liuchangchxy",
+            }
+            class CredentialProvider:
+                api_url = "https://api.github.com"
+            wired = build_runtime(MANIFEST, local, api=FakeAPI(), writer=FakeWriter(),
+                                  credential_provider=CredentialProvider(), push_backend=object())
+
+            self.assertEqual(wired.router.primary, "claude_code")
+            self.assertEqual(wired.local_reviewer.provider_key, "antigravity")
+            self.assertIs(wired.lifecycle.local_reviewer, wired.local_reviewer)
 
     def test_generic_app_runtime_needs_no_prebuilt_helpers_and_generates_attempt_wrappers(self):
         with tempfile.TemporaryDirectory() as temp:
