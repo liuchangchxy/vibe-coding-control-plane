@@ -1305,7 +1305,7 @@ class RuntimeCore:
                                 receipt["evidence_digest"], current):
                             items.append({"issue": 37, "status": "historical_recovery_deferred"})
                             continue
-                    if self.workflow.remove_coordination_labels_and_close(row["repo"], row["issue_number"]):
+                    if self.workflow.close_historical_dayspark37_noop(row["repo"], row["issue_number"]):
                         self.store.success_noop_recovery(row["attempt_id"], current)
                         items.append({"issue": 37, "status": "success_no_op"})
                     else:
