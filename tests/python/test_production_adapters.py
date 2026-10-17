@@ -440,6 +440,64 @@ class AdapterTests(unittest.TestCase):
             self.assertEqual(adapter.launch(LaunchRequest("o/r", 1, "attempt-missing", "initial_dispatch")).disposition,
                              LaunchDisposition.DEFINITELY_NOT_STARTED)
 
+    def test_antigravity_launch_injects_current_language_server_context(self):
+        with tempfile.TemporaryDirectory() as temp:
+            executable = Path(temp) / "language_server"
+            executable.touch()
+            workspace = init_git_repo(Path(temp) / "repo")
+            calls = []
+            response = SimpleNamespace(returncode=0, stdout=json.dumps({"conversation_id": CONVERSATION_ID}))
+            context = {"ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:54195",
+                       "ANTIGRAVITY_CSRF_TOKEN": "ephemeral-csrf-token"}
+            adapter = AntiGravityImplementer(str(executable), str(workspace), "app-gh", "app-git-push",
+                                             runner=lambda args, **kw: (calls.append((args, kw)), response)[1],
+                                             environ={"HOME": "/Users/test"})
+            with mock.patch("vccp_runtime.adapters.sys.platform", "darwin"), \
+                 mock.patch("vccp_runtime.adapters._discover_antigravity_agentapi_environment",
+                            return_value=context) as discover:
+                result = adapter.launch(LaunchRequest("o/r", 1, "attempt-context", "initial_dispatch"))
+
+            self.assertEqual(result.disposition, LaunchDisposition.CONFIRMED)
+            discover.assert_called_once_with(str(executable))
+            child_env = calls[0][1]["env"]
+            self.assertEqual(child_env["ANTIGRAVITY_LS_ADDRESS"], context["ANTIGRAVITY_LS_ADDRESS"])
+            self.assertEqual(child_env["ANTIGRAVITY_CSRF_TOKEN"], context["ANTIGRAVITY_CSRF_TOKEN"])
+
+    def test_antigravity_context_discovery_uses_only_healthy_loopback_server(self):
+        from vccp_runtime.adapters import _discover_antigravity_agentapi_environment
+
+        executable = "/Applications/Antigravity.app/Contents/Resources/bin/language_server"
+        commands = []
+
+        def fake_run(args, **kwargs):
+            commands.append(args)
+            if args[:3] == ["ps", "-axo", "pid=,command="]:
+                return SimpleNamespace(returncode=0, stdout=(
+                    f"510 {executable} --standalone --override_ide_name antigravity "
+                    "--csrf_token=ephemeral-csrf-token\n"))
+            if args[:3] == ["lsof", "-nP", "-a"]:
+                return SimpleNamespace(returncode=0, stdout=(
+                    "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n"
+                    "language 510 user 7u IPv4 0x1 0t0 TCP 127.0.0.1:54195 (LISTEN)\n"
+                    "language 510 user 8u IPv4 0x2 0t0 TCP *:54196 (LISTEN)\n"))
+            self.fail(f"unexpected command: {args}")
+
+        class HealthResponse:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def read(self): return b'{"status":"ok"}'
+
+        with mock.patch("vccp_runtime.adapters.sys.platform", "darwin"), \
+             mock.patch("vccp_runtime.adapters.subprocess.run", side_effect=fake_run), \
+             mock.patch("vccp_runtime.adapters.urlopen", return_value=HealthResponse()) as open_url:
+            result = _discover_antigravity_agentapi_environment(executable)
+
+        self.assertEqual(result, {"ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:54195",
+                                  "ANTIGRAVITY_CSRF_TOKEN": "ephemeral-csrf-token"})
+        self.assertEqual(len(commands), 2)
+        self.assertIn("http://127.0.0.1:54195/healthz", open_url.call_args.args[0].full_url)
+
     def test_guard_failure_prevents_agentapi_invocation(self):
         calls = []
         class FailedGuard:
