@@ -156,6 +156,7 @@ def _active_work(repo, database_path):
             if "attempts" in tables:
                 rows = connection.execute("SELECT phase, closeout_pending FROM attempts WHERE lower(repo)=lower(?)", (repo,)).fetchall()
                 terminal = {"CLAIM_FAILED", "LAUNCH_NOT_STARTED", "BUDGET_EXHAUSTED", "MERGED_SUCCESS",
+                            "SUCCESS_NO_OP",
                             "STOPPED_CANCELLED", "TERMINAL_UNRESOLVED", "COMPLETED", "FAILED"}
                 active = [row[0] for row in rows if row[0] not in terminal or row[1]]
                 if active:

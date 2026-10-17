@@ -55,6 +55,23 @@ class HostDeploymentTests(unittest.TestCase):
             self.assertEqual(result["status"], "blocked")
             self.assertIn("active Consumer execution", result["reason"])
 
+    def test_remove_allows_completed_success_no_op_attempt(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            database = root / "state.sqlite"
+            import sqlite3
+            with closing(sqlite3.connect(database)) as connection:
+                connection.execute("CREATE TABLE attempts(repo TEXT, phase TEXT, closeout_pending INTEGER)")
+                connection.execute("INSERT INTO attempts VALUES('owner/consumer', 'SUCCESS_NO_OP', 0)")
+                connection.commit()
+            result = remove_macos_launch_agent(repo="owner/consumer", database_path=str(database),
+                runtime_config_path=str(root / "runtime.json"),
+                label="com.vccp.consumer-dispatcher", plist_path=str(root / "missing.plist"),
+                user_id="501", runner=lambda *_args, **_kwargs: SimpleNamespace(
+                    returncode=1, stdout="", stderr="Could not find service"))
+            self.assertEqual(result["status"], "already_removed", result)
+            self.assertTrue(result["runtime_lock_released"])
+
     def test_remove_blocks_on_active_reviewer(self):
         with tempfile.TemporaryDirectory() as root:
             database = Path(root) / "state.sqlite"
