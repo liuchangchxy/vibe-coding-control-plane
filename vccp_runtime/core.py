@@ -240,6 +240,25 @@ class _Store:
                     authorization_digest TEXT NOT NULL, workspace_evidence TEXT NOT NULL,
                     evidence_reference TEXT, evidence_digest TEXT, created_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS controlled_pushes (
+                    push_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    attempt_id TEXT NOT NULL,
+                    repo TEXT NOT NULL,
+                    destination_ref TEXT NOT NULL,
+                    expected_sha TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    completed_at REAL
+                );
+                CREATE INDEX IF NOT EXISTS controlled_pushes_attempt_idx
+                    ON controlled_pushes(attempt_id);
+                CREATE TABLE IF NOT EXISTS historical_closeout_intents (
+                    attempt_id TEXT PRIMARY KEY,
+                    evidence_reference TEXT NOT NULL,
+                    evidence_digest TEXT NOT NULL,
+                    expected_head TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS attempts_flow_idx
                     ON attempts(repo, issue_number, kind, repair_ordinal);
                 """
@@ -453,6 +472,10 @@ class _Store:
                     or row["execution_id"] != execution_id or not row["frozen_spec_digest"]):
                 connection.rollback()
                 return False
+            if connection.execute("SELECT 1 FROM controlled_pushes WHERE attempt_id=? LIMIT 1",
+                                  (attempt_id,)).fetchone():
+                connection.rollback()
+                return False
             prior = connection.execute("SELECT repo,issue_number,provider,execution_id,source,authorization_digest,workspace_evidence "
                                        "FROM completion_receipts WHERE attempt_id=?", (attempt_id,)).fetchone()
             expected = (row["repo"], row["issue_number"], provider, execution_id, source,
@@ -472,6 +495,61 @@ class _Store:
             raise
         finally:
             connection.close()
+
+    def begin_controlled_push(self, attempt_id: str, repo: str, provider: str,
+                              destination_ref: str, expected_sha: str, now: float | None = None):
+        """Durably fence a push before the external Git operation can start."""
+        connection = self.transaction()
+        try:
+            row = connection.execute("SELECT repo,phase,launch_outcome,implementer_provider FROM attempts "
+                                     "WHERE attempt_id=?", (attempt_id,)).fetchone()
+            if (row is None or row["repo"] != _repo_key(repo) or row["phase"] != "LAUNCH_CONFIRMED"
+                    or row["launch_outcome"] != "confirmed" or row["implementer_provider"] != provider
+                    or not destination_ref or not _SHA_RE.fullmatch(expected_sha or "")
+                    or connection.execute("SELECT 1 FROM completion_receipts WHERE attempt_id=?",
+                                          (attempt_id,)).fetchone()):
+                connection.rollback()
+                return None
+            cursor = connection.execute(
+                "INSERT INTO controlled_pushes(attempt_id,repo,destination_ref,expected_sha,phase,created_at) "
+                "VALUES(?,?,?,?,'intent',?)",
+                (attempt_id, row["repo"], destination_ref, expected_sha.lower(),
+                 time.time() if now is None else float(now)),
+            )
+            connection.commit()
+            return cursor.lastrowid
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def complete_controlled_push(self, push_id: int, remote_sha: str, now: float | None = None):
+        connection = self.transaction()
+        try:
+            cursor = connection.execute(
+                "UPDATE controlled_pushes SET phase='completed',completed_at=? WHERE push_id=? "
+                "AND phase='intent' AND expected_sha=?",
+                (time.time() if now is None else float(now), push_id, (remote_sha or "").lower()),
+            )
+            connection.commit()
+            return cursor.rowcount == 1
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def has_controlled_push(self, attempt_id: str):
+        with closing(self._connect()) as connection:
+            return connection.execute("SELECT 1 FROM controlled_pushes WHERE attempt_id=? LIMIT 1",
+                                      (attempt_id,)).fetchone() is not None
+
+    def controlled_pushes_for_attempt(self, attempt_id: str):
+        with closing(self._connect()) as connection:
+            rows = connection.execute("SELECT * FROM controlled_pushes WHERE attempt_id=? ORDER BY push_id",
+                                      (attempt_id,)).fetchall()
+            return [dict(row) for row in rows]
 
     def record_historical_recovery(self, attempt_id: str, expected: dict, evidence_reference: str,
                                   evidence_digest: str):
@@ -504,6 +582,65 @@ class _Store:
         finally:
             connection.close()
 
+    def begin_historical_closeout(self, attempt_id: str, expected_head: str,
+                                 evidence_reference: str, evidence_digest: str,
+                                 now: float | None = None):
+        """Persist a historical close intent bound to its admitted evidence receipt."""
+        connection = self.transaction()
+        try:
+            row = connection.execute(
+                "SELECT a.repo,a.issue_number,a.phase,a.implementer_provider,a.execution_id,"
+                "r.source,r.authorization_digest,r.evidence_reference,r.evidence_digest,r.workspace_evidence "
+                "FROM attempts a LEFT JOIN completion_receipts r USING(attempt_id) WHERE a.attempt_id=?",
+                (attempt_id,),
+            ).fetchone()
+            valid = (row is not None
+                     and tuple(row[:5]) == ("liuchangchxy/dayspark", 37, "TERMINAL_UNRESOLVED",
+                                            "antigravity", "c6d4791b-419b-4800-a83d-f229761a8dab")
+                     and row["source"] == "operator_recovery"
+                     and row["authorization_digest"] == "historical-dayspark37"
+                     and row["evidence_reference"] == evidence_reference
+                     and row["evidence_digest"] == evidence_digest
+                     and bool(re.fullmatch(r"[0-9a-f]{64}", evidence_digest or ""))
+                     and bool(_SHA_RE.fullmatch(expected_head or "")))
+            if valid:
+                try:
+                    evidence = json.loads(row["workspace_evidence"])
+                except (TypeError, json.JSONDecodeError):
+                    evidence = None
+                valid = (isinstance(evidence, dict)
+                         and evidence.get("expected_head") == expected_head.lower()
+                         and isinstance(evidence.get("head"), str)
+                         and evidence["head"].lower() == expected_head.lower())
+            if not valid:
+                connection.rollback()
+                return False
+            prior = connection.execute("SELECT evidence_reference,evidence_digest,expected_head "
+                                       "FROM historical_closeout_intents WHERE attempt_id=?",
+                                       (attempt_id,)).fetchone()
+            expected = (evidence_reference, evidence_digest, expected_head.lower())
+            if prior and tuple(prior) != expected:
+                connection.rollback()
+                return False
+            connection.execute(
+                "INSERT OR IGNORE INTO historical_closeout_intents(attempt_id,evidence_reference,evidence_digest,"
+                "expected_head,created_at) VALUES(?,?,?,?,?)",
+                (attempt_id, *expected, time.time() if now is None else float(now)),
+            )
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def historical_closeout_intent(self, attempt_id: str):
+        with closing(self._connect()) as connection:
+            row = connection.execute("SELECT * FROM historical_closeout_intents WHERE attempt_id=?",
+                                     (attempt_id,)).fetchone()
+            return dict(row) if row else None
+
     def receipt(self, attempt_id):
         with closing(self._connect()) as connection:
             row = connection.execute("SELECT * FROM completion_receipts WHERE attempt_id=?", (attempt_id,)).fetchone()
@@ -525,7 +662,9 @@ class _Store:
                     or row["receipt_repo"] != row["repo"] or row["receipt_issue"] != row["issue_number"]
                     or row["provider"] != row["implementer_provider"]
                     or row["receipt_execution"] != row["execution_id"]
-                    or row["authorization_digest"] != row["frozen_spec_digest"]):
+                    or row["authorization_digest"] != row["frozen_spec_digest"]
+                    or connection.execute("SELECT 1 FROM controlled_pushes WHERE attempt_id=? LIMIT 1",
+                                          (attempt_id,)).fetchone()):
                 connection.rollback()
                 return False
             connection.execute("UPDATE attempts SET no_op_closeout_intent=1,updated_at=? WHERE attempt_id=?",
@@ -1096,6 +1235,9 @@ class RuntimeCore:
             receipt = self.store.receipt(row["attempt_id"])
             if not receipt or row["phase"] == "SUCCESS_NO_OP":
                 continue
+            if self.store.has_controlled_push(row["attempt_id"]):
+                items.append({"issue": row["issue_number"], "status": "no_op_rejected_controlled_push"})
+                continue
             if row["phase"] == "SUCCESS_NO_OP_CLEANUP_PENDING":
                 if not row["no_op_closeout_intent"]:
                     items.append({"issue": row["issue_number"], "status": "no_op_deferred"})
@@ -1115,20 +1257,54 @@ class RuntimeCore:
             try:
                 snapshot = self.workflow.observe(row["repo"], row["issue_number"])
                 if receipt["source"] == "operator_recovery":
-                    historical_ok = (row["repo"] == "liuchangchxy/dayspark" and row["issue_number"] == 37
-                                     and row["attempt_id"] == "8dc7fdbc-39c2-4fc1-9193-aab3d060f2a0"
-                                     and receipt["provider"] == "antigravity"
-                                     and receipt["execution_id"] == "c6d4791b-419b-4800-a83d-f229761a8dab"
-                                     and bool(receipt["evidence_reference"])
-                                     and bool(re.fullmatch(r"[0-9a-f]{64}", receipt["evidence_digest"] or ""))
-                                     and snapshot.issue_open and snapshot.frozen_spec
-                                     and "infra-blocked" in snapshot.terminal_labels
-                                     and snapshot.coordination_state == "infra-blocked"
-                                     and not snapshot.canonical_link_count and not snapshot.open_linked_pr_count
-                                     and snapshot.canonical_relationship_valid)
-                    if not historical_ok or not self._workspace_baseline_matches(json.loads(receipt["workspace_evidence"])):
+                    intent = self.store.historical_closeout_intent(row["attempt_id"])
+                    try:
+                        evidence = json.loads(receipt["workspace_evidence"])
+                    except (TypeError, json.JSONDecodeError):
+                        evidence = None
+                    expected_head = evidence.get("expected_head") if isinstance(evidence, dict) else None
+                    historical_identity = (
+                        row["repo"] == "liuchangchxy/dayspark" and row["issue_number"] == 37
+                        and row["attempt_id"] == "8dc7fdbc-39c2-4fc1-9193-aab3d060f2a0"
+                        and receipt["repo"] == row["repo"] and receipt["issue_number"] == 37
+                        and receipt["provider"] == "antigravity"
+                        and receipt["execution_id"] == "c6d4791b-419b-4800-a83d-f229761a8dab"
+                        and receipt["authorization_digest"] == "historical-dayspark37"
+                        and bool(receipt["evidence_reference"])
+                        and bool(re.fullmatch(r"[0-9a-f]{64}", receipt["evidence_digest"] or ""))
+                        and isinstance(evidence, dict) and expected_head == evidence.get("head")
+                        and bool(_SHA_RE.fullmatch(expected_head or ""))
+                        and bool(self.workspace_path)
+                        and snapshot.frozen_spec and not snapshot.canceled
+                        and snapshot.canonical_relationship_valid and not snapshot.canonical_link_count
+                        and not snapshot.open_linked_pr_count and not row["pr_number"]
+                        and self._workspace_baseline_matches(
+                            {"head": evidence.get("head"), "status": evidence.get("status")})
+                    )
+                    intent_matches = (intent is None or (
+                        intent["evidence_reference"] == receipt["evidence_reference"]
+                        and intent["evidence_digest"] == receipt["evidence_digest"]
+                        and intent["expected_head"] == expected_head))
+                    if not historical_identity or not intent_matches:
                         items.append({"issue": row["issue_number"], "status": "historical_recovery_deferred"})
                         continue
+                    if not snapshot.issue_open:
+                        if not intent:
+                            items.append({"issue": 37, "status": "historical_recovery_deferred"})
+                            continue
+                        self.store.success_noop_recovery(row["attempt_id"], current)
+                        items.append({"issue": 37, "status": "success_no_op"})
+                        continue
+                    if not intent:
+                        if ("infra-blocked" not in snapshot.terminal_labels
+                                or snapshot.coordination_state != "infra-blocked"):
+                            items.append({"issue": 37, "status": "historical_recovery_deferred"})
+                            continue
+                        if not self.store.begin_historical_closeout(
+                                row["attempt_id"], expected_head, receipt["evidence_reference"],
+                                receipt["evidence_digest"], current):
+                            items.append({"issue": 37, "status": "historical_recovery_deferred"})
+                            continue
                     if self.workflow.remove_coordination_labels_and_close(row["repo"], row["issue_number"]):
                         self.store.success_noop_recovery(row["attempt_id"], current)
                         items.append({"issue": 37, "status": "success_no_op"})

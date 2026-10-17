@@ -13,6 +13,7 @@ from vccp_runtime.adapters import (AntiGravityImplementer, GitHubAPI, GitHubAppW
 from vccp_runtime.core import LaunchDisposition, LaunchRequest, RepairCandidate
 from vccp_runtime.lifecycle import LifecycleDriver
 from vccp_runtime import runner as runtime_runner
+from vccp_runtime import controlled_cli
 
 
 SHA = "a" * 40
@@ -740,6 +741,68 @@ class AdapterTests(unittest.TestCase):
             reconciliation = runtime.core.reconcile_no_change("o/r")
             self.assertEqual(reconciliation["items"][0]["status"], "success_no_op")
             self.assertEqual(runtime.core.store.attempt(result["attempt_id"])["phase"], "SUCCESS_NO_OP")
+
+    def test_controlled_push_blocks_noop_after_workspace_is_restored(self):
+        with tempfile.TemporaryDirectory() as temp:
+            api = FakeAPI()
+            api.issue["body"] = "completion_policy: allow_no_change=true\nFrozen task"
+            workspace = init_git_repo(Path(temp) / "repo")
+            subprocess.run(["git", "-C", str(workspace), "remote", "add", "origin",
+                            "https://github.com/o/r.git"], check=True, capture_output=True)
+
+            class Provider:
+                api_url = "https://api.github.com"
+                target_repository = "o/r"
+                def get_token(self, repo): raise AssertionError("mocked push must not mint a token")
+                def request(self, *args, **kwargs): raise AssertionError("mocked push must not call GitHub")
+
+            class PushBackend:
+                def push(self, *args, **kwargs):
+                    self.args = args
+                    self.kwargs = kwargs
+                    return {"status": "pushed", "sha": args[2], "destination_ref": args[3]}
+
+            launches = []
+            def agent_runner(args, **kwargs):
+                launches.append(kwargs)
+                return SimpleNamespace(returncode=0, stdout=json.dumps({"conversation_id": CONVERSATION_ID}))
+
+            local = {"database_path": str(Path(temp) / "runtime.sqlite"), "workspace": str(workspace),
+                     "owner_id": "worker", "antigravity_executable": "language_server.exe",
+                     "github_app": {"app_id": "123456", "credential_source": {
+                         "type": "windows_dpapi_file", "path": str(Path(temp) / "key.dpapi")}}}
+            runtime = build_runtime(MANIFEST, local, api=api, writer=MutatingWriter(api),
+                                    runner=agent_runner, credential_provider=Provider(), push_backend=object())
+            result = runtime.core.dispatch_initial("o/r", 1, "worker")
+            attempt = runtime.core.store.attempt(result["attempt_id"])
+            git_dir = Path(subprocess.run(["git", "-C", str(workspace), "rev-parse", "--absolute-git-dir"],
+                                          capture_output=True, text=True, check=True).stdout.strip())
+            context_path = list(git_dir.glob("vccp-control/*/*/runtime-context.json"))[0]
+            completion = list(git_dir.glob("vccp-control/*/*/complete-no-change*"))[0]
+            head = subprocess.run(["git", "-C", str(workspace), "rev-parse", "HEAD"],
+                                  capture_output=True, text=True, check=True).stdout.strip()
+            backend = PushBackend()
+            with mock.patch.dict(os.environ, {"VCCP_CONTROLLED_PUSH": "1"}), \
+                 mock.patch.object(controlled_cli, "_provider", return_value=Provider()), \
+                 mock.patch.object(controlled_cli, "GitHubAppPushBackend", return_value=backend):
+                pushed = controlled_cli.run(["--context", str(context_path), "git-push", "--branch",
+                                             "implement/1", "--expected-sha", head])
+            self.assertEqual(pushed, 0)
+            self.assertEqual(backend.kwargs["controlled"], True)
+            push_audit = runtime.core.store.controlled_pushes_for_attempt(result["attempt_id"])
+            self.assertEqual(len(push_audit), 1)
+            self.assertEqual(push_audit[0]["phase"], "completed")
+            marker = Path(workspace) / "temporary-push-change"
+            marker.write_text("changed")
+            marker.unlink()
+            self.assertEqual(runtime.core._workspace_baseline(str(workspace)), attempt["workspace_baseline"])
+            self.assertIsNone(attempt["pr_number"])
+            completion_result = subprocess.run(
+                [str(completion)] if os.name != "nt" else ["cmd", "/c", str(completion)],
+                cwd=workspace, env=dict(launches[0]["env"]), capture_output=True, text=True)
+            self.assertNotEqual(completion_result.returncode, 0)
+            self.assertIn("controlled push", completion_result.stderr.lower())
+            self.assertIsNone(runtime.core.store.receipt(result["attempt_id"]))
 
     def test_exact_head_repair_and_stale_review_launch_counts(self):
         with tempfile.TemporaryDirectory() as temp:

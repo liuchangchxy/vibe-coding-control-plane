@@ -98,6 +98,8 @@ def run(argv=None) -> int:
             if (not attempt or attempt["repo"] != repo.casefold() or attempt["implementer_provider"] != context.get("provider")
                     or attempt["frozen_spec_digest"] != context.get("authorization_digest")):
                 raise GitHubAppError("attempt provenance does not authorize completion")
+            if store.has_controlled_push(context["attempt_id"]):
+                raise GitHubAppError("no-change completion is unavailable after controlled push")
             if not store.record_completion(context["attempt_id"], attempt["implementer_provider"],
                                            attempt["execution_id"], evidence):
                 raise GitHubAppError("attempt provenance does not authorize completion")
@@ -124,9 +126,19 @@ def run(argv=None) -> int:
         if args.command == "git-push":
             if os.environ.get("VCCP_CONTROLLED_PUSH") != "1":
                 raise GitHubAppError("push is available only through its attempt-scoped wrapper")
+            if not context.get("attempt_id") or not context.get("provider") or not context.get("database_path"):
+                raise GitHubAppError("attempt-scoped push audit is unavailable")
+            store = _Store(context["database_path"])
             backend = GitHubAppPushBackend(provider, context["workspace"], repo,
                                            context["base_branch"])
-            backend.push(repo, args.branch, args.expected_sha, args.branch, controlled=True)
+            push_id = store.begin_controlled_push(context["attempt_id"], repo, context["provider"],
+                                                  args.branch, args.expected_sha)
+            if push_id is None:
+                raise GitHubAppError("attempt provenance does not authorize controlled push")
+            result = backend.push(repo, args.branch, args.expected_sha, args.branch, controlled=True)
+            if (not isinstance(result, dict) or result.get("status") != "pushed"
+                    or not store.complete_controlled_push(push_id, result.get("sha"))):
+                raise GitHubAppError("controlled push result could not be durably recorded")
             return 0
         raise GitHubAppError("controlled operation is not allowed")
     except GitHubAppError as error:
