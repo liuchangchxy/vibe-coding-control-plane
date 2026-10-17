@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +12,7 @@ from vccp_runtime.adapters import (AntiGravityImplementer, GitHubAPI, GitHubAppW
                                    WorkspaceWriteGuard, build_runtime, generic_prompt)
 from vccp_runtime.core import LaunchDisposition, LaunchRequest, RepairCandidate
 from vccp_runtime.lifecycle import LifecycleDriver
+from vccp_runtime import runner as runtime_runner
 
 
 SHA = "a" * 40
@@ -118,6 +120,36 @@ def linked_api(review=True):
 
 
 class AdapterTests(unittest.TestCase):
+    def test_historical_recovery_operator_cli_invokes_fixed_runtime_operation(self):
+        calls = []
+        class Lock:
+            def __init__(self, *args): pass
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+        class Core:
+            def recover_historical_dayspark37(self, *args):
+                calls.append(args)
+                return {"status": "receipt_recorded"}
+        fake_runtime = SimpleNamespace(core=Core())
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = init_git_repo(Path(temp) / "repo")
+            subprocess.run(["git", "-C", str(workspace), "remote", "add", "origin",
+                            "https://github.com/liuchangchxy/dayspark.git"], check=True, capture_output=True)
+            local = {"target_repository": "liuchangchxy/dayspark",
+                     "enrollment": {"authorized_repository": "liuchangchxy/dayspark"},
+                     "workspace": str(workspace), "database_path": str(Path(temp)/"runtime.sqlite"),
+                     "owner_id": "operator"}
+            manifest = {"vccp": {"revision": "a"*40}}
+            with mock.patch.object(runtime_runner, "_load", side_effect=[manifest, local]), \
+                 mock.patch.object(runtime_runner, "_validate_runtime_revision"), \
+                 mock.patch.object(runtime_runner, "RuntimeLock", Lock), \
+                 mock.patch.object(runtime_runner, "build_runtime", return_value=fake_runtime):
+                runtime_runner.main(["--manifest", "m", "--runtime-config", "c", "--repo",
+                    "liuchangchxy/dayspark", "--recover-dayspark-37", "--expected-head", "a"*40,
+                    "--evidence-reference", "archive://receipt", "--evidence-sha256", "b"*64])
+        self.assertEqual(calls[0][0], "liuchangchxy/dayspark")
+        self.assertEqual(calls[0][1], "8dc7fdbc-39c2-4fc1-9193-aab3d060f2a0")
+
     def test_fresh_issue_maps_and_fail_closed_blockers(self):
         api = FakeAPI(); writer = MutatingWriter(api)
         adapter = GitHubWorkflowAdapter(api, writer, MANIFEST)
@@ -356,6 +388,7 @@ class AdapterTests(unittest.TestCase):
     def test_real_core_recovery_uses_app_writer_for_infra_blocked(self):
         with tempfile.TemporaryDirectory() as temp:
             api = FakeAPI()
+            api.issue["body"] = "completion_policy: allow_no_change=true\nTask"
             api.issue["labels"] = [{"name": "agent-working"}, {"name": "frozen-spec"}]
             api.discovery["agent-working"] = [{"number": 1}]
             commands = FakeProductionCommands(api)
@@ -576,6 +609,12 @@ class AdapterTests(unittest.TestCase):
         self.assertIn("a plain mention is insufficient", prompt)
         self.assertIn("--body 'SUMMARY. Closes #<issue_number>'", prompt)
         self.assertIn("C:/tools/app-git-push.exe", prompt)
+        noop_prompt = generic_prompt(LaunchRequest("o/r", 3, "b", "initial_dispatch",
+            allow_no_change=True, completion_command="/git/complete-no-change"), "local", MANIFEST,
+            "app-gh", "app-git-push")
+        self.assertIn("`/git/complete-no-change`", noop_prompt)
+        self.assertIn("Otherwise, implement", noop_prompt)
+        self.assertNotIn("and open one PR", noop_prompt.split("Otherwise,")[0])
         for forbidden in ("EasyExam", "Reviewer-only", "three REQUEST_CHANGES rounds"):
             self.assertNotIn(forbidden, prompt)
 
@@ -594,12 +633,14 @@ class AdapterTests(unittest.TestCase):
             self.assertIsInstance(wired.lifecycle, LifecycleDriver)
             result = wired.core.dispatch_initial("o/r", 1, "owner")
             self.assertEqual(result["phase"], "LAUNCH_CONFIRMED")
+            self.assertEqual(Path(wired.core.workspace_path).resolve(), Path(workspace).resolve())
             self.assertEqual(len(launches), 1)
             with self.assertRaises(ValueError): build_runtime({"schema_version": 1}, local, api, FakeWriter(), runner)
 
     def test_generic_app_runtime_needs_no_prebuilt_helpers_and_generates_attempt_wrappers(self):
         with tempfile.TemporaryDirectory() as temp:
             api = FakeAPI()
+            api.issue["body"] = "completion_policy: allow_no_change=true\nTask"
             workspace = init_git_repo(Path(temp) / "repo")
             subprocess.run(["git", "-C", str(workspace), "remote", "add", "origin",
                             "https://github.com/o/r.git"], check=True, capture_output=True)
@@ -635,6 +676,13 @@ class AdapterTests(unittest.TestCase):
             env = launches[0][1]["env"]
             self.assertEqual(env["VCCP_APP_GIT_PUSH_BACKEND"], "vccp_runtime.github_push.GitHubAppPushBackend")
             self.assertNotIn("GITHUB_APP_PRIVATE_KEY", env)
+            completion = list(Path(subprocess.run(["git", "-C", str(workspace), "rev-parse", "--absolute-git-dir"],
+                                                   capture_output=True, text=True, check=True).stdout.strip())
+                              .glob("vccp-control/*/*/complete-no-change*"))[0]
+            self.assertTrue(os.access(completion, os.X_OK))
+            self.assertIn(str(completion), launches[0][0][-1])
+            attempt = runtime.core.store.attempt(result["attempt_id"])
+            self.assertNotEqual(attempt["workspace_baseline"], "{}")
             self.assertTrue(list(Path(subprocess.run(["git", "-C", str(workspace), "rev-parse", "--absolute-git-dir"],
                                                      capture_output=True, text=True, check=True).stdout.strip())
                                .glob("vccp-control/*/*/app-gh*")))

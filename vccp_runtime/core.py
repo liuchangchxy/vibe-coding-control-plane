@@ -115,6 +115,7 @@ class LaunchRequest:
     allow_no_change: bool = False
     frozen_spec_digest: str | None = None
     runtime_context: dict | None = None
+    completion_command: str | None = None
 
 
 class WorkflowPort(Protocol):
@@ -882,7 +883,10 @@ class RuntimeCore:
         self.database_path = str(Path(database_path).expanduser().resolve())
         self.workflow = workflow
         self.implementer = implementer
-        self.workspace_path = getattr(implementer, "workspace", None)
+        self.workspace_path = (getattr(implementer, "workspace", None)
+                               or next((getattr(p, "workspace", None) for p in
+                                        getattr(implementer, "_by_key", {}).values()
+                                        if getattr(p, "workspace", None)), None))
         self.lease_ttl_seconds = lease_ttl_seconds
         if recovery_timeout_seconds <= 0:
             raise ValueError("recovery_timeout_seconds must be positive")
@@ -1096,6 +1100,23 @@ class RuntimeCore:
                         items.append({"issue": 37, "status": "success_no_op"})
                     else:
                         items.append({"issue": 37, "status": "historical_recovery_closeout_pending"})
+                    continue
+                if not snapshot.issue_open and snapshot.frozen_spec \
+                        and snapshot.coordination_state in {"invalid", "agent-working"} \
+                        and receipt["repo"] == row["repo"] and receipt["issue_number"] == row["issue_number"] \
+                        and receipt["provider"] == row["implementer_provider"] \
+                        and receipt["execution_id"] == row["execution_id"] \
+                        and receipt["authorization_digest"] == row["frozen_spec_digest"] \
+                        and snapshot.allow_no_change and snapshot.frozen_spec_digest == row["frozen_spec_digest"] \
+                        and snapshot.canonical_relationship_valid and not snapshot.canonical_link_count \
+                        and not snapshot.open_linked_pr_count and not row["pr_number"] \
+                        and self._workspace_baseline_matches(json.loads(row["workspace_baseline"] or "{}")):
+                    if self.workflow.clear_active_coordination_labels(row["repo"], row["issue_number"]):
+                        self.store.no_op_terminal(row["attempt_id"], current)
+                        items.append({"issue": row["issue_number"], "status": "success_no_op"})
+                    else:
+                        self.store.no_op_terminal(row["attempt_id"], current, pending=True)
+                        items.append({"issue": row["issue_number"], "status": "closeout_pending"})
                     continue
                 if (row["phase"] != "LAUNCH_CONFIRMED" or not row["no_change_authorized"]
                         or row["launch_outcome"] != "confirmed" or not row["execution_id"]

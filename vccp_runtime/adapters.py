@@ -504,11 +504,14 @@ def generic_prompt(request: LaunchRequest, workspace: str, policy: dict,
                          f"The exact supplied baseline is {request.expected_head_sha}; repair ordinal "
                          f"{request.repair_ordinal} is authoritative. {cause_guidance}Do not create another PR/branch, "
                          "count reviews, or calculate repair budget.\n")
-    no_op = ("This Frozen Issue authorizes a legitimate no-change result. If no repository change is needed, "
-             "run the attempt-scoped command `vccp-controlled --context <context> complete-no-change` once "
+    no_op = (f"This Frozen Issue authorizes a legitimate no-change result. If no repository change is needed, "
+             f"run `{request.completion_command}` once "
              "after verifying your work. Do not describe a no-op in prose as completion. " if request.allow_no_change else "")
-    return common + no_op + (f"Implement on a non-base branch and open one PR linked to this Frozen Issue, "
-                     f"using base branch {policy['repository']['base_branch']}.\n")
+    pr_path = ((f"Otherwise, implement on a non-base branch and open one PR linked to this Frozen Issue, "
+                f"using base branch {policy['repository']['base_branch']}.\n") if request.allow_no_change else
+               (f"Implement on a non-base branch and open one PR linked to this Frozen Issue, "
+                f"using base branch {policy['repository']['base_branch']}.\n"))
+    return common + no_op + pr_path
 
 
 class _GuardedProvider:
@@ -614,6 +617,7 @@ class AntiGravityImplementer(_GuardedProvider):
         except Exception:
             # A missing/failed guard proves the external AgentAPI command was never invoked.
             return LaunchResult(LaunchDisposition.DEFINITELY_NOT_STARTED)
+        request = __import__("dataclasses").replace(request, completion_command=guard.completion_command)
         prompt = generic_prompt(request, self.workspace, self._policy, app_gh_command, guard.git_push_command)
         try:
             result = self.runner([self.executable, "agentapi", "new-conversation", prompt],
@@ -754,6 +758,7 @@ class ClaudeCodeImplementer(_GuardedProvider):
         except Exception:
             # A missing/failed guard proves the external Claude command was never invoked.
             return LaunchResult(LaunchDisposition.DEFINITELY_NOT_STARTED)
+        request = __import__("dataclasses").replace(request, completion_command=guard.completion_command)
         prompt = generic_prompt(request, self.workspace, self._policy, app_gh_command, guard.git_push_command)
         command = [self.executable, "--bg", prompt, "--permission-mode", self.permission_mode,
                    "--settings", _CLAUDE_BACKGROUND_SETTINGS]
@@ -798,6 +803,7 @@ class WorkspaceGuard:
     git_push_command: str
     environment: dict[str, str]
     github_command: str | None = None
+    completion_command: str | None = None
 
 
 class WorkspaceWriteGuard:
@@ -865,18 +871,22 @@ class WorkspaceWriteGuard:
                     raise ValueError("runtime context path cannot be represented safely by the wrapper")
                 github_wrapper = root / ("app-gh.cmd" if os.name == "nt" else "app-gh")
                 wrapper = root / ("app-git-push.cmd" if os.name == "nt" else "app-git-push")
+                completion_wrapper = root / ("complete-no-change.cmd" if os.name == "nt" else "complete-no-change")
                 command = f'"{python}" -m vccp_runtime.controlled_cli --context "{context_path}"'
                 if os.name == "nt":
                     github_wrapper.write_text(f'@echo off\r\n{command} app-gh %*\r\nexit /b %ERRORLEVEL%\r\n',
                                               encoding="utf-8")
                     wrapper.write_text('@echo off\r\nsetlocal\r\nset "VCCP_CONTROLLED_PUSH=1"\r\n'
                                        f'{command} git-push %*\r\nexit /b %ERRORLEVEL%\r\n', encoding="utf-8")
+                    completion_wrapper.write_text(f'@echo off\r\n{command} complete-no-change\r\nexit /b %ERRORLEVEL%\r\n', encoding="utf-8")
                 else:
                     github_wrapper.write_text("#!/bin/sh\nexec " + command + ' app-gh "$@"\n', encoding="utf-8")
                     wrapper.write_text("#!/bin/sh\nVCCP_CONTROLLED_PUSH=1 export VCCP_CONTROLLED_PUSH\n"
                                        "exec " + command + ' git-push "$@"\n', encoding="utf-8")
+                    completion_wrapper.write_text("#!/bin/sh\nexec " + command + " complete-no-change\n", encoding="utf-8")
                     github_wrapper.chmod(0o700)
                     wrapper.chmod(0o700)
+                    completion_wrapper.chmod(0o700)
                     hook.chmod(0o700)
                 github_command = str(github_wrapper)
             else:
@@ -926,7 +936,8 @@ class WorkspaceWriteGuard:
             }
             if launch_context is not None:
                 env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
-            return WorkspaceGuard(str(wrapper), env, github_command)
+            return WorkspaceGuard(str(wrapper), env, github_command,
+                                  str(completion_wrapper) if launch_context is not None else None)
         except Exception:
             if not config_written:
                 import shutil

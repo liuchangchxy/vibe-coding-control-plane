@@ -73,6 +73,15 @@ class NoOpCompletionTests(unittest.TestCase):
         self.assertEqual(restarted.store.attempt(self.attempt)["phase"], "SUCCESS_NO_OP")
         self.assertEqual(self.workflow.closes, 1)
 
+    def test_restart_after_github_close_before_sqlite_terminal_write(self):
+        self.assertTrue(self.receipt())
+        self.workflow.snapshot = replace(self.workflow.snapshot, issue_open=False,
+                                          coordination_state="invalid", active_labels=())
+        restarted = RuntimeCore(self.db, MANIFEST, self.workflow, Implementer())
+        result = restarted.reconcile_no_change("acme/repo")
+        self.assertEqual(result["items"][0]["status"], "success_no_op")
+        self.assertEqual(restarted.store.attempt(self.attempt)["phase"], "SUCCESS_NO_OP")
+
     def test_no_receipt_does_not_prevent_existing_stall_timeout(self):
         row = self.core.store.attempt(self.attempt)
         result = self.core.observe_implementer_progress("acme/repo", row["progress_deadline_at"])
