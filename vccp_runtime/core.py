@@ -1642,7 +1642,7 @@ class RuntimeCore:
             first_review_rejection_pending = (
                 bool(flow and flow.get("trusted"))
                 and flow.get("repair_count", 0) == 0
-                and any(r["kind"] == "initial_dispatch" and r["phase"] == "PR_BOUND" for r in rows)
+                and any(r["kind"] in {"initial_dispatch", "adopted"} and r["phase"] == "PR_BOUND" for r in rows)
             )
             if snapshot.coordination_state == "changes-requested" and not first_review_rejection_pending and (
                     not flow or not flow.get("trusted") or not has_repair_history):
@@ -1653,18 +1653,32 @@ class RuntimeCore:
                 continue
             if not latest and rows:
                 phase = rows[-1]["phase"]
-                if phase in {"STOPPED_CANCELLED", "TERMINAL_UNRESOLVED"}:
+                if phase == "PR_BOUND":
+                    bound_row = rows[-1]
+                    output.append({"issue": issue, "status": "already_bound", "pr": bound_row["pr_number"]})
+                    continue
+                if phase == "STOPPED_CANCELLED":
                     output.append({"issue": issue, "status": "stopped_terminal"})
                     continue
-                if phase == "PR_BOUND":
-                    output.append({"issue": issue, "status": "already_bound", "pr": rows[-1]["pr_number"]})
+                has_adoptable_pr = (
+                    snapshot.canonical_relationship_valid
+                    and snapshot.canonical_link_count == 1
+                    and snapshot.open_linked_pr_count == 1
+                    and snapshot.pr_open
+                    and snapshot.pr_number is not None
+                    and bool(snapshot.pr_branch)
+                    and bool(snapshot.pr_head_sha)
+                )
+                if phase != "TERMINAL_UNRESOLVED" or not has_adoptable_pr:
+                    if phase == "TERMINAL_UNRESOLVED":
+                        output.append({"issue": issue, "status": "stopped_terminal"})
+                    else:
+                        terminal = "needs-human"
+                        self._recovery_terminal(repo_key, issue, snapshot, terminal)
+                        self.store.local_terminal(rows[-1]["attempt_id"], "TERMINAL_UNRESOLVED", current_time)
+                        output.append({"issue": issue, "status": "stale_or_contradictory_local_history",
+                                       "terminal": terminal})
                     continue
-                terminal = "needs-human"
-                self._recovery_terminal(repo_key, issue, snapshot, terminal)
-                self.store.local_terminal(rows[-1]["attempt_id"], "TERMINAL_UNRESOLVED", current_time)
-                output.append({"issue": issue, "status": "stale_or_contradictory_local_history",
-                               "terminal": terminal})
-                continue
             if latest:
                 self.store.renew_owner_lease(repo_key, issue, owner_id, current_time, self.lease_ttl_seconds)
                 if latest["phase"] == "LAUNCH_CONFIRMED" and latest.get("execution_id"):

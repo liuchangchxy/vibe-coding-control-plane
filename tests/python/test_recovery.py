@@ -295,6 +295,46 @@ class RecoveryTests(unittest.TestCase):
         self.assertTrue(self.core.store.flow("acme/alpha", 7)["trusted"])
         self.assertEqual(self.core.store.attempts_for_repo("acme/alpha")[-1]["kind"], "adopted")
 
+    def test_prior_terminal_unresolved_attempt_with_canonical_pr_adopts_orphan(self):
+        self.start()
+        attempt_id = self.core.store.attempts_for_repo("acme/alpha")[-1]["attempt_id"]
+        self.core.store.local_terminal(attempt_id, "TERMINAL_UNRESOLVED", time.time())
+        self.add_pr()
+        result = self.core.reconcile_once("acme/alpha", "owner")
+        self.assertEqual(result["items"][0]["status"], "orphan_adopted_trusted")
+        self.assertTrue(self.core.store.flow("acme/alpha", 7)["trusted"])
+        adopted = self.core.store.attempts_for_repo("acme/alpha")[-1]
+        self.assertEqual(adopted["kind"], "adopted")
+        self.assertEqual(adopted["phase"], "PR_BOUND")
+
+    def test_prior_terminal_unresolved_attempt_does_not_adopt_ambiguous_or_invalid_pr(self):
+        for snapshot in (
+            replace(snap(state="agent-working"), pr_number=44, pr_open=True, pr_linked_issue=7,
+                    pr_head_sha=SHA, pr_branch=BRANCH, open_linked_pr_count=2,
+                    canonical_link_count=2),
+            replace(snap(state="agent-working"), pr_number=44, pr_open=True, pr_linked_issue=7,
+                    pr_head_sha=SHA, pr_branch=BRANCH, open_linked_pr_count=1,
+                    canonical_link_count=1, canonical_relationship_valid=False),
+        ):
+            with self.subTest(snapshot=snapshot):
+                self.start()
+                attempt_id = self.core.store.attempts_for_repo("acme/alpha")[-1]["attempt_id"]
+                self.core.store.local_terminal(attempt_id, "TERMINAL_UNRESOLVED", time.time())
+                self.set_snapshot(snapshot)
+                before = len(self.core.store.attempts_for_repo("acme/alpha"))
+                self.core.reconcile_once("acme/alpha", "owner")
+                self.assertEqual(len(self.core.store.attempts_for_repo("acme/alpha")), before)
+                self.assertFalse(self.core.store.flow("acme/alpha", 7).get("trusted", False))
+
+    def test_stopped_cancelled_attempt_with_pr_is_not_resurrected(self):
+        self.start()
+        attempt_id = self.core.store.attempts_for_repo("acme/alpha")[-1]["attempt_id"]
+        self.core.store.local_terminal(attempt_id, "STOPPED_CANCELLED", time.time())
+        self.add_pr()
+        result = self.core.reconcile_once("acme/alpha", "owner")
+        self.assertEqual(result["items"][0]["status"], "stopped_terminal")
+        self.assertEqual(len(self.core.store.attempts_for_repo("acme/alpha")), 1)
+
     def test_canonical_adoption_without_budget_evidence_cannot_repair(self):
         self.set_snapshot(replace(snap(state="agent-working"), pr_number=44, pr_open=True,
                                   pr_linked_issue=7, pr_head_sha=SHA, pr_branch=BRANCH,
