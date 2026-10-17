@@ -452,7 +452,8 @@ class AdapterTests(unittest.TestCase):
             adapter = AntiGravityImplementer(str(executable), str(workspace), "app-gh", "app-git-push",
                                              runner=lambda args, **kw: (calls.append((args, kw)), response)[1],
                                              environ={"HOME": "/Users/test"})
-            with mock.patch("vccp_runtime.adapters._discover_antigravity_agentapi_environment",
+            with mock.patch("vccp_runtime.adapters.sys.platform", "darwin"), \
+                 mock.patch("vccp_runtime.adapters._discover_antigravity_agentapi_environment",
                             return_value=context) as discover:
                 result = adapter.launch(LaunchRequest("o/r", 1, "attempt-context", "initial_dispatch"))
 
