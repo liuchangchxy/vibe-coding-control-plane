@@ -598,6 +598,14 @@ test("rendered Reviewer prompt waits for same-run checks and enables Auto-merge 
     assert.match(prompt, /enable native Auto-merge[\s\S]*APPROVE/);
     assert.match(prompt, /Dispatcher alone admits or rejects repairs under the shared `max_automated_repairs` budget/);
     assert.match(prompt, /If required CI is red, exit without a product `REQUEST_CHANGES`/);
+    assert.match(prompt, /No first-finding early exit/);
+    assert.match(prompt, /Root-cause-wide sibling audit/);
+    assert.match(prompt, /Cumulative review/);
+    assert.match(prompt, /Complete actionable blocking list/);
+    assert.match(prompt, /No scope inflation/);
+    assert.match(prompt, /Evidence types/);
+    assert.match(prompt, /listed locations are confirmed examples, not an exhaustive patch list/);
+    assert.match(prompt, /next review to repeat the Frozen-Spec-wide audit/);
     assert.doesNotMatch(prompt, /Count formal `REQUEST_CHANGES` reviews/);
     assert.doesNotMatch(prompt, /After the third formal request/);
     assert.doesNotMatch(prompt, /check_run\.completed/);
