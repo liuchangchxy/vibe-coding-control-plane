@@ -1227,13 +1227,57 @@ class RuntimeCore:
             return False
         return self.store.record_completion(attempt_id, provider, execution_id, current)
 
+    @staticmethod
+    def _historical_postsuccess_cleanup_matches(row, receipt, intent):
+        if not intent:
+            return False
+        try:
+            evidence = json.loads(receipt["workspace_evidence"])
+        except (TypeError, json.JSONDecodeError):
+            return False
+        expected_head = evidence.get("expected_head") if isinstance(evidence, dict) else None
+        return (
+            row["repo"] == "liuchangchxy/dayspark" and row["issue_number"] == 37
+            and row["attempt_id"] == "8dc7fdbc-39c2-4fc1-9193-aab3d060f2a0"
+            and receipt["source"] == "operator_recovery"
+            and receipt["repo"] == row["repo"] and receipt["issue_number"] == 37
+            and receipt["provider"] == "antigravity"
+            and receipt["execution_id"] == "c6d4791b-419b-4800-a83d-f229761a8dab"
+            and receipt["authorization_digest"] == "historical-dayspark37"
+            and bool(receipt["evidence_reference"])
+            and bool(re.fullmatch(r"[0-9a-f]{64}", receipt["evidence_digest"] or ""))
+            and isinstance(evidence, dict) and expected_head == evidence.get("head")
+            and bool(_SHA_RE.fullmatch(expected_head or ""))
+            and intent["evidence_reference"] == receipt["evidence_reference"]
+            and intent["evidence_digest"] == receipt["evidence_digest"]
+            and intent["expected_head"] == expected_head
+        )
+
     def reconcile_no_change(self, repo: str, now: float | None = None):
         """Complete durable receipts only after fresh provider-neutral GitHub checks."""
         current = time.time() if now is None else float(now)
         items = []
         for row in self.store.attempts_for_repo(repo):
             receipt = self.store.receipt(row["attempt_id"])
-            if not receipt or row["phase"] == "SUCCESS_NO_OP":
+            if not receipt:
+                continue
+            if row["phase"] == "SUCCESS_NO_OP":
+                if self._historical_postsuccess_cleanup_matches(
+                        row, receipt, self.store.historical_closeout_intent(row["attempt_id"])):
+                    try:
+                        snapshot = self.workflow.observe(row["repo"], row["issue_number"])
+                        if (not snapshot.issue_open and snapshot.frozen_spec and not snapshot.canceled
+                                and "infra-blocked" in snapshot.terminal_labels
+                                and "needs-human" not in snapshot.terminal_labels
+                                and snapshot.canonical_relationship_valid and not snapshot.canonical_link_count
+                                and not snapshot.open_linked_pr_count and not row["pr_number"]):
+                            if self.workflow.cleanup_historical_dayspark37_noop_labels(
+                                    row["repo"], row["issue_number"]):
+                                items.append({"issue": 37, "status": "success_no_op"})
+                            else:
+                                items.append({"issue": 37, "status": "historical_cleanup_pending"})
+                    except Exception:
+                        items.append({"issue": 37, "status": "historical_cleanup_pending"})
                 continue
             if self.store.has_controlled_push(row["attempt_id"]):
                 items.append({"issue": row["issue_number"], "status": "no_op_rejected_controlled_push"})

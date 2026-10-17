@@ -177,6 +177,62 @@ class AdapterTests(unittest.TestCase):
             self.assertEqual(writer.calls[0][2], ["agent-ready", "infra-blocked"])
             self.assertEqual(core.store.attempt(attempt)["phase"], "SUCCESS_NO_OP")
 
+    def test_historical_dayspark37_postsuccess_cleanup_is_scoped_and_idempotent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = init_git_repo(Path(temp) / "dayspark")
+            head = subprocess.run(["git", "-C", str(workspace), "rev-parse", "HEAD"],
+                                  capture_output=True, text=True, check=True).stdout.strip()
+            api = FakeAPI()
+            api.issue.update(labels=[{"name": name} for name in ("infra-blocked", "frozen-spec")])
+            api.issue["body"] = "Frozen historical Issue"
+
+            writer = MutatingWriter(api)
+            workflow = GitHubWorkflowAdapter(api, writer, MANIFEST)
+            core = RuntimeCore(Path(temp) / "runtime.sqlite", MANIFEST, workflow,
+                               SimpleNamespace(workspace=str(workspace)))
+            attempt = "8dc7fdbc-39c2-4fc1-9193-aab3d060f2a0"
+            connection = core.store.transaction()
+            try:
+                connection.execute(
+                    "INSERT INTO attempts(attempt_id,repo,issue_number,owner_id,lease_token,kind,phase,"
+                    "launch_outcome,execution_id,implementer_provider,created_at,updated_at) "
+                    "VALUES(?, 'liuchangchxy/dayspark',37,'operator','', 'initial_dispatch',"
+                    "'TERMINAL_UNRESOLVED','confirmed','c6d4791b-419b-4800-a83d-f229761a8dab',"
+                    "'antigravity',1,1)", (attempt,))
+                connection.commit()
+            finally:
+                connection.close()
+
+            evidence_reference = "archive://historical-vcbs-report"
+            evidence_digest = "a" * 64
+            self.assertEqual(core.recover_historical_dayspark37(
+                "liuchangchxy/dayspark", attempt, head, evidence_reference, evidence_digest)["status"],
+                "receipt_recorded")
+            self.assertTrue(core.store.begin_historical_closeout(
+                attempt, head, evidence_reference, evidence_digest, now=2))
+            self.assertTrue(core.store.success_noop_recovery(attempt, now=3))
+            api.issue["state"] = "closed"
+            api.issue["labels"] = [{"name": name} for name in
+                                    ("infra-blocked", "agent-working", "frozen-spec")]
+            self.assertEqual(api.issue["state"], "closed")
+            self.assertEqual(core.store.attempt(attempt)["phase"], "SUCCESS_NO_OP")
+            self.assertEqual(core.store.receipt(attempt)["source"], "operator_recovery")
+            intent = core.store.historical_closeout_intent(attempt)
+            self.assertEqual(intent["evidence_reference"], evidence_reference)
+            self.assertEqual(intent["evidence_digest"], evidence_digest)
+            self.assertEqual({item["name"] for item in api.issue["labels"]},
+                             {"infra-blocked", "agent-working", "frozen-spec"})
+
+            core.reconcile_no_change("liuchangchxy/dayspark")
+            self.assertEqual(api.issue["state"], "closed")
+            self.assertEqual({item["name"] for item in api.issue["labels"]}, {"frozen-spec"})
+            self.assertEqual(core.store.attempt(attempt)["phase"], "SUCCESS_NO_OP")
+
+            core.reconcile_no_change("liuchangchxy/dayspark")
+            self.assertEqual(api.issue["state"], "closed")
+            self.assertEqual({item["name"] for item in api.issue["labels"]}, {"frozen-spec"})
+            self.assertEqual(core.store.attempt(attempt)["phase"], "SUCCESS_NO_OP")
+
     def test_historical_recovery_operator_cli_invokes_fixed_runtime_operation(self):
         calls = []
         class Lock:
