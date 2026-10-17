@@ -770,6 +770,9 @@ test("status recognizes an uninstalled Consumer as NEEDS_ACTION", async () => {
     assert.equal(code, 2);
     const report = JSON.parse(output);
     assert.equal(report.desired_revision, null);
+    assert.equal(report.repository_status, "not_installed");
+    assert.equal(report.repository_audit.overall_status, "not_installed");
+    assert.equal(report.host_runner.status, "not_installed");
     assert.equal(report.overall_status, "NEEDS_ACTION");
   });
 });

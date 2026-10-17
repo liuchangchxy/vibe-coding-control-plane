@@ -1,14 +1,135 @@
 import plistlib
 import hashlib
+from contextlib import closing
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from vccp_runtime.host_deployment import reconcile_macos_launch_agent
+from vccp_runtime.host_deployment import reconcile_macos_launch_agent, remove_macos_launch_agent
 
 
 class HostDeploymentTests(unittest.TestCase):
+    def test_remove_stops_verified_consumer_then_removes_its_launcher(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            database = root / "state.sqlite"
+            plist = root / "runner.plist"
+            plist.write_bytes(plistlib.dumps({"Label": "com.vccp.consumer-dispatcher",
+                "ProgramArguments": ["python", "-m", "vccp_runtime.runner", "--runtime-config",
+                    str((root / "runtime.json").resolve()), "--repo", "owner/consumer"]}))
+            calls = []
+            printed = iter(["state = running\npid = 41", ""])
+            ps_checks = iter([SimpleNamespace(returncode=0, stdout="python -m vccp_runtime.runner"),
+                              SimpleNamespace(returncode=1, stdout="")])
+            def command(args, **kwargs):
+                calls.append(args)
+                if args[:2] == ["launchctl", "print"]:
+                    value = next(printed)
+                    return SimpleNamespace(returncode=0 if "pid =" in value else 1, stdout=value,
+                        stderr="" if "pid =" in value else "Could not find service")
+                if args[:2] == ["ps", "-p"]:
+                    return next(ps_checks)
+                return SimpleNamespace(returncode=0, stdout="")
+            result = remove_macos_launch_agent(repo="owner/consumer", database_path=str(database),
+                runtime_config_path=str(root / "runtime.json"),
+                label="com.vccp.consumer-dispatcher", plist_path=str(plist), user_id="501", runner=command)
+            self.assertEqual(result["status"], "removed", result)
+            self.assertTrue(result["runtime_lock_released"])
+            self.assertFalse(plist.exists())
+            self.assertIn(["launchctl", "bootout", "gui/501/com.vccp.consumer-dispatcher"], calls)
+
+    def test_remove_blocks_on_active_implementer_or_reviewer_execution(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            database = root / "state.sqlite"
+            import sqlite3
+            with closing(sqlite3.connect(database)) as connection:
+                connection.execute("CREATE TABLE attempts(repo TEXT, phase TEXT, closeout_pending INTEGER)")
+                connection.execute("INSERT INTO attempts VALUES('owner/consumer', 'PR_BOUND', 0)")
+                connection.commit()
+            result = remove_macos_launch_agent(repo="owner/consumer", database_path=str(database),
+                runtime_config_path=str(Path(root) / "runtime.json"),
+                label="com.vccp.consumer-dispatcher", plist_path=str(root / "missing.plist"),
+                user_id="501", runner=lambda *_args, **_kwargs: self.fail("must block before host mutation"))
+            self.assertEqual(result["status"], "blocked")
+            self.assertIn("active Consumer execution", result["reason"])
+
+    def test_remove_blocks_on_active_reviewer(self):
+        with tempfile.TemporaryDirectory() as root:
+            database = Path(root) / "state.sqlite"
+            import sqlite3
+            with closing(sqlite3.connect(database)) as connection:
+                connection.execute("CREATE TABLE reviewer_executions(repo TEXT, state TEXT)")
+                connection.execute("INSERT INTO reviewer_executions VALUES('owner/consumer', 'RUNNING')")
+                connection.commit()
+            result = remove_macos_launch_agent(repo="owner/consumer", database_path=str(database),
+                runtime_config_path=str(Path(root) / "runtime.json"),
+                label="com.vccp.consumer-dispatcher", plist_path=str(Path(root) / "missing.plist"),
+                user_id="501", runner=lambda *_args, **_kwargs: self.fail("must block before host mutation"))
+            self.assertEqual(result["status"], "blocked")
+            self.assertIn("Local Reviewer", result["reason"])
+
+    def test_remove_of_already_absent_launcher_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as root:
+            calls = []
+            result = remove_macos_launch_agent(repo="owner/consumer", database_path=str(Path(root) / "state.sqlite"),
+                runtime_config_path=str(Path(root) / "runtime.json"),
+                label="com.vccp.consumer-dispatcher", plist_path=str(Path(root) / "missing.plist"),
+                user_id="501", runner=lambda command, **_kwargs: calls.append(command) or SimpleNamespace(returncode=1, stdout="", stderr="Could not find service"))
+            self.assertEqual(result["status"], "already_removed")
+            self.assertTrue(result["runtime_lock_released"])
+            self.assertFalse(any("bootout" in call for call in calls))
+
+    def test_remove_refuses_symlink_launcher(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            target = root / "user-job.plist"
+            target.write_bytes(plistlib.dumps({"Label": "user.job"}))
+            alias = root / "com.vccp.consumer-dispatcher.plist"
+            alias.symlink_to(target)
+            result = remove_macos_launch_agent(repo="owner/consumer", database_path=str(root / "state.sqlite"),
+                runtime_config_path=str(root / "runtime.json"), label="com.vccp.consumer-dispatcher",
+                plist_path=str(alias), user_id="501",
+                runner=lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stdout="", stderr="Could not find service"))
+            self.assertEqual(result["status"], "blocked")
+            self.assertTrue(alias.is_symlink())
+            self.assertTrue(target.exists())
+
+    def test_remove_rechecks_active_work_after_runner_stop_before_deleting_launcher(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            database = root / "state.sqlite"
+            import sqlite3
+            with closing(sqlite3.connect(database)) as connection:
+                connection.execute("CREATE TABLE attempts(repo TEXT, phase TEXT, closeout_pending INTEGER)")
+                connection.commit()
+            plist = root / "runner.plist"
+            plist.write_bytes(plistlib.dumps({"Label": "com.vccp.consumer-dispatcher",
+                "ProgramArguments": ["python", "-m", "vccp_runtime.runner", "--runtime-config",
+                    str((root / "runtime.json").resolve()), "--repo", "owner/consumer"]}))
+            printed = iter(["pid = 42", ""])
+            ps_checks = iter([SimpleNamespace(returncode=0, stdout="python -m vccp_runtime.runner"),
+                              SimpleNamespace(returncode=1, stdout="")])
+            def command(args, **kwargs):
+                if args[:2] == ["launchctl", "print"]:
+                    value = next(printed)
+                    return SimpleNamespace(returncode=0 if "pid =" in value else 1, stdout=value,
+                        stderr="" if "pid =" in value else "Could not find service")
+                if args[:2] == ["ps", "-p"]:
+                    return next(ps_checks)
+                if args[:2] == ["launchctl", "bootout"]:
+                    with closing(sqlite3.connect(database)) as connection:
+                        connection.execute("INSERT INTO attempts VALUES('owner/consumer', 'PR_BOUND', 0)")
+                        connection.commit()
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            result = remove_macos_launch_agent(repo="owner/consumer", database_path=str(database),
+                runtime_config_path=str(root / "runtime.json"), label="com.vccp.consumer-dispatcher",
+                plist_path=str(plist), user_id="501", runner=command)
+            self.assertEqual(result["status"], "blocked")
+            self.assertIn("active Consumer execution", result["reason"])
+            self.assertTrue(plist.exists())
+
     def test_aligned_running_agent_is_noop_without_restart(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
