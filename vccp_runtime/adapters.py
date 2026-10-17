@@ -559,6 +559,69 @@ class _GuardedProvider:
         return json.dumps({"head": head, "status": status}, sort_keys=True)
 
 
+def _discover_antigravity_agentapi_environment(executable: str) -> dict[str, str] | None:
+    """Find the active macOS Antigravity LS endpoint without persisting its CSRF token."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        processes = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True,
+                                   text=True, check=False, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if processes.returncode != 0:
+        return None
+
+    contexts = set()
+    for line in processes.stdout.splitlines():
+        try:
+            pid, command = line.strip().split(None, 1)
+            arguments = shlex.split(command)
+        except (ValueError, shlex.Error):
+            continue
+        if (not arguments or arguments[0] != executable or "--standalone" not in arguments
+                or "--override_ide_name" not in arguments):
+            continue
+        ide_index = arguments.index("--override_ide_name")
+        if ide_index + 1 >= len(arguments) or arguments[ide_index + 1] != "antigravity":
+            continue
+        csrf_token = None
+        for index, argument in enumerate(arguments):
+            if argument.startswith("--csrf_token="):
+                csrf_token = argument.partition("=")[2]
+                break
+            if argument == "--csrf_token" and index + 1 < len(arguments):
+                csrf_token = arguments[index + 1]
+                break
+        if not csrf_token:
+            continue
+        try:
+            listeners = subprocess.run(
+                ["lsof", "-nP", "-a", "-p", pid, "-iTCP", "-sTCP:LISTEN"],
+                capture_output=True, text=True, check=False, timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if listeners.returncode != 0:
+            continue
+        ports = set(re.findall(r"TCP\s+127\.0\.0\.1:(\d+)\s+\(LISTEN\)", listeners.stdout))
+        for port in ports:
+            address = f"127.0.0.1:{port}"
+            try:
+                with urlopen(Request(f"http://{address}/healthz"), timeout=2) as response:
+                    health = json.loads(response.read().decode("utf-8"))
+            except Exception:
+                continue
+            if getattr(response, "status", 0) == 200 and isinstance(health, dict) \
+                    and health.get("status") == "ok":
+                contexts.add((address, csrf_token))
+
+    # Multiple live Antigravity instances are ambiguous; do not choose one by process order.
+    if len(contexts) != 1:
+        return None
+    address, csrf_token = next(iter(contexts))
+    return {"ANTIGRAVITY_LS_ADDRESS": address, "ANTIGRAVITY_CSRF_TOKEN": csrf_token}
+
+
 class AntiGravityImplementer(_GuardedProvider):
     def __init__(self, executable: str, workspace: str, app_gh: str, app_git_push: str,
                  runner: Callable = subprocess.run, timeout: int = 60, environ=None, write_guard=None,
@@ -608,6 +671,12 @@ class AntiGravityImplementer(_GuardedProvider):
                 env.pop(key)
         for key in ("ANTIGRAVITY_CONVERSATION_ID", "ANTIGRAVITY_SOURCE_METADATA", "ANTIGRAVITY_TRAJECTORY_ID"):
             env.pop(key, None)
+        if (sys.platform == "darwin" and Path(self.executable).is_file()
+                and (not env.get("ANTIGRAVITY_LS_ADDRESS") or not env.get("ANTIGRAVITY_CSRF_TOKEN"))):
+            context = _discover_antigravity_agentapi_environment(self.executable)
+            if context is None:
+                return LaunchResult(LaunchDisposition.DEFINITELY_NOT_STARTED)
+            env.update(context)
         project_id = self._resolve_project_id()
         if project_id:
             env["ANTIGRAVITY_PROJECT_ID"] = project_id
