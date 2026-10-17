@@ -259,6 +259,18 @@ class _Store:
                     expected_head TEXT NOT NULL,
                     created_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS reviewer_executions (
+                    repo TEXT NOT NULL,
+                    pr_number INTEGER NOT NULL,
+                    head_sha TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    execution_id TEXT,
+                    state TEXT NOT NULL,
+                    started_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    outcome TEXT,
+                    PRIMARY KEY (repo, pr_number, head_sha)
+                );
                 CREATE INDEX IF NOT EXISTS attempts_flow_idx
                     ON attempts(repo, issue_number, kind, repair_ordinal);
                 """
@@ -962,6 +974,52 @@ class _Store:
             row = connection.execute("SELECT * FROM lifecycle WHERE repo=? AND issue_number=?",
                                      (_repo_key(repo), issue)).fetchone()
             return dict(row) if row else None
+
+    def reviewer_execution(self, repo: str, pr_number: int, head_sha: str):
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM reviewer_executions WHERE repo=? AND pr_number=? AND head_sha=?",
+                (_repo_key(repo), pr_number, head_sha.casefold()),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def claim_reviewer_execution(self, repo: str, pr_number: int, head_sha: str,
+                                 provider: str, now: float | None = None):
+        """Reserve one Reviewer launch per exact PR head before invoking an Agent."""
+        timestamp = time.time() if now is None else float(now)
+        connection = self.transaction()
+        try:
+            cursor = connection.execute(
+                "INSERT OR IGNORE INTO reviewer_executions"
+                "(repo,pr_number,head_sha,provider,execution_id,state,started_at,updated_at,outcome)"
+                " VALUES(?,?,?,?,NULL,'STARTING',?,?,NULL)",
+                (_repo_key(repo), pr_number, head_sha.casefold(), provider, timestamp, timestamp),
+            )
+            row = connection.execute(
+                "SELECT * FROM reviewer_executions WHERE repo=? AND pr_number=? AND head_sha=?",
+                (_repo_key(repo), pr_number, head_sha.casefold()),
+            ).fetchone()
+            connection.commit()
+            return dict(row), cursor.rowcount == 1
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def update_reviewer_execution(self, repo: str, pr_number: int, head_sha: str,
+                                  state: str, execution_id: str | None = None,
+                                  outcome: str | None = None, now: float | None = None):
+        if state not in {"STARTING", "RUNNING", "COMPLETED", "FAILED", "DECIDED"}:
+            raise ValueError("invalid Reviewer execution state")
+        timestamp = time.time() if now is None else float(now)
+        with closing(self._connect()) as connection:
+            cursor = connection.execute(
+                "UPDATE reviewer_executions SET state=?, execution_id=COALESCE(?,execution_id),"
+                " outcome=?, updated_at=? WHERE repo=? AND pr_number=? AND head_sha=?",
+                (state, execution_id, outcome, timestamp, _repo_key(repo), pr_number, head_sha.casefold()),
+            )
+            return cursor.rowcount == 1
 
     def set_lifecycle(self, repo: str, issue: int, phase: str, head_sha: str, now: float,
                       timeout: float, outcome: str | None = None):

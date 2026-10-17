@@ -166,5 +166,15 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual(result["status"], "not_ready")
         self.assertTrue(any("credential_source must identify" in item for item in result["blockers"]))
 
+    def test_readiness_only_requires_the_explicitly_selected_implementer(self):
+        config = dict(self.config, providers=[
+            {"key": "antigravity", "type": "antigravity", "executable": str(self.executable)},
+            {"key": "claude_code", "type": "claude_code", "executable": str(self.root / "missing-claude")},
+        ], implementer_provider="antigravity")
+
+        result = self._qualify(config=config)
+
+        self.assertEqual(result["status"], "ready")
+
 
 if __name__ == "__main__": unittest.main()

@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 
-from .adapters import (GitHubAPI, GitHubAppWriter, _PROVIDER_ADAPTERS, _configured_providers,
+from .adapters import (GitHubAPI, GitHubAppWriter, _PROVIDER_ADAPTERS, _configured_providers_for_role,
                        _make_credential_provider, _workspace_repository, build_runtime)
 from .core import RuntimeConfig
 from .github_app import (DPAPIFileCredentialSource, GitHubAppError,
@@ -71,7 +71,7 @@ def qualify_activation(manifest: dict, local_config: dict, repo: str, environ=No
         blockers.append("workspace origin does not match the consumer repository")
 
     try:
-        providers = _configured_providers(local_config)
+        providers = _configured_providers_for_role(local_config, "implementer")
     except ValueError as error:
         providers = []
         blockers.append(f"machine-local providers: {error}")
@@ -85,6 +85,26 @@ def qualify_activation(manifest: dict, local_config: dict, repo: str, environ=No
             blockers.append(f"{provider_type} provider requires a configured executable")
         elif not Path(executable).expanduser().is_file():
             blockers.append(f"required executable is unavailable: {provider_type}")
+
+    try:
+        reviewer_settings = _configured_providers_for_role(local_config, "reviewer")
+    except ValueError as error:
+        reviewer_settings = []
+        blockers.append(f"machine-local Reviewer provider: {error}")
+    if reviewer_settings:
+        identity = local_config.get("reviewer_github_identity")
+        if not isinstance(identity, str) or not identity.strip():
+            blockers.append("reviewer_github_identity is required for a local Reviewer binding")
+        for settings in reviewer_settings:
+            provider_type, executable = settings.get("type"), settings.get("executable")
+            if provider_type not in _PROVIDER_ADAPTERS:
+                blockers.append(f"unsupported local Reviewer provider type: {provider_type}")
+            elif not isinstance(executable, str) or not Path(executable).expanduser().is_file():
+                blockers.append(f"required Reviewer executable is unavailable: {provider_type}")
+        project_root = local_config.get("project_config_root")
+        if any(item.get("type") == "antigravity" for item in reviewer_settings) \
+                and project_root and not Path(project_root).expanduser().is_dir():
+            blockers.append("configured AntiGravity project config root is unavailable")
 
     database_path = Path(local_config["database_path"]).expanduser()
     database_parent = database_path.parent
@@ -162,6 +182,11 @@ def qualify_activation(manifest: dict, local_config: dict, repo: str, environ=No
                 raise ValueError("runtime component construction was incomplete")
         with RuntimeLock(repo, str(database_path)):
             pass
+        if reviewer_settings:
+            from .local_reviewer import GitHubUserReviewerProvider
+            reviewer_identity = local_config["reviewer_github_identity"]
+            identity_status = GitHubUserReviewerProvider(
+                target_repo, reviewer_identity).verify_identity()
     except GitHubAppNotInstalled as error:
         return {"status": "not_ready", "blockers": [str(error)], "installation": {"installed": False}}
     except GitHubAppPermissionError as error:
@@ -177,7 +202,9 @@ def qualify_activation(manifest: dict, local_config: dict, repo: str, environ=No
             "installation": {"installed": True, "permissions_sufficient": True,
                              "missing_permissions": []},
             "repository_read": "passed", "writer_constructed": True,
-            "push_backend_constructed": True}
+            "push_backend_constructed": True,
+            "reviewer_identity": ({"login": identity_status["login"], "verified": True}
+                                  if reviewer_settings else None)}
 
 
 def main() -> int:

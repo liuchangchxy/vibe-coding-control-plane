@@ -750,6 +750,31 @@ class AdapterTests(unittest.TestCase):
             self.assertEqual(len(launches), 1)
             with self.assertRaises(ValueError): build_runtime({"schema_version": 1}, local, api, FakeWriter(), runner)
 
+    def test_runtime_wires_explicit_independent_local_reviewer_provider(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = init_git_repo(Path(temp) / "repo")
+            subprocess.run(["git", "-C", str(workspace), "remote", "add", "origin",
+                            "https://github.com/o/r.git"], check=True, capture_output=True)
+            local = {
+                "database_path": str(Path(temp) / "runtime.sqlite"), "workspace": str(workspace),
+                "owner_id": "owner", "target_repository": "o/r",
+                "github_app": {"app_id": "1", "credential_source": {"type": "test"}},
+                "providers": [
+                    {"key": "antigravity", "type": "antigravity", "executable": "language_server"},
+                    {"key": "claude_code", "type": "claude_code", "executable": "claude"},
+                ],
+                "implementer_provider": "claude_code", "reviewer_provider": "antigravity",
+                "reviewer_github_identity": "liuchangchxy",
+            }
+            class CredentialProvider:
+                api_url = "https://api.github.com"
+            wired = build_runtime(MANIFEST, local, api=FakeAPI(), writer=FakeWriter(),
+                                  credential_provider=CredentialProvider(), push_backend=object())
+
+            self.assertEqual(wired.router.primary, "claude_code")
+            self.assertEqual(wired.local_reviewer.provider_key, "antigravity")
+            self.assertIs(wired.lifecycle.local_reviewer, wired.local_reviewer)
+
     def test_generic_app_runtime_needs_no_prebuilt_helpers_and_generates_attempt_wrappers(self):
         with tempfile.TemporaryDirectory() as temp:
             api = FakeAPI()

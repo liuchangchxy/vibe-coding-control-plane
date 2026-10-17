@@ -999,6 +999,7 @@ class RuntimeAdapters:
     lifecycle: object
     credential_provider: GitHubAppCredentialProvider | None = None
     push_backend: object | None = None
+    local_reviewer: object | None = None
 
 
 def _workspace_repository(workspace: str, api_url: str) -> str:
@@ -1062,6 +1063,27 @@ def _configured_providers(local_config: dict) -> list[dict]:
         # here rather than only when the router is constructed.
         normalize_provider_key(entry.get("key"))
     return list(configured)
+
+
+def _configured_providers_for_role(local_config: dict, role: str) -> list[dict]:
+    """Return the configured provider set for one machine-local role.
+
+    New deployments bind ``implementer_provider`` explicitly and get one provider,
+    which makes runtime fallback impossible. Configurations without a role binding
+    retain the pre-existing ordered fallback behavior for compatibility.
+    """
+    if role not in {"implementer", "reviewer"}:
+        raise ValueError("provider role must be implementer or reviewer")
+    binding = local_config.get(f"{role}_provider")
+    if binding is None:
+        return _configured_providers(local_config) if role == "implementer" else []
+    if not isinstance(binding, str) or not binding.strip():
+        raise ValueError(f"{role}_provider must name a configured provider")
+    providers = _configured_providers(local_config)
+    selected = [entry for entry in providers if entry.get("key") == binding]
+    if len(selected) != 1:
+        raise ValueError(f"{role}_provider does not name a configured provider")
+    return selected
 
 
 def _antigravity_provider(settings: dict, manifest: dict, workspace: str, app_gh, app_git_push,
@@ -1152,13 +1174,45 @@ def build_runtime(manifest: dict, local_config: dict, api=None, writer=None,
     router = ProviderRouter(
         (settings.get("key"), _provider_adapter(settings, manifest, workspace, app_gh,
                                                 app_git_push, runner, runtime_context))
-        for settings in _configured_providers(local_config)
+        for settings in _configured_providers_for_role(local_config, "implementer")
     )
     core = RuntimeCore(local_config["database_path"], manifest, workflow, router,
                        recovery_timeout_seconds=local_config.get("recovery_timeout_seconds", 900),
                        implementer_progress_timeout_seconds=local_config.get(
                            "implementer_progress_timeout_seconds", 1800))
     from .lifecycle import LifecycleDriver
-    lifecycle = LifecycleDriver(core, manifest, local_config.get("lifecycle_timeouts", {}))
+    local_reviewer = None
+    reviewer_settings = _configured_providers_for_role(local_config, "reviewer")
+    if reviewer_settings:
+        from .local_reviewer import GitHubUserReviewerProvider, LocalReviewerDriver, LocalReviewerWriter
+        from .reviewer_agents import AntigravityReviewer, ClaudeCodeReviewer
+        identity = local_config.get("reviewer_github_identity")
+        if not isinstance(identity, str) or not identity.strip():
+            raise ValueError("explicit local Reviewer binding requires reviewer_github_identity")
+        target_repo = target_repo if app_configured else _workspace_repository(
+            workspace, getattr(api, "api_url", "https://api.github.com"))
+        settings = reviewer_settings[0]
+        reviewer_factory = {
+            ANTIGRAVITY_PROVIDER: AntigravityReviewer,
+            CLAUDE_CODE_PROVIDER: ClaudeCodeReviewer,
+        }.get(settings.get("type"))
+        if reviewer_factory is None:
+            raise ValueError("unsupported local Reviewer provider type")
+        review_root = local_config.get("review_workspace_root") or str(
+            Path(local_config["database_path"]).expanduser().resolve().parent / "review-workspaces")
+        reviewer_agent = reviewer_factory(
+            settings.get("executable"), api, manifest, workspace, review_root,
+            settings.get("project_config_root"),
+        ) if settings.get("type") == ANTIGRAVITY_PROVIDER else reviewer_factory(
+            settings.get("executable"), api, manifest, workspace, review_root,
+            local_config.get("claude_config_root"),
+        )
+        user_provider = GitHubUserReviewerProvider(target_repo, identity)
+        reviewer_writer = LocalReviewerWriter(user_provider, workflow, target_repo, identity, manifest)
+        local_reviewer = LocalReviewerDriver(core.store, reviewer_agent, reviewer_writer,
+                                             settings["key"])
+    lifecycle = LifecycleDriver(core, manifest, local_config.get("lifecycle_timeouts", {}),
+                                local_reviewer=local_reviewer)
     return RuntimeAdapters(core, workflow, router, lifecycle,
-                           credential_provider=credential_provider, push_backend=push_backend)
+                           credential_provider=credential_provider, push_backend=push_backend,
+                           local_reviewer=local_reviewer)

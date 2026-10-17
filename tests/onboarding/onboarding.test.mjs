@@ -725,6 +725,34 @@ test("readiness succeeds when canonical repository audit and machine qualificati
   });
 });
 
+test("status provides one read-only READY view over repository audit and machine readiness", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
+    await applyOnboardingPlan({ plan, root, github });
+    const configPath = path.join(root, "runtime-config.json");
+    await writeFile(configPath, JSON.stringify(localEnrollment(root)));
+    let output = "";
+    const code = await runOnboardingCli(["status", "--repo", REPO, "--path", root, "--runtime-config", configPath], {
+      stdout: { write: (text) => { output += text; } },
+      stderr: { write: (text) => assert.fail(text) },
+      githubFactory: () => github,
+      runtimeQualifier: async () => ({ runtime_activation: { status: "ready", blockers: [] } }),
+      runtimeRevision: REV_A,
+    });
+    const report = JSON.parse(output);
+    assert.equal(code, 0);
+    assert.equal(report.command, "status");
+    assert.equal(report.overall_status, "READY");
+    assert.equal(report.repository_status, "ready");
+    assert.equal(report.machine_activation.status, "ready");
+    assert.equal(report.desired_revision, REV_A);
+    assert.equal(report.installation_lock.status, "satisfied");
+    assert.equal(report.machine_runtime.implementer_provider, null);
+    assert.ok(["launchd", "unsupported", "windows_sidecar"].includes(report.host_runner.mechanism));
+  });
+});
+
 test("CLI rejects a runtime revision mismatch before APPLY mutates files or GitHub", async () => {
   await withRepo(async (root) => {
     const github = new FakeGitHub();

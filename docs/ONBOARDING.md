@@ -98,6 +98,14 @@ Run qualification explicitly:
 node scripts/onboard-consumer.mjs readiness --repo OWNER/REPO --path /path/to/consumer --runtime-config /path/to/consumer-runtime.json
 ```
 
+For one read-only view of the repository audit, pinned revision, explicit machine provider bindings, readiness, and the native host runner, use:
+
+```sh
+node scripts/vccp.mjs status --repo OWNER/REPO --path /path/to/consumer --runtime-config /path/to/consumer-runtime.json
+```
+
+`status` reports `READY`, `NEEDS_ACTION`, or `BLOCKED`. A running-revision mismatch or missing provider binding remains visible in the component evidence and does not get repaired by this read-only command.
+
 Readiness first runs the same canonical repository AUDIT used by the `audit` command, including capability inspection, cleanup conflict detection, and managed artifact drift checks. It then independently qualifies machine authorization and activation. The report preserves all three states; machine wiring can be technically ready while the overall result remains blocked if AUDIT reports repository changes, drift, or conflict. Readiness does not APPLY the plan.
 
 Machine qualification validates explicit enrollment, matching repository identities, workspace and SQLite locations, executable and configured conversation roots, reads the protected private key, verifies App installation and permissions, mints a short-lived token, performs a harmless repository read, constructs the production writer/push/runtime graph using temporary SQLite, and tries then releases the machine process lock. It does not dispatch Issues, mutate GitHub labels, create PRs, push, start repairs, or launch AntiGravity conversations. Installation/token/read calls are read-only and never report credential material.
