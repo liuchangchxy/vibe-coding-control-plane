@@ -5,22 +5,32 @@ import { AppGitHubClient } from "../../lib/onboarding/app-github-client.mjs";
 const CONSUMER = "liuchangchxy/dayspark";
 const SOURCE = "liuchangchxy/vibe-coding-control-plane";
 
-test("public VCCP revision reads do not widen the Consumer-scoped App credential", async () => {
-  const requests = [];
+test("public VCCP revision reads use credential-free Git while Consumer access stays App-scoped", async () => {
+  const calls = [];
+  const revision = "a".repeat(40);
   const client = new AppGitHubClient({
     runtimeConfig: { github_app: {}, target_repository: CONSUMER },
-    publicFetch: async (url, options) => {
-      requests.push({ url, options });
-      return { ok: true, status: 200, json: async () => ({ name: "main", commit: { sha: "a".repeat(40) } }) };
+    publicFetch: async () => assert.fail("public reads must not depend on API rate limits"),
+    gitRunner: (command, args, options) => {
+      calls.push({ command, args, options });
+      if (args.includes("ls-remote")) {
+        return { status: 0, stdout: `${revision}\trefs/heads/main\n`, stderr: "" };
+      }
+      if (args.includes("cat-file")) return { status: 0, stdout: "", stderr: "" };
+      return { status: 1, stdout: "", stderr: "unexpected git operation" };
     },
   });
 
   const branch = await client.getBranch(SOURCE, "main");
-  const commit = await client.getCommit(SOURCE, "a".repeat(40));
+  const commit = await client.getCommit(SOURCE, revision);
 
-  assert.equal(branch.commit.sha, "a".repeat(40));
-  assert.equal(commit.commit.sha, "a".repeat(40));
-  assert.equal(requests.length, 2);
-  assert.ok(requests.every(({ url }) => url.startsWith("https://api.github.com/repos/liuchangchxy/vibe-coding-control-plane/")));
-  assert.ok(requests.every(({ options }) => !Object.keys(options.headers).some((key) => key.toLowerCase() === "authorization")));
+  assert.equal(branch.commit.sha, revision);
+  assert.equal(commit.sha, revision);
+  assert.equal(calls.length, 2);
+  assert.ok(calls.every(({ command, args }) => command === "git" && args.includes("-c")
+    && args.includes("credential.helper=")));
+  assert.ok(calls.every(({ options }) => options.env.GIT_CONFIG_NOSYSTEM === "1"
+    && options.env.GIT_CONFIG_GLOBAL === "/dev/null"));
+  assert.ok(calls.some(({ args }) => args.includes("ls-remote")));
+  assert.ok(calls.some(({ args }) => args.includes("cat-file")));
 });
