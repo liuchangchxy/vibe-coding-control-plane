@@ -16,6 +16,7 @@ test("public VCCP revision reads use credential-free Git while Consumer access s
       if (args.includes("ls-remote")) {
         return { status: 0, stdout: `${revision}\trefs/heads/main\n`, stderr: "" };
       }
+      if (args.includes("fetch")) return { status: 0, stdout: "", stderr: "" };
       if (args.includes("cat-file")) return { status: 0, stdout: "", stderr: "" };
       return { status: 1, stdout: "", stderr: "unexpected git operation" };
     },
@@ -26,11 +27,24 @@ test("public VCCP revision reads use credential-free Git while Consumer access s
 
   assert.equal(branch.commit.sha, revision);
   assert.equal(commit.sha, revision);
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 3);
   assert.ok(calls.every(({ command, args }) => command === "git" && args.includes("-c")
     && args.includes("credential.helper=")));
   assert.ok(calls.every(({ options }) => options.env.GIT_CONFIG_NOSYSTEM === "1"
     && options.env.GIT_CONFIG_GLOBAL === "/dev/null"));
   assert.ok(calls.some(({ args }) => args.includes("ls-remote")));
+  assert.ok(calls.some(({ args }) => args.includes("fetch")));
   assert.ok(calls.some(({ args }) => args.includes("cat-file")));
+});
+
+test("a locally cached commit is rejected when the public source cannot provide that revision", async () => {
+  const revision = "b".repeat(40);
+  const client = new AppGitHubClient({
+    runtimeConfig: { github_app: {}, target_repository: CONSUMER },
+    gitRunner: (_command, args) => args.includes("fetch")
+      ? { status: 1, stdout: "", stderr: "remote did not provide requested revision" }
+      : { status: 0, stdout: "", stderr: "" },
+  });
+
+  assert.equal(await client.getCommit(SOURCE, revision), null);
 });
