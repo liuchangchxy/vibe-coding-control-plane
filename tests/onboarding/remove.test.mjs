@@ -79,6 +79,8 @@ test("remove opens one maintenance PR before machine cleanup, then unregisters i
   try {
     execFileSync("git", ["init", "-q", root]);
     execFileSync("git", ["-C", root, "remote", "add", "origin", `https://github.com/${REPO}.git`]);
+    execFileSync("git", ["-C", root, "config", "user.email", "test@example.invalid"]);
+    execFileSync("git", ["-C", root, "config", "user.name", "Test"]);
     const source = stringifyManifest(manifest());
     await mkdir(path.join(root, ".github"), { recursive: true });
     await writeFile(path.join(root, ".gitignore"), "runtime.json\n");
