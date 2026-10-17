@@ -8,7 +8,7 @@ import subprocess
 import sys
 
 from .activation import qualify_activation
-from .host_deployment import reconcile_macos_launch_agent
+from .host_deployment import reconcile_macos_launch_agent, remove_macos_launch_agent
 from .runtime_checkout import ensure_runtime_checkout
 
 
@@ -53,10 +53,30 @@ def deploy_host(*, repo: str, manifest: dict, local_config: dict,
             "reason": f"unsupported resident host platform: {selected_platform}"}
 
 
+def remove_host(*, repo: str, local_config: dict, runtime_config_path: str,
+                platform: str | None = None, runner=subprocess.run) -> dict:
+    selected_platform = platform or sys.platform
+    if selected_platform == "darwin":
+        dispatcher = local_config.get("dispatcher") or {}
+        slug = repo.split("/")[-1].lower().replace("_", "-")
+        label = dispatcher.get("label", f"com.vccp.{slug}-dispatcher")
+        plist_path = dispatcher.get("plist_path", str(Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"))
+        try:
+            return remove_macos_launch_agent(repo=repo, database_path=local_config["database_path"],
+                runtime_config_path=runtime_config_path,
+                label=label, plist_path=plist_path, user_id=str(os.getuid()), runner=runner)
+        except KeyError:
+            return {"status": "blocked", "reason": "runtime config lacks the Consumer database identity required to verify RuntimeLock"}
+    if selected_platform == "win32":
+        return {"status": "blocked", "reason": "no verified Windows resident host remover is configured"}
+    return {"status": "blocked", "reason": f"unsupported resident host platform: {selected_platform}"}
+
+
 def main() -> int:
     try:
         payload = json.load(sys.stdin)
-        result = deploy_host(**payload)
+        operation = payload.pop("operation", "deploy")
+        result = remove_host(**payload) if operation == "remove" else deploy_host(**payload)
     except (KeyError, TypeError, ValueError, OSError) as error:
         result = {"status": "blocked", "reason": str(error)}
     print(json.dumps(result, ensure_ascii=False))

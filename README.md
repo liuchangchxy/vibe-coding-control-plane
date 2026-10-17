@@ -22,6 +22,8 @@ Formal `REQUEST_CHANGES` reopens work on the same PR. VCCP v2 gives one budget o
 
 Start with [consumer onboarding](docs/ONBOARDING.md). The Node CLI produces a read-only JSON PLAN, applies only explicitly safe changes from a saved plan, and audits committed consumer state. It never creates ChatGPT Work Tasks or writes branch protection.
 
+The same CLI supports `vccp deploy` and `vccp remove` for Consumer runtime lifecycle. Remove opens a deterministic maintenance PR for VCCP-owned files, then stops and unregisters only that Consumer's machine runtime after the PR is merged. It preserves GitHub history and policies, shared credentials/providers, SQLite history, and shared runtime checkouts.
+
 `vibe-coding-control-plane` is the automation/control-plane canonical source. `vibe-coding-starter` is the consumer/bootstrapper. Future projects can be connected by the starter; existing projects such as EasyExam, DaySpark, and Zhanghui onboard through migration. This repository does not depend on the starter.
 
 EasyExam is documented as reference evidence in [EASYEXAM_REFERENCE.md](docs/EASYEXAM_REFERENCE.md), not as a source of universal test commands or application-specific defaults.
