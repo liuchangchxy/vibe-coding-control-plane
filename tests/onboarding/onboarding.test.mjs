@@ -816,6 +816,26 @@ test("status blocks a running Consumer owner on a different revision", async () 
   });
 });
 
+test("status blocks a running exact-revision host whose config digest drifted", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
+    await applyOnboardingPlan({ plan, root, github });
+    const configPath = path.join(root, "runtime-config.json");
+    await writeFile(configPath, JSON.stringify(localEnrollment(root)));
+    let output = "";
+    const code = await runOnboardingCli(["status", "--repo", REPO, "--path", root, "--runtime-config", configPath], {
+      stdout: { write: (text) => { output += text; } }, stderr: { write: (text) => assert.fail(text) },
+      githubFactory: () => github, runtimeRevision: REV_A,
+      hostInspector: () => ({ status: "running", running_revision: REV_A,
+        running_checkout_clean: true, config_matches: false, pid: 1234 }),
+      runtimeQualifier: async () => ({ runtime_activation: { status: "ready", blockers: [] } }),
+    });
+    assert.equal(code, 2);
+    assert.equal(JSON.parse(output).overall_status, "BLOCKED");
+  });
+});
+
 test("deploy reuses PLAN and opens a structured maintenance PR without changing the base checkout", async () => {
   await withRepo(async (root) => {
     const github = new FakeGitHub();
