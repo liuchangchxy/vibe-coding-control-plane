@@ -21,7 +21,6 @@ class Workflow:
         self.closes = 0
         self.clears = 0
         self.closeout_intent_at_close = None
-        self.historical_closeout_intent_at_close = None
         self.store = None
 
     def observe(self, repo, issue):
@@ -39,13 +38,6 @@ class Workflow:
 
     def clear_active_coordination_labels(self, repo, issue):
         self.clears += 1
-        return True
-
-    def close_historical_dayspark37_noop(self, repo, issue):
-        self.historical_closeout_intent_at_close = self.store.historical_closeout_intent(
-            self.historical_attempt_id)
-        self.snapshot = replace(self.snapshot, issue_open=False, coordination_state="invalid",
-                                terminal_labels=(), active_labels=())
         return True
 
     def discover_active(self, repo):
@@ -80,37 +72,6 @@ class NoOpCompletionTests(unittest.TestCase):
 
     def receipt(self, **kwargs):
         return self.core.store.record_completion(self.attempt, "antigravity", "execution-1", "{}", **kwargs)
-
-    def prepare_historical_recovery(self):
-        attempt = "8dc7fdbc-39c2-4fc1-9193-aab3d060f2a0"
-        execution = "c6d4791b-419b-4800-a83d-f229761a8dab"
-        connection = self.core.store.transaction()
-        try:
-            connection.execute("INSERT INTO attempts(attempt_id,repo,issue_number,owner_id,lease_token,kind,phase,"
-                               "launch_outcome,execution_id,implementer_provider,created_at,updated_at) "
-                               "VALUES(?, 'liuchangchxy/dayspark',37,'worker','', 'initial_dispatch',"
-                               "'TERMINAL_UNRESOLVED','confirmed',?,'antigravity',1,1)", (attempt,execution))
-            connection.commit()
-        finally:
-            connection.close()
-        workspace = Path(self.temp.name) / "historical"
-        workspace.mkdir()
-        subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
-        subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=workspace, check=True)
-        subprocess.run(["git", "config", "user.name", "Test"], cwd=workspace, check=True)
-        (workspace / "tracked.txt").write_text("historical")
-        subprocess.run(["git", "add", "tracked.txt"], cwd=workspace, check=True)
-        subprocess.run(["git", "commit", "-qm", "historical"], cwd=workspace, check=True)
-        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=workspace, check=True,
-                              capture_output=True, text=True).stdout.strip()
-        self.core.workspace_path = str(workspace)
-        self.workflow.historical_attempt_id = attempt
-        self.workflow.snapshot = WorkflowSnapshot("liuchangchxy/dayspark", 37, "r1", True,
-            "infra-blocked", True, terminal_labels=("infra-blocked",))
-        result = self.core.recover_historical_dayspark37(
-            "liuchangchxy/dayspark", attempt, head, "archive://evidence", "a" * 64)
-        self.assertEqual(result["status"], "receipt_recorded")
-        return attempt, head
 
     def test_authorized_noop_completes_once_and_survives_restart(self):
         self.assertTrue(self.receipt())
@@ -187,40 +148,6 @@ class NoOpCompletionTests(unittest.TestCase):
         (workspace / "tracked.txt").write_text("changed")
         self.assertTrue(self.receipt())
         self.assertEqual(self.core.reconcile_no_change("acme/repo")["items"][0]["status"], "workspace_mutated")
-
-    def test_historical_recovery_is_exact_and_records_evidence_before_closeout(self):
-        attempt, head = self.prepare_historical_recovery()
-        self.assertEqual(self.core.recover_historical_dayspark37("wrong/repo", attempt, head, "evidence", "a"*64)["status"],
-                         "invalid_historical_recovery_request")
-        self.assertEqual(self.core.store.receipt(attempt)["source"], "operator_recovery")
-        self.assertEqual(self.core.store.attempt(attempt)["phase"], "TERMINAL_UNRESOLVED")
-
-    def test_historical_close_then_crash_recovers_from_evidence_bound_intent(self):
-        attempt, _ = self.prepare_historical_recovery()
-        with mock.patch.object(self.core.store, "success_noop_recovery",
-                               side_effect=RuntimeError("simulated crash")):
-            self.core.reconcile_no_change("liuchangchxy/dayspark")
-        intent = self.workflow.historical_closeout_intent_at_close
-        self.assertEqual(intent["evidence_reference"], "archive://evidence")
-        self.assertEqual(intent["evidence_digest"], "a" * 64)
-        self.assertEqual(self.workflow.snapshot.issue_open, False)
-        self.assertEqual(self.core.store.attempt(attempt)["phase"], "TERMINAL_UNRESOLVED")
-        implementer = Implementer()
-        implementer.workspace = self.core.workspace_path
-        restarted = RuntimeCore(self.db, MANIFEST, self.workflow, implementer)
-        result = restarted.reconcile_no_change("liuchangchxy/dayspark")
-        self.assertEqual(result["items"][0]["status"], "success_no_op")
-        self.assertEqual(restarted.store.attempt(attempt)["phase"], "SUCCESS_NO_OP")
-
-    def test_historical_external_close_without_intent_does_not_succeed(self):
-        attempt, _ = self.prepare_historical_recovery()
-        self.workflow.snapshot = replace(self.workflow.snapshot, issue_open=False,
-                                          coordination_state="invalid", terminal_labels=())
-        result = self.core.reconcile_no_change("liuchangchxy/dayspark")
-        self.assertEqual(result["items"][0]["status"], "historical_recovery_deferred")
-        self.assertIsNone(self.core.store.historical_closeout_intent(attempt))
-        self.assertEqual(self.core.store.attempt(attempt)["phase"], "TERMINAL_UNRESOLVED")
-
 
 if __name__ == "__main__":
     unittest.main()

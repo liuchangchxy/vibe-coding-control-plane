@@ -728,7 +728,7 @@ test("readiness succeeds when canonical repository audit and machine qualificati
   });
 });
 
-test("status provides one read-only READY view over repository audit and machine readiness", async () => {
+test("status reports NEEDS_ACTION until the qualified Runner is actually running", async () => {
   await withRepo(async (root) => {
     const github = new FakeGitHub();
     const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
@@ -744,15 +744,33 @@ test("status provides one read-only READY view over repository audit and machine
       runtimeRevision: REV_A,
     });
     const report = JSON.parse(output);
-    assert.equal(code, 0);
+    assert.equal(code, 2);
     assert.equal(report.command, "status");
-    assert.equal(report.overall_status, "READY_TO_START");
+    assert.equal(report.overall_status, "NEEDS_ACTION");
     assert.equal(report.repository_status, "ready");
     assert.equal(report.machine_activation.status, "ready");
     assert.equal(report.desired_revision, REV_A);
     assert.equal(report.installation_lock.status, "satisfied");
     assert.equal(report.machine_runtime.implementer_provider, null);
     assert.ok(["launchd", "unsupported", "windows_sidecar"].includes(report.host_runner.mechanism));
+  });
+});
+
+test("status recognizes an uninstalled Consumer as NEEDS_ACTION", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const configPath = path.join(root, "runtime-config.json");
+    await writeFile(configPath, JSON.stringify(localEnrollment(root)));
+    let output = "";
+    const code = await runOnboardingCli(["status", "--repo", REPO, "--path", root,
+      "--runtime-config", configPath], {
+      stdout: { write: (text) => { output += text; } }, stderr: { write: (text) => assert.fail(text) },
+      githubFactory: () => github, hostInspector: () => ({ status: "not_installed" }),
+    });
+    assert.equal(code, 2);
+    const report = JSON.parse(output);
+    assert.equal(report.desired_revision, null);
+    assert.equal(report.overall_status, "NEEDS_ACTION");
   });
 });
 
@@ -773,9 +791,28 @@ test("status trusts only an exact running clean host and avoids a lock-conflicti
     });
     const report = JSON.parse(output);
     assert.equal(code, 0);
-    assert.equal(report.overall_status, "RUNNING");
+    assert.equal(report.overall_status, "READY");
     assert.equal(report.host_runner.pid, 1234);
     assert.equal(report.machine_activation.source, "verified_running_runtime");
+  });
+});
+
+test("status blocks a running Consumer owner on a different revision", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
+    await applyOnboardingPlan({ plan, root, github });
+    const configPath = path.join(root, "runtime-config.json");
+    await writeFile(configPath, JSON.stringify(localEnrollment(root)));
+    let output = "";
+    const code = await runOnboardingCli(["status", "--repo", REPO, "--path", root, "--runtime-config", configPath], {
+      stdout: { write: (text) => { output += text; } }, stderr: { write: (text) => assert.fail(text) },
+      githubFactory: () => github, runtimeRevision: REV_A,
+      hostInspector: () => ({ status: "running", running_revision: REV_B,
+        running_checkout_clean: true, config_matches: false, pid: 1234 }),
+    });
+    assert.equal(code, 2);
+    assert.equal(JSON.parse(output).overall_status, "BLOCKED");
   });
 });
 
@@ -803,7 +840,34 @@ test("deploy reuses PLAN and opens a structured maintenance PR without changing 
   });
 });
 
-test("deploy binds configured providers once then delegates the ready repository to host reconciliation", async () => {
+test("deploy requires explicit first-time provider bindings and does not mutate machine config", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
+    await applyOnboardingPlan({ plan, root, github });
+    const configPath = path.join(root, "runtime.json");
+    const initial = { ...localEnrollment(root), providers: [
+      { key: "antigravity", type: "antigravity", executable: "/bin/true" },
+      { key: "claude_code", type: "claude_code", executable: "/bin/true" },
+    ] };
+    await writeFile(configPath, JSON.stringify(initial));
+    let output = "";
+    const code = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root,
+      "--runtime-config", configPath, "--propose-revision", REV_A], {
+      stdout: { write: (text) => { output += text; } },
+      stderr: { write: (text) => assert.fail(text) }, githubFactory: () => github,
+      runtimeRevision: REV_A,
+      hostDeployer: async () => assert.fail("must not start a guessed provider"),
+    });
+    const report = JSON.parse(output);
+    assert.equal(code, 2);
+    assert.equal(report.next_action.type, "bind_local_agent_providers");
+    assert.match(report.next_action.detail, /explicitly select.*implementer.*reviewer/i);
+    assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), initial);
+  });
+});
+
+test("deploy binds explicitly selected providers once then delegates the ready repository to host reconciliation", async () => {
   await withRepo(async (root) => {
     const github = new FakeGitHub();
     const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
@@ -817,7 +881,9 @@ test("deploy binds configured providers once then delegates the ready repository
     let deployed;
     let output = "";
     const code = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root,
-      "--runtime-config", configPath, "--propose-revision", REV_A, "--reviewer-identity", "reviewer-user"], {
+      "--runtime-config", configPath, "--propose-revision", REV_A,
+      "--implementer-provider", "antigravity", "--reviewer-provider", "claude_code",
+      "--reviewer-identity", "reviewer-user"], {
       stdout: { write: (text) => { output += text; } },
       stderr: { write: (text) => assert.fail(text) }, githubFactory: () => github,
       runtimeRevision: REV_A, hostDeployer: async (request) => { deployed = request; return { status: "running", no_op: true, revision: REV_A }; },

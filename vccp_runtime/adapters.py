@@ -375,50 +375,6 @@ class GitHubWorkflowAdapter:
             return False
         return bool(self.writer.close_issue(repo, issue_number))
 
-    def close_historical_dayspark37_noop(self, repo, issue_number):
-        """Clear the false terminal label only for the evidence-bound historical recovery."""
-        if repo.casefold() != "liuchangchxy/dayspark" or issue_number != 37:
-            return False
-        fresh = self._facts(repo, issue_number)
-        if (not fresh.issue_open or not fresh.frozen_spec or fresh.canceled
-                or "infra-blocked" not in fresh.terminal_labels
-                or "needs-human" in fresh.terminal_labels
-                or not fresh.canonical_relationship_valid or fresh.canonical_link_count
-                or fresh.open_linked_pr_count):
-            return False
-        remove = list(fresh.active_labels) + ["infra-blocked"]
-        if not self.writer.replace_labels(repo, issue_number, remove, []):
-            return False
-        after = self._facts(repo, issue_number)
-        if (not after.issue_open or not after.frozen_spec or after.canceled
-                or after.active_labels or "infra-blocked" in after.terminal_labels
-                or "needs-human" in after.terminal_labels
-                or not after.canonical_relationship_valid or after.canonical_link_count
-                or after.open_linked_pr_count):
-            return False
-        return bool(self.writer.close_issue(repo, issue_number))
-
-    def cleanup_historical_dayspark37_noop_labels(self, repo, issue_number):
-        """Clean stale labels after the exact historical Issue already closed."""
-        if repo.casefold() != "liuchangchxy/dayspark" or issue_number != 37:
-            return False
-        fresh = self._facts(repo, issue_number)
-        if (fresh.issue_open or not fresh.frozen_spec or fresh.canceled
-                or "infra-blocked" not in fresh.terminal_labels
-                or "needs-human" in fresh.terminal_labels
-                or not fresh.canonical_relationship_valid or fresh.canonical_link_count
-                or fresh.open_linked_pr_count):
-            return False
-        remove = list(fresh.active_labels) + ["infra-blocked"]
-        if not self.writer.replace_labels(repo, issue_number, remove, []):
-            return False
-        after = self._facts(repo, issue_number)
-        return (not after.issue_open and after.frozen_spec and not after.canceled
-                and not after.active_labels and "infra-blocked" not in after.terminal_labels
-                and "needs-human" not in after.terminal_labels
-                and after.canonical_relationship_valid and not after.canonical_link_count
-                and not after.open_linked_pr_count)
-
     def clear_noop_coordination_labels(self, repo, issue_number):
         fresh = self._facts(repo, issue_number)
         if fresh.issue_open or not fresh.frozen_spec or fresh.canceled or not fresh.canonical_relationship_valid:

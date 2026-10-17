@@ -193,10 +193,6 @@ def main(argv=None):
     mode.add_argument("--one-cycle", action="store_true")
     mode.add_argument("--continuous", action="store_true")
     parser.add_argument("--poll-interval", type=float, default=30.0)
-    parser.add_argument("--recover-dayspark-37", action="store_true")
-    parser.add_argument("--expected-head")
-    parser.add_argument("--evidence-reference")
-    parser.add_argument("--evidence-sha256")
     args = parser.parse_args(argv)
     manifest, local = _load(args.manifest), _load(args.runtime_config)
     try:
@@ -220,14 +216,6 @@ def main(argv=None):
     try:
         with lock:
             runtime = build_runtime(manifest, local)
-            if args.recover_dayspark_37:
-                if not all((args.expected_head, args.evidence_reference, args.evidence_sha256)):
-                    parser.error("historical recovery requires expected head and evidence reference/digest")
-                result = runtime.core.recover_historical_dayspark37(
-                    args.repo, "8dc7fdbc-39c2-4fc1-9193-aab3d060f2a0", args.expected_head,
-                    args.evidence_reference, args.evidence_sha256)
-                print(json.dumps(result, ensure_ascii=False))
-                return
             if args.continuous:
                 run_continuous(runtime, args.repo, local["owner_id"], args.poll_interval,
                                on_cycle=lambda result: _report_cycle(result, args.repo))
