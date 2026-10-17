@@ -11,8 +11,8 @@ test("public VCCP revision reads use credential-free Git while Consumer access s
   const client = new AppGitHubClient({
     runtimeConfig: { github_app: {}, target_repository: CONSUMER },
     publicFetch: async () => assert.fail("public reads must not depend on API rate limits"),
-    gitRunner: (command, args) => {
-      calls.push({ command, args });
+    gitRunner: (command, args, options) => {
+      calls.push({ command, args, options });
       if (args.includes("ls-remote")) {
         return { status: 0, stdout: `${revision}\trefs/heads/main\n`, stderr: "" };
       }
@@ -29,6 +29,8 @@ test("public VCCP revision reads use credential-free Git while Consumer access s
   assert.equal(calls.length, 2);
   assert.ok(calls.every(({ command, args }) => command === "git" && args.includes("-c")
     && args.includes("credential.helper=")));
+  assert.ok(calls.every(({ options }) => options.env.GIT_CONFIG_NOSYSTEM === "1"
+    && options.env.GIT_CONFIG_GLOBAL === "/dev/null"));
   assert.ok(calls.some(({ args }) => args.includes("ls-remote")));
   assert.ok(calls.some(({ args }) => args.includes("cat-file")));
 });
