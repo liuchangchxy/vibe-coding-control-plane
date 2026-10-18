@@ -192,8 +192,27 @@ def main(argv=None):
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--one-cycle", action="store_true")
     mode.add_argument("--continuous", action="store_true")
+    mode.add_argument("--retry-reviewer", action="store_true",
+                      help="one manually authorized retry of a failed exact-head Claude Reviewer")
+    parser.add_argument("--issue", type=int, help="Frozen Issue number for --retry-reviewer")
+    parser.add_argument("--pr", type=int, help="pull request number for --retry-reviewer")
+    parser.add_argument("--head-sha", help="exact full PR head SHA for --retry-reviewer")
+    parser.add_argument("--authorize-reviewer-retry-for", metavar="SHA",
+                        help="explicitly authorize retry for this exact full SHA")
     parser.add_argument("--poll-interval", type=float, default=30.0)
     args = parser.parse_args(argv)
+    retry_values = (args.issue, args.pr, args.head_sha, args.authorize_reviewer_retry_for)
+    if args.retry_reviewer:
+        if any(value is None for value in retry_values):
+            parser.error("--retry-reviewer requires --issue, --pr, --head-sha, and "
+                         "--authorize-reviewer-retry-for")
+        if (not re.fullmatch(r"[0-9a-fA-F]{40}", args.head_sha)
+                or args.authorize_reviewer_retry_for.casefold() != args.head_sha.casefold()):
+            parser.error("reviewer retry authorization must repeat the exact full --head-sha")
+        if args.issue < 1 or args.pr < 1:
+            parser.error("--issue and --pr must be positive integers")
+    elif any(value is not None for value in retry_values):
+        parser.error("reviewer retry arguments require --retry-reviewer")
     manifest, local = _load(args.manifest), _load(args.runtime_config)
     try:
         _validate_runtime_revision(manifest)
@@ -216,6 +235,18 @@ def main(argv=None):
     try:
         with lock:
             runtime = build_runtime(manifest, local)
+            if args.retry_reviewer:
+                if runtime.local_reviewer is None:
+                    parser.error("configured runtime has no Local Reviewer")
+                result = runtime.local_reviewer.retry_failed(
+                    args.repo, args.issue, args.pr, args.head_sha,
+                    authorization_head=args.authorize_reviewer_retry_for)
+                print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+                if result.get("status") == "reviewer_running":
+                    return 0
+                if result.get("status") in {"reviewer_retry_rejected", "reviewer_retry_claim_lost"}:
+                    return 2
+                return 1
             if args.continuous:
                 run_continuous(runtime, args.repo, local["owner_id"], args.poll_interval,
                                on_cycle=lambda result: _report_cycle(result, args.repo))
@@ -226,4 +257,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

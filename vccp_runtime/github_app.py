@@ -33,6 +33,12 @@ _APPROX_TOKEN_TTL = dt.timedelta(minutes=5)
 class GitHubAppError(RuntimeError):
     """Safe, credential-free production error."""
 
+    def __init__(self, message: str, *, transport_exception_type: str | None = None,
+                 endpoint: str | None = None):
+        self.transport_exception_type = transport_exception_type
+        self.endpoint = endpoint
+        super().__init__(message)
+
 
 class GitHubAppNotInstalled(GitHubAppError):
     pass
@@ -50,9 +56,9 @@ class GitHubAppIdentityError(GitHubAppError):
 
 
 class GitHubHTTPError(GitHubAppError):
-    def __init__(self, status: int, operation: str):
+    def __init__(self, status: int, operation: str, endpoint: str | None = None):
         self.status, self.operation = status, operation
-        super().__init__(f"GitHub {operation} failed (HTTP {status})")
+        super().__init__(f"GitHub {operation} failed (HTTP {status})", endpoint=endpoint)
 
 
 class WindowsDPAPI:
@@ -246,9 +252,15 @@ class UrllibTransport:
                 return response.status, json.loads(raw.decode("utf-8")) if raw else {}
         except HTTPError as error:
             # Read no response body; GitHub error bodies are not suitable for logs.
-            raise GitHubHTTPError(error.code, method) from None
-        except (OSError, URLError, TimeoutError, json.JSONDecodeError):
-            raise GitHubAppError(f"GitHub {method} request failed") from None
+            target = urlparse(url)
+            endpoint = target.path + (f"?{target.query}" if target.query else "")
+            raise GitHubHTTPError(error.code, method, endpoint) from None
+        except (OSError, URLError, TimeoutError, json.JSONDecodeError) as error:
+            target = urlparse(url)
+            endpoint = target.path + (f"?{target.query}" if target.query else "")
+            raise GitHubAppError(f"GitHub {method} request failed",
+                                 transport_exception_type=type(error).__name__,
+                                 endpoint=endpoint) from None
 
 
 class GitHubAppCredentialProvider:

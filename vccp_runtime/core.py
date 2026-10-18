@@ -264,6 +264,20 @@ class _Store:
                     outcome TEXT,
                     PRIMARY KEY (repo, pr_number, head_sha)
                 );
+                CREATE TABLE IF NOT EXISTS reviewer_retry_authorizations (
+                    authorization_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    repo TEXT NOT NULL,
+                    pr_number INTEGER NOT NULL,
+                    head_sha TEXT NOT NULL,
+                    authorized_by TEXT NOT NULL,
+                    authorization_head_sha TEXT NOT NULL,
+                    authorized_at REAL NOT NULL,
+                    previous_state TEXT NOT NULL,
+                    previous_execution_id TEXT,
+                    previous_started_at REAL NOT NULL,
+                    previous_outcome TEXT,
+                    consumed_at REAL
+                );
                 CREATE INDEX IF NOT EXISTS attempts_flow_idx
                     ON attempts(repo, issue_number, kind, repair_ordinal);
                 """
@@ -902,10 +916,108 @@ class _Store:
         finally:
             connection.close()
 
+    def authorize_reviewer_retry(self, repo: str, pr_number: int, head_sha: str,
+                                 provider: str, authorization_head_sha: str,
+                                 authorized_by: str, now: float | None = None):
+        """Append explicit authorization and atomically arm one FAILED exact-head retry."""
+        normalized_head = head_sha.casefold() if isinstance(head_sha, str) else ""
+        normalized_authorization = (authorization_head_sha.casefold()
+                                    if isinstance(authorization_head_sha, str) else "")
+        if (not normalized_head or normalized_authorization != normalized_head
+                or not isinstance(authorized_by, str) or not authorized_by.strip()
+                or len(authorized_by) > 128):
+            return False
+        timestamp = time.time() if now is None else float(now)
+        connection = self.transaction()
+        try:
+            row = connection.execute(
+                "SELECT * FROM reviewer_executions WHERE repo=? AND pr_number=? AND head_sha=?",
+                (_repo_key(repo), pr_number, normalized_head),
+            ).fetchone()
+            if (row is None or row["state"] != "FAILED" or row["execution_id"] is not None
+                    or row["provider"] != provider):
+                connection.rollback()
+                return False
+            cursor = connection.execute(
+                "UPDATE reviewer_executions SET state='RETRY_AUTHORIZED',updated_at=? "
+                "WHERE repo=? AND pr_number=? AND head_sha=? AND provider=? "
+                "AND state='FAILED' AND execution_id IS NULL",
+                (timestamp, _repo_key(repo), pr_number, normalized_head, provider),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                return False
+            connection.execute(
+                "INSERT INTO reviewer_retry_authorizations"
+                "(repo,pr_number,head_sha,authorized_by,authorization_head_sha,authorized_at,"
+                "previous_state,previous_execution_id,previous_started_at,previous_outcome) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (_repo_key(repo), pr_number, normalized_head, authorized_by.strip(),
+                 normalized_authorization, timestamp, row["state"], row["execution_id"],
+                 row["started_at"], row["outcome"]),
+            )
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def claim_authorized_reviewer_retry(self, repo: str, pr_number: int, head_sha: str,
+                                        provider: str, now: float | None = None):
+        """Consume one authorization and reserve the retry without removing history."""
+        timestamp = time.time() if now is None else float(now)
+        normalized_head = head_sha.casefold()
+        connection = self.transaction()
+        try:
+            authorization = connection.execute(
+                "SELECT authorization_id FROM reviewer_retry_authorizations "
+                "WHERE repo=? AND pr_number=? AND head_sha=? AND consumed_at IS NULL "
+                "ORDER BY authorization_id DESC LIMIT 1",
+                (_repo_key(repo), pr_number, normalized_head),
+            ).fetchone()
+            if authorization is None:
+                connection.rollback()
+                return None, False
+            cursor = connection.execute(
+                "UPDATE reviewer_executions SET state='STARTING',started_at=?,updated_at=?,outcome=NULL "
+                "WHERE repo=? AND pr_number=? AND head_sha=? AND provider=? "
+                "AND state='RETRY_AUTHORIZED' AND execution_id IS NULL",
+                (timestamp, timestamp, _repo_key(repo), pr_number, normalized_head, provider),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                return None, False
+            connection.execute(
+                "UPDATE reviewer_retry_authorizations SET consumed_at=? WHERE authorization_id=? "
+                "AND consumed_at IS NULL", (timestamp, authorization["authorization_id"]),
+            )
+            row = connection.execute(
+                "SELECT * FROM reviewer_executions WHERE repo=? AND pr_number=? AND head_sha=?",
+                (_repo_key(repo), pr_number, normalized_head),
+            ).fetchone()
+            connection.commit()
+            return dict(row), True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def reviewer_retry_history(self, repo: str, pr_number: int, head_sha: str):
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT * FROM reviewer_retry_authorizations WHERE repo=? AND pr_number=? "
+                "AND head_sha=? ORDER BY authorization_id",
+                (_repo_key(repo), pr_number, head_sha.casefold()),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
     def update_reviewer_execution(self, repo: str, pr_number: int, head_sha: str,
                                   state: str, execution_id: str | None = None,
                                   outcome: str | None = None, now: float | None = None):
-        if state not in {"STARTING", "RUNNING", "COMPLETED", "FAILED", "DECIDED"}:
+        if state not in {"STARTING", "RUNNING", "COMPLETED", "FAILED", "DECIDED", "RETRY_AUTHORIZED"}:
             raise ValueError("invalid Reviewer execution state")
         timestamp = time.time() if now is None else float(now)
         with closing(self._connect()) as connection:

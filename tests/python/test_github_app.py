@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.error import URLError
 
 from unittest.mock import patch
 
@@ -17,7 +18,7 @@ from vccp_runtime.github_app import (DPAPIFileCredentialSource, GitHubAppCredent
                                      GitHubAppNotInstalled, GitHubAppPermissionError,
                                      GitHubHTTPError, POSIXFileCredentialSource,
                                      REQUIRED_PERMISSIONS, create_app_jwt,
-                                     make_credential_source)
+                                     make_credential_source, UrllibTransport)
 
 
 APP_ID = "123456"
@@ -343,6 +344,21 @@ class GitHubAppWriterTests(unittest.TestCase):
                 after = len([call for call in self.transport.calls
                              if call[0] == "POST" and call[1].endswith("/pulls")])
                 self.assertEqual(after, before)
+
+
+class GitHubTransportDiagnosticsTests(unittest.TestCase):
+    def test_transport_failure_retains_only_safe_exception_type(self):
+        secret = "bearer secret-do-not-log"
+        def fail(*_args, **_kwargs):
+            raise URLError(secret)
+
+        with self.assertRaises(GitHubAppError) as raised:
+            UrllibTransport(opener=fail).request("GET", "https://api.github.com/private-path",
+                                                 "token-do-not-log")
+
+        self.assertEqual(raised.exception.transport_exception_type, "URLError")
+        self.assertNotIn(secret, str(raised.exception))
+        self.assertNotIn("token-do-not-log", str(raised.exception))
 
 
 if __name__ == "__main__":

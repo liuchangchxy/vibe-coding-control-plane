@@ -83,6 +83,14 @@ class LocalReviewerWriter:
                      and str(review.get("commit_id") or "").casefold() == head.casefold()
                      and review.get("state") in {"APPROVED", "CHANGES_REQUESTED"}), None)
 
+    def _formal_review_exists_for_head(self, repo: str, pr: int, head: str) -> bool:
+        status, reviews = self.provider.request(
+            "GET", f"/repos/{repo}/pulls/{pr}/reviews?per_page=100", repo)
+        if status != 200 or not isinstance(reviews, list) or len(reviews) >= 100:
+            raise ValueError("formal review state is incomplete")
+        return any(str(review.get("commit_id") or "").casefold() == head.casefold()
+                   for review in reviews if isinstance(review, dict))
+
     def _enable_auto_merge(self, repo: str, pull_request: dict):
         method = str(self.manifest["merge"]["method"]).upper()
         if method not in {"MERGE", "SQUASH", "REBASE"}:
@@ -219,6 +227,58 @@ class LocalReviewerDriver:
         self.store, self.provider, self.writer = store, provider, writer
         self.provider_key = provider_key
 
+    def retry_failed(self, repo: str, issue: int, pr: int, head: str,
+                     authorization_head: str):
+        """Explicitly authorize one guarded retry of a FAILED Claude execution."""
+        normalized_head = head.casefold() if isinstance(head, str) else ""
+        if (not normalized_head or not isinstance(authorization_head, str)
+                or authorization_head.casefold() != normalized_head
+                or self.provider_key != "claude_code"):
+            return {"status": "reviewer_retry_rejected", "reason": "authorization_or_provider_mismatch",
+                    "head_sha": normalized_head or head}
+        record = self.store.reviewer_execution(repo, pr, normalized_head)
+        if (not record or record.get("state") != "FAILED"
+                or record.get("execution_id") is not None
+                or record.get("provider") != self.provider_key):
+            return {"status": "reviewer_retry_rejected", "reason": "execution_not_retryable",
+                    "head_sha": normalized_head}
+        try:
+            self.writer._snapshot(repo, issue, pr, normalized_head)
+            self.writer._pull_request(repo, pr, normalized_head)
+            if self.writer._formal_review_exists_for_head(repo, pr, normalized_head):
+                return {"status": "reviewer_retry_rejected", "reason": "formal_review_exists",
+                        "head_sha": normalized_head}
+        except Exception as error:
+            return {"status": "reviewer_retry_rejected", "reason": "github_preconditions_unavailable",
+                    "head_sha": normalized_head, "exception_type": type(error).__name__}
+        inspect_sessions = getattr(self.provider, "retry_session_evidence", None)
+        if inspect_sessions is None:
+            return {"status": "reviewer_retry_rejected", "reason": "session_evidence_unavailable",
+                    "head_sha": normalized_head}
+        try:
+            evidence = inspect_sessions(repo, issue, pr, normalized_head)
+        except Exception as error:
+            evidence = {"status": "unobservable", "exception_type": type(error).__name__}
+        if not isinstance(evidence, dict) or evidence.get("status") != "none":
+            return {"status": "reviewer_retry_rejected", "reason": "session_evidence_present_or_unknown",
+                    "head_sha": normalized_head,
+                    "exception_type": evidence.get("exception_type") if isinstance(evidence, dict) else None}
+        try:
+            identity = self.writer.provider.verify_identity()
+        except Exception as error:
+            return {"status": "reviewer_retry_rejected", "reason": "operator_identity_unverified",
+                    "head_sha": normalized_head, "exception_type": type(error).__name__}
+        operator = str((identity or {}).get("login") or "").strip()
+        if not operator:
+            return {"status": "reviewer_retry_rejected", "reason": "operator_identity_unverified",
+                    "head_sha": normalized_head}
+        authorized = self.store.authorize_reviewer_retry(
+            repo, pr, normalized_head, self.provider_key, authorization_head, operator)
+        if not authorized:
+            return {"status": "reviewer_retry_rejected", "reason": "failed_state_changed",
+                    "head_sha": normalized_head}
+        return self.advance(repo, issue, pr, normalized_head)
+
     def advance(self, repo: str, issue: int, pr: int, head: str):
         try:
             self.writer._snapshot(repo, issue, pr, head)
@@ -234,63 +294,108 @@ class LocalReviewerDriver:
         record, claimed = self.store.claim_reviewer_execution(
             repo, pr, head, self.provider_key)
         if not claimed:
-            if record["state"] == "RUNNING" and record.get("execution_id"):
+            if record["state"] == "RETRY_AUTHORIZED":
                 try:
-                    result = self.provider.observe_review(record["execution_id"], repo, issue, pr, head)
-                except Exception:
-                    self.store.update_reviewer_execution(repo, pr, head, "FAILED",
-                                                         outcome="execution_observation_failed")
-                    return {"status": "reviewer_execution_failed", "head_sha": head}
-                if result.get("status") == "running":
-                    return {"status": "reviewer_running", "execution_id": record["execution_id"],
-                            "head_sha": head}
-                if result.get("status") != "completed":
-                    self.store.update_reviewer_execution(repo, pr, head, "FAILED",
-                                                         outcome="execution_unobservable_or_failed")
-                    return {"status": "reviewer_execution_failed", "head_sha": head}
-                return self._submit_decision(repo, issue, pr, head, result)
-            if record["state"] == "STARTING":
-                recover = getattr(self.provider, "recover_review", None)
-                try:
-                    execution_id = recover(repo, issue, pr, head) if recover else None
-                except Exception:
-                    execution_id = None
-                if execution_id:
-                    self.store.update_reviewer_execution(repo, pr, head, "RUNNING",
-                                                         str(execution_id))
-                    try:
-                        observed = self.provider.observe_review(str(execution_id), repo, issue,
-                                                               pr, head)
-                    except Exception:
-                        observed = {"status": "failed"}
-                    if observed.get("status") == "running":
-                        return {"status": "reviewer_running", "execution_id": str(execution_id),
+                    if self.writer._formal_review_exists_for_head(repo, pr, head):
+                        return {"status": "reviewer_retry_rejected", "reason": "formal_review_exists",
                                 "head_sha": head}
-                    if observed.get("status") == "completed":
-                        return self._submit_decision(repo, issue, pr, head, observed)
-                    self.store.update_reviewer_execution(repo, pr, head, "FAILED",
-                                                         outcome="recovered_execution_unobservable")
-                    return {"status": "reviewer_execution_failed", "head_sha": head}
-                self.store.update_reviewer_execution(repo, pr, head, "FAILED",
-                                                     outcome="runner_interrupted_during_launch")
-                return {"status": "reviewer_launch_interrupted", "head_sha": head}
+                    evidence = self.provider.retry_session_evidence(repo, issue, pr, head)
+                except Exception:
+                    return {"status": "reviewer_retry_rejected", "reason": "retry_evidence_unavailable",
+                            "head_sha": head}
+                if not isinstance(evidence, dict) or evidence.get("status") != "none":
+                    return {"status": "reviewer_retry_rejected", "reason": "session_evidence_present_or_unknown",
+                            "head_sha": head}
+                record, claimed = self.store.claim_authorized_reviewer_retry(
+                    repo, pr, head, self.provider_key)
+                if not claimed:
+                    return {"status": "reviewer_retry_claim_lost", "head_sha": head}
+            else:
+                return self._continue_existing(repo, issue, pr, head, record)
+        if claimed:
+            return self._launch(repo, issue, pr, head)
+        return {"status": "reviewer_not_relaunched", "state": record["state"],
+                "outcome": record.get("outcome"), "head_sha": head}
+
+    def _continue_existing(self, repo: str, issue: int, pr: int, head: str, record: dict):
+        if not record:
+            return {"status": "reviewer_not_relaunched", "state": None, "head_sha": head}
+        if not record.get("state"):
+            return {"status": "reviewer_not_relaunched", "head_sha": head}
+        if not record.get("execution_id") and record["state"] not in {"STARTING"}:
             return {"status": "reviewer_not_relaunched", "state": record["state"],
                     "outcome": record.get("outcome"), "head_sha": head}
+        if record["state"] == "RUNNING" and record.get("execution_id"):
+            try:
+                result = self.provider.observe_review(record["execution_id"], repo, issue, pr, head)
+            except Exception:
+                self.store.update_reviewer_execution(repo, pr, head, "FAILED",
+                                                     outcome="execution_observation_failed")
+                return {"status": "reviewer_execution_failed", "head_sha": head}
+            if result.get("status") == "running":
+                return {"status": "reviewer_running", "execution_id": record["execution_id"],
+                        "head_sha": head}
+            if result.get("status") != "completed":
+                self.store.update_reviewer_execution(repo, pr, head, "FAILED",
+                                                     outcome="execution_unobservable_or_failed")
+                return {"status": "reviewer_execution_failed", "head_sha": head}
+            return self._submit_decision(repo, issue, pr, head, result)
+        if record["state"] == "STARTING":
+            recover = getattr(self.provider, "recover_review", None)
+            try:
+                execution_id = recover(repo, issue, pr, head) if recover else None
+            except Exception:
+                execution_id = None
+            if execution_id:
+                self.store.update_reviewer_execution(repo, pr, head, "RUNNING", str(execution_id))
+                try:
+                    observed = self.provider.observe_review(str(execution_id), repo, issue, pr, head)
+                except Exception:
+                    observed = {"status": "failed"}
+                if observed.get("status") == "running":
+                    return {"status": "reviewer_running", "execution_id": str(execution_id),
+                            "head_sha": head}
+                if observed.get("status") == "completed":
+                    return self._submit_decision(repo, issue, pr, head, observed)
+                self.store.update_reviewer_execution(repo, pr, head, "FAILED",
+                                                     outcome="recovered_execution_unobservable")
+                return {"status": "reviewer_execution_failed", "head_sha": head}
+            self.store.update_reviewer_execution(repo, pr, head, "FAILED",
+                                                 outcome="runner_interrupted_during_launch")
+            return {"status": "reviewer_launch_interrupted", "head_sha": head}
+        return {"status": "reviewer_not_relaunched", "state": record["state"],
+                "outcome": record.get("outcome"), "head_sha": head}
 
+    def _launch(self, repo: str, issue: int, pr: int, head: str):
         try:
             execution = self.provider.launch_review(repo, issue, pr, head)
-        except Exception:
+        except Exception as error:
+            diagnostic = self._launch_diagnostic(error)
             self.store.update_reviewer_execution(repo, pr, head, "FAILED",
-                                                 outcome="provider_launch_failed")
-            return {"status": "reviewer_launch_failed", "head_sha": head}
+                                                 outcome="provider_launch_failed:" + diagnostic)
+            return {"status": "reviewer_launch_failed", "head_sha": head, "detail": diagnostic}
         if not isinstance(execution, dict) or not execution.get("execution_id"):
+            diagnostic = "stage=execution_id_persist http_status=none exception_type=ExecutionIdMissing"
             self.store.update_reviewer_execution(repo, pr, head, "FAILED",
-                                                 outcome="provider_launch_unobservable")
-            return {"status": "reviewer_launch_unobservable", "head_sha": head}
+                                                 outcome="provider_launch_unobservable:" + diagnostic)
+            return {"status": "reviewer_launch_unobservable", "head_sha": head, "detail": diagnostic}
         self.store.update_reviewer_execution(repo, pr, head, "RUNNING",
                                              str(execution["execution_id"]))
         return {"status": "reviewer_running", "execution_id": str(execution["execution_id"]),
                 "head_sha": head}
+
+    @staticmethod
+    def _launch_diagnostic(error: Exception) -> str:
+        stage = str(getattr(error, "stage", "provider_launch"))[:64]
+        endpoint = getattr(error, "endpoint", None)
+        endpoint = str(endpoint)[:256] if endpoint else "none"
+        status = getattr(error, "http_status", None)
+        status = status if isinstance(status, int) else "none"
+        exception_type = str(getattr(error, "exception_type", None) or type(error).__name__)[:80]
+        process_status = getattr(error, "process_status", None)
+        process_status = process_status if isinstance(process_status, int) else "none"
+        return (f"stage={stage} endpoint={endpoint} http_status={status} "
+                f"exception_type={exception_type} process_status={process_status}")
 
     def _submit_decision(self, repo, issue, pr, head, result):
         event, body = result.get("event"), result.get("body")
