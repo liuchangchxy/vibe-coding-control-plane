@@ -220,6 +220,47 @@ class RuntimeRunnerTests(unittest.TestCase):
                          "--repo", "owner/repo", "--one-cycle"])
         self.assertEqual(events, [("identity", "owner/repo", "state.db"), "lock", "build", "cycle", "release"])
 
+    def test_reviewer_retry_cli_requires_human_authorization_for_exact_head(self):
+        with patch.object(runner, "_load", side_effect=AssertionError("must reject before loading")), \
+                patch.object(runner, "build_runtime", side_effect=AssertionError("must not build runtime")):
+            with self.assertRaises(SystemExit) as error:
+                runner.main(["--manifest", "manifest.yml", "--runtime-config", "runtime.json",
+                             "--repo", "owner/repo", "--retry-reviewer", "--issue", "7",
+                             "--pr", "12", "--head-sha", "a" * 40,
+                             "--authorize-reviewer-retry-for", "b" * 40])
+        self.assertEqual(error.exception.code, 2)
+
+    def test_reviewer_retry_cli_invokes_local_driver_under_runtime_lock(self):
+        head = "a" * 40
+        events = []
+        class Lock:
+            def __init__(self, repo, database): events.append(("identity", repo, database))
+            def __enter__(self): events.append("lock"); return self
+            def __exit__(self, *_): events.append("release")
+        class Reviewer:
+            def retry_failed(self, repo, issue, pr, current_head, authorization_head):
+                events.append(("retry", repo, issue, pr, current_head, authorization_head))
+                return {"status": "reviewer_running", "execution_id": "claude-session", "head_sha": current_head}
+        local = {"database_path": "state.db", "owner_id": "owner", "workspace": ".",
+                 "target_repository": "owner/repo", "enrollment": {"authorized_repository": "owner/repo"}}
+        manifest = {"vccp": {"revision": _checkout_head()}}
+        output = StringIO()
+        runtime = type("Runtime", (), {"local_reviewer": Reviewer()})()
+        with patch.object(runner, "_load", side_effect=[manifest, local]), \
+                patch.object(runner, "_runtime_source_revision", return_value=_checkout_head()), \
+                patch.object(runner, "_workspace_repository", return_value="owner/repo"), \
+                patch.object(runner, "RuntimeLock", Lock), \
+                patch.object(runner, "build_runtime", return_value=runtime), redirect_stdout(output):
+            result = runner.main(["--manifest", "manifest.yml", "--runtime-config", "runtime.json",
+                                  "--repo", "owner/repo", "--retry-reviewer", "--issue", "7",
+                                  "--pr", "12", "--head-sha", head,
+                                  "--authorize-reviewer-retry-for", head])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(events, [("identity", "owner/repo", "state.db"), "lock",
+                                  ("retry", "owner/repo", 7, 12, head, head), "release"])
+        self.assertEqual(json.loads(output.getvalue())["execution_id"], "claude-session")
+
     def test_cli_rejects_target_or_enrollment_mismatch_before_runtime_construction(self):
         manifest = {"vccp": {"revision": _checkout_head()}}
         local = {"database_path": "state.db", "owner_id": "owner", "workspace": ".",
@@ -255,4 +296,4 @@ class RuntimeRunnerTests(unittest.TestCase):
         self.assertEqual(RuntimeConfig.from_manifest(manifest).max_automated_repairs, 3)
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(unittest.main())

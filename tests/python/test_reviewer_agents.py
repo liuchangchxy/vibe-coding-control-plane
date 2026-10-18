@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from vccp_runtime.github_app import GitHubHTTPError
 from vccp_runtime.reviewer_agents import ClaudeCodeReviewer, _decision
 
 
@@ -126,6 +127,71 @@ class ReviewerAgentTests(unittest.TestCase):
                     returncode=0, stdout=json.dumps(sessions)), environ={})
 
             self.assertEqual(provider.recover_review(REPO, 7, 12, head), "review-uuid")
+
+    def test_reviewer_task_failure_reports_stage_endpoint_and_http_status(self):
+        class FailingAPI:
+            def get(self, path):
+                raise GitHubHTTPError(503, "GET")
+
+        with tempfile.TemporaryDirectory() as temp:
+            provider = ClaudeCodeReviewer("/usr/bin/claude", FailingAPI(), MANIFEST,
+                                          temp, str(Path(temp) / "reviews"), runner=lambda *_a, **_k: None,
+                                          environ={})
+            with self.assertRaises(Exception) as raised:
+                provider.task.build(REPO, 7, 12, SHA)
+
+        error = raised.exception
+        self.assertEqual(error.stage, "issue")
+        self.assertEqual(error.endpoint, f"/repos/{REPO}/issues/7")
+        self.assertEqual(error.http_status, 503)
+        self.assertEqual(error.exception_type, "GitHubHTTPError")
+        self.assertNotIn("token", str(error).casefold())
+
+    def test_reviewer_task_diagnostic_identifies_app_auth_endpoint(self):
+        class AuthFailureAPI:
+            def get(self, _path):
+                raise GitHubHTTPError(502, "GET", "/app")
+
+        with tempfile.TemporaryDirectory() as temp:
+            provider = ClaudeCodeReviewer("/usr/bin/claude", AuthFailureAPI(), MANIFEST,
+                                          temp, str(Path(temp) / "reviews"), runner=lambda *_a, **_k: None,
+                                          environ={})
+            with self.assertRaises(Exception) as raised:
+                provider.task.build(REPO, 7, 12, SHA)
+
+        self.assertEqual(raised.exception.stage, "issue.github_app_auth")
+        self.assertEqual(raised.exception.endpoint, "/app")
+        self.assertEqual(raised.exception.http_status, 502)
+        self.assertEqual(raised.exception.exception_type, "GitHubHTTPError")
+
+    def test_reviewer_session_inventory_fails_closed_when_claude_query_fails(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source"
+            source.mkdir()
+            git(source, "init", "-b", "main")
+            git(source, "config", "user.name", "Test")
+            git(source, "config", "user.email", "test@example.com")
+            (source / "code.py").write_text("pass\n")
+            git(source, "add", "code.py")
+            git(source, "commit", "-m", "exact head")
+            head = git(source, "rev-parse", "HEAD")
+            reviews = Path(temp) / "reviews"
+            provider = ClaudeCodeReviewer(
+                "/usr/bin/claude", FakeAPI(head), MANIFEST, str(source), str(reviews),
+                runner=lambda *_a, **_k: SimpleNamespace(returncode=1, stdout="", stderr="private detail"),
+                environ={})
+            workspace = provider.workspace.path_for(REPO, 12, head)
+            git(source, "worktree", "add", "--detach", str(workspace), head)
+
+            evidence = provider.retry_session_evidence(REPO, 7, 12, head)
+            self.assertEqual(evidence["status"], "unobservable")
+            provider.runner = lambda *_a, **_k: SimpleNamespace(returncode=0, stdout="[]", stderr="")
+            empty_evidence = provider.retry_session_evidence(REPO, 7, 12, head)
+
+        self.assertEqual(evidence["status"], "unobservable")
+        self.assertEqual(evidence["exception_type"], "ClaudeSessionQueryFailed")
+        self.assertNotIn("private detail", str(evidence))
+        self.assertEqual(empty_evidence, {"status": "none"})
 
 
 if __name__ == "__main__":

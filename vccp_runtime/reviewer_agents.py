@@ -35,6 +35,24 @@ def _decision(text: str) -> dict | None:
     return None
 
 
+class ReviewerTaskError(RuntimeError):
+    """Bounded Reviewer failure context with no response body or credential data."""
+
+    def __init__(self, stage: str, endpoint: str | None = None, http_status: int | None = None,
+                 exception_type: str = "RuntimeError", process_status: int | None = None):
+        self.stage = stage
+        self.endpoint = endpoint
+        self.http_status = http_status
+        self.exception_type = exception_type
+        self.process_status = process_status
+        fields = [f"stage={stage}", f"endpoint={endpoint or 'none'}",
+                  f"http_status={http_status if http_status is not None else 'none'}",
+                  f"exception_type={exception_type}"]
+        if process_status is not None:
+            fields.append(f"process_status={process_status}")
+        super().__init__("Reviewer launch failed: " + " ".join(fields))
+
+
 class _ReviewWorkspace:
     def __init__(self, source: str, root: str):
         self.source = Path(source).expanduser().resolve()
@@ -82,21 +100,36 @@ class _ReviewerTask:
         self.api, self.manifest = api, manifest
         self.contract_path, self.workspace = contract_path, workspace
 
+    def _get(self, stage, endpoint):
+        try:
+            return self.api.get(endpoint)
+        except Exception as error:
+            actual_endpoint = getattr(error, "endpoint", None)
+            diagnostic_stage = f"{stage}.github_app_auth" if actual_endpoint and actual_endpoint != endpoint else stage
+            raise ReviewerTaskError(
+                diagnostic_stage, actual_endpoint or endpoint, getattr(error, "status", None),
+                getattr(error, "transport_exception_type", None) or type(error).__name__,
+            ) from None
+
     def build(self, repo, issue, pr, head):
-        snapshot_issue = self.api.get(f"/repos/{repo}/issues/{issue}")
-        pull = self.api.get(f"/repos/{repo}/pulls/{pr}")
+        issue_endpoint = f"/repos/{repo}/issues/{issue}"
+        pull_endpoint = f"/repos/{repo}/pulls/{pr}"
+        snapshot_issue = self._get("issue", issue_endpoint)
+        pull = self._get("pull_request", pull_endpoint)
         if (pull.get("state") != "open" or pull.get("draft") is True
                 or (pull.get("base") or {}).get("ref") != self.manifest["repository"]["base_branch"]
                 or str((pull.get("user") or {}).get("login") or "").casefold()
                 not in {str(name).casefold() for name in self.manifest["repository"]["implementer_authors"]}
                 or str((pull.get("head") or {}).get("sha") or "").casefold() != head.casefold()):
             raise ValueError("Reviewer task PR state or exact head changed")
-        reviews = self.api.get(f"/repos/{repo}/pulls/{pr}/reviews?per_page=100")
+        reviews_endpoint = f"/repos/{repo}/pulls/{pr}/reviews?per_page=100"
+        reviews = self._get("reviews", reviews_endpoint)
         if not isinstance(reviews, list) or len(reviews) >= 100:
             raise ValueError("formal review history is incomplete")
         files = []
         for page in range(1, 31):
-            current = self.api.get(f"/repos/{repo}/pulls/{pr}/files?per_page=100&page={page}")
+            files_endpoint = f"/repos/{repo}/pulls/{pr}/files?per_page=100&page={page}"
+            current = self._get("files", files_endpoint)
             if not isinstance(current, list):
                 raise ValueError("pull request changed-file list is incomplete")
             files.extend(current)
@@ -105,7 +138,10 @@ class _ReviewerTask:
             raise ValueError("pull request changed-file list exceeded the bounded review limit")
         if not files:
             raise ValueError("pull request has no observable changed files")
-        path = self.workspace.prepare(repo, pr, head)
+        try:
+            path = self.workspace.prepare(repo, pr, head)
+        except Exception as error:
+            raise ReviewerTaskError("review_workspace", exception_type=type(error).__name__) from None
         contract = self.contract_path.read_text(encoding="utf-8")
         issue_body = str(snapshot_issue.get("body") or "")
         title = str(pull.get("title") or "")
@@ -168,16 +204,20 @@ class ClaudeCodeReviewer:
                    "--disallowedTools", f"Read({Path.home() / '.vccp'}/**)",
                    f"Read({Path.home() / '.ssh'}/**)", f"Read({self.config_root}/**)",
                    "--cwd", str(path)]
-        result = self.runner(command, cwd=path, env=env, timeout=60)
+        try:
+            result = self.runner(command, cwd=path, env=env, timeout=60)
+        except Exception as error:
+            raise ReviewerTaskError("claude_launch", exception_type=type(error).__name__) from None
         handle = _CLAUDE_BACKGROUND_HANDLE.search(result.stdout or "") if result.returncode == 0 else None
         if not handle:
-            raise ValueError("Claude Code did not return a Reviewer session handle")
+            raise ReviewerTaskError("claude_launch", exception_type="ClaudeBackgroundHandleMissing",
+                                    process_status=getattr(result, "returncode", None))
         records = self._sessions(path, env)
         for record in records:
             if isinstance(record, dict) and record.get("id") == handle.group(1) \
                     and isinstance(record.get("sessionId"), str):
                 return {"execution_id": record["sessionId"]}
-        raise ValueError("Claude Code Reviewer session could not be observed")
+        raise ReviewerTaskError("claude_session_lookup", exception_type="ClaudeSessionHandleNotObserved")
 
     def _sessions(self, path, env):
         result = self.runner([self.executable, "agents", "--json", "--all", "--cwd", str(path)],
@@ -189,6 +229,40 @@ class ClaudeCodeReviewer:
             return values if isinstance(values, list) else []
         except ValueError:
             return []
+
+    def retry_session_evidence(self, repo, issue, pr, head):
+        """Return present/none only after a successful exact-workspace Claude query."""
+        path = self.workspace.path_for(repo, pr, head)
+        if path.is_symlink() or not path.is_dir():
+            return {"status": "unobservable", "exception_type": "ReviewerWorkspaceUnavailable"}
+        current = _run(["git", "rev-parse", "HEAD"], path)
+        status = _run(["git", "status", "--porcelain=v1", "--untracked-files=all"], path)
+        if (current.returncode != 0 or current.stdout.strip().casefold() != head.casefold()
+                or status.returncode != 0 or status.stdout.strip()):
+            return {"status": "unobservable", "exception_type": "ReviewerWorkspaceNotCleanAtExactHead"}
+        try:
+            result = self.runner([self.executable, "agents", "--json", "--all", "--cwd", str(path)],
+                                 cwd=str(path), env=self._env(), text=True, encoding="utf-8",
+                                 errors="replace", capture_output=True, check=False, timeout=30)
+        except Exception as error:
+            return {"status": "unobservable", "exception_type": type(error).__name__}
+        if result.returncode != 0:
+            return {"status": "unobservable", "exception_type": "ClaudeSessionQueryFailed"}
+        try:
+            records = json.loads(result.stdout or "[]")
+        except (TypeError, ValueError):
+            return {"status": "unobservable", "exception_type": "ClaudeSessionInventoryInvalid"}
+        if not isinstance(records, list):
+            return {"status": "unobservable", "exception_type": "ClaudeSessionInventoryInvalid"}
+        scoped = []
+        for record in records:
+            if not isinstance(record, dict):
+                return {"status": "unobservable", "exception_type": "ClaudeSessionInventoryInvalid"}
+            cwd = record.get("cwd")
+            if cwd and Path(str(cwd)).expanduser().resolve() != path.resolve():
+                continue
+            scoped.append(record)
+        return {"status": "present", "count": len(scoped)} if scoped else {"status": "none"}
 
     def recover_review(self, repo, issue, pr, head):
         """Recover only a unique Claude session scoped to this PR/head worktree."""

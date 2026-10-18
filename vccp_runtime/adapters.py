@@ -82,7 +82,7 @@ class GitHubAPI:
             repo = self._repo_from_path(path)
             status, payload = self.provider.request("GET", path, repo)
             if status < 200 or status >= 300:
-                raise GitHubHTTPError(status, "GET")
+                raise GitHubHTTPError(status, "GET", path)
             return payload
         request = Request(self.api_url + path, headers={
             "Authorization": f"Bearer {self.token}", "Accept": "application/vnd.github+json",
