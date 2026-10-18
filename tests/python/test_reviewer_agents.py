@@ -193,6 +193,36 @@ class ReviewerAgentTests(unittest.TestCase):
         self.assertNotIn("private detail", str(evidence))
         self.assertEqual(empty_evidence, {"status": "none"})
 
+    def test_reviewer_session_inventory_uses_supported_runner_signature(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source"
+            source.mkdir()
+            git(source, "init", "-b", "main")
+            git(source, "config", "user.name", "Test")
+            git(source, "config", "user.email", "test@example.com")
+            (source / "code.py").write_text("pass\n")
+            git(source, "add", "code.py")
+            git(source, "commit", "-m", "exact head")
+            head = git(source, "rev-parse", "HEAD")
+            reviews = Path(temp) / "reviews"
+            calls = []
+
+            def runner(command, cwd=None, env=None, timeout=30):
+                calls.append((command, cwd, env, timeout))
+                return SimpleNamespace(returncode=0, stdout="[]", stderr="")
+
+            provider = ClaudeCodeReviewer("/usr/bin/claude", FakeAPI(head), MANIFEST,
+                                          str(source), str(reviews), runner=runner, environ={})
+            workspace = provider.workspace.path_for(REPO, 12, head)
+            git(source, "worktree", "add", "--detach", str(workspace), head)
+
+            evidence = provider.retry_session_evidence(REPO, 7, 12, head)
+
+        self.assertEqual(evidence, {"status": "none"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0][1:4], ["agents", "--json", "--all"])
+        self.assertEqual(calls[0][1], str(workspace))
+
 
 if __name__ == "__main__":
     unittest.main()

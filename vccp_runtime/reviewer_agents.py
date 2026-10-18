@@ -242,8 +242,7 @@ class ClaudeCodeReviewer:
             return {"status": "unobservable", "exception_type": "ReviewerWorkspaceNotCleanAtExactHead"}
         try:
             result = self.runner([self.executable, "agents", "--json", "--all", "--cwd", str(path)],
-                                 cwd=str(path), env=self._env(), text=True, encoding="utf-8",
-                                 errors="replace", capture_output=True, check=False, timeout=30)
+                                 cwd=str(path), env=self._env(), timeout=30)
         except Exception as error:
             return {"status": "unobservable", "exception_type": type(error).__name__}
         if result.returncode != 0:
