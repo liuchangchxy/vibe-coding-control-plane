@@ -6,13 +6,10 @@ import os
 from pathlib import Path
 import re
 import subprocess
-import tempfile
+import asyncio
 import threading
-import time
 from urllib.request import Request, urlopen
-from uuid import uuid4
 
-from .adapters import _CLAUDE_BACKGROUND_HANDLE, _CLAUDE_SESSION_ENVIRONMENT
 from .runtime_checkout import _SHA
 
 
@@ -39,12 +36,17 @@ class ReviewerTaskError(RuntimeError):
     """Bounded Reviewer failure context with no response body or credential data."""
 
     def __init__(self, stage: str, endpoint: str | None = None, http_status: int | None = None,
-                 exception_type: str = "RuntimeError", process_status: int | None = None):
+                 exception_type: str = "RuntimeError", process_status: int | None = None,
+                 *, execution_id: str | None = None, terminal: bool = False,
+                 execution_started: bool = False):
         self.stage = stage
         self.endpoint = endpoint
         self.http_status = http_status
         self.exception_type = exception_type
         self.process_status = process_status
+        self.execution_id = execution_id
+        self.terminal = terminal
+        self.execution_started = execution_started
         fields = [f"stage={stage}", f"endpoint={endpoint or 'none'}",
                   f"http_status={http_status if http_status is not None else 'none'}",
                   f"exception_type={exception_type}"]
@@ -111,7 +113,7 @@ class _ReviewerTask:
                 getattr(error, "transport_exception_type", None) or type(error).__name__,
             ) from None
 
-    def build(self, repo, issue, pr, head):
+    def build(self, repo, issue, pr, head, structured=False):
         issue_endpoint = f"/repos/{repo}/issues/{issue}"
         pull_endpoint = f"/repos/{repo}/pulls/{pr}"
         snapshot_issue = self._get("issue", issue_endpoint)
@@ -164,158 +166,171 @@ class _ReviewerTask:
                       f"Use the checked-out code in the exact-head workspace and complete the following canonical review contract.\n"
                       f"<review-contract>\n{contract}\n</review-contract>\n\n"
                       "Do not edit files, commit, push, call GitHub, or submit a review. The VCCP host performs bounded exact-head writes after revalidation. "
-                      "Return one final JSON object and no other trailing text: {\"event\":\"APPROVE\"|\"REQUEST_CHANGES\",\"body\":\"complete review body\"}. "
-                      "If required evidence or a prerequisite is missing, return REQUEST_CHANGES only when a Frozen Spec criterion is demonstrably unmet; otherwise report a non-decision in JSON with event \"BLOCKED\".")
+                      + ("Return structured output with decision (APPROVE or CHANGES_REQUESTED), summary, and findings containing severity, file, line, and description. "
+                         "APPROVE requires no blocking finding; CHANGES_REQUESTED requires a blocking finding."
+                         if structured else
+                         "Return one final JSON object and no other trailing text: {\"event\":\"APPROVE\"|\"REQUEST_CHANGES\",\"body\":\"complete review body\"}. "
+                         "If required evidence or a prerequisite is missing, return REQUEST_CHANGES only when a Frozen Spec criterion is demonstrably unmet; otherwise report a non-decision in JSON with event \"BLOCKED\"."))
 
 
-class ClaudeCodeReviewer:
+class ClaudeAgentSDKReviewer:
+    """One-shot read-only Reviewer backed by Anthropic's supported Python Agent SDK."""
+
+    _SCHEMA = {
+        "type": "object",
+        "properties": {
+            "decision": {"type": "string", "enum": ["APPROVE", "CHANGES_REQUESTED"]},
+            "summary": {"type": "string", "minLength": 1, "maxLength": 4000},
+            "findings": {"type": "array", "maxItems": 10, "items": {
+                "type": "object",
+                "properties": {
+                    "severity": {"type": "string", "enum": ["blocking"]},
+                    "file": {"type": "string", "minLength": 1, "maxLength": 500},
+                    "line": {"type": "integer", "minimum": 1},
+                    "description": {"type": "string", "minLength": 1, "maxLength": 4000},
+                },
+                "required": ["severity", "file", "line", "description"],
+                "additionalProperties": False,
+            }},
+        },
+        "required": ["decision", "summary", "findings"],
+        "additionalProperties": False,
+    }
+
     def __init__(self, executable, api, manifest, workspace, review_root,
-                 config_root=None, runner=_run, environ=None):
-        self.executable = executable
-        self.api = api
-        self.manifest = manifest
-        self.environ = os.environ if environ is None else environ
-        self.runner = runner
+                 config_root=None, sdk_query=None):
+        self.api, self.manifest = api, manifest
         self.workspace = _ReviewWorkspace(workspace, review_root)
         self.task = _ReviewerTask(api, manifest, Path(__file__).resolve().parent.parent /
                                   "templates" / "reviewer-task-prompt.md", self.workspace)
-        self.config_root = Path(config_root or (Path.home() / ".claude")).expanduser()
-        if not executable:
-            raise ValueError("Claude Code Reviewer executable is required")
+        self._query = sdk_query
+        self.timeout_seconds = 1200
 
-    def _env(self):
-        env = dict(self.environ)
-        for key in list(env):
-            if key.upper() in {"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN",
-                               "GITHUB_APP_TOKEN", "GITHUB_APP_PRIVATE_KEY", *_CLAUDE_SESSION_ENVIRONMENT}:
-                env.pop(key, None)
-        gh_config = Path(tempfile.gettempdir()) / f"vccp-review-gh-{os.getuid() if hasattr(os, 'getuid') else 'user'}"
-        gh_config.mkdir(parents=True, exist_ok=True)
-        env["GH_CONFIG_DIR"] = str(gh_config)
-        env["GIT_CONFIG_NOSYSTEM"] = "1"
-        env["GIT_CONFIG_GLOBAL"] = os.devnull
-        return env
+    @staticmethod
+    def _sdk():
+        try:
+            from claude_agent_sdk import (ClaudeAgentOptions, PermissionResultAllow,
+                                          PermissionResultDeny, ResultMessage, SystemMessage, query)
+        except ImportError as error:
+            raise ReviewerTaskError("claude_agent_sdk_import", exception_type=type(error).__name__) from None
+        return (ClaudeAgentOptions, PermissionResultAllow, PermissionResultDeny,
+                ResultMessage, SystemMessage, query)
+
+    def _options(self, path):
+        options_type, allow_type, deny_type, *_ = self._sdk()
+
+        async def permission(tool_name, tool_input, _context):
+            if tool_name not in {"Read", "Glob", "Grep"}:
+                return deny_type(message="Reviewer tools are read-only and restricted to the exact workspace")
+            candidate = tool_input.get("file_path") or tool_input.get("path") or str(path)
+            if tool_name == "Glob" and ".." in Path(str(tool_input.get("pattern") or "")).parts:
+                return deny_type(message="Path traversal is outside the Reviewer workspace")
+            target = Path(str(candidate)).expanduser()
+            if not target.is_absolute():
+                target = path / target
+            try:
+                target.resolve().relative_to(path.resolve())
+            except (OSError, ValueError):
+                return deny_type(message="Reads are restricted to the exact Reviewer workspace")
+            return allow_type()
+
+        env = {key: value for key, value in os.environ.items()
+               if key.upper() not in {"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN",
+                                      "GITHUB_APP_TOKEN", "GITHUB_APP_PRIVATE_KEY", "CLAUDECODE"}}
+        return options_type(
+            cwd=str(path),
+            tools=["Read", "Glob", "Grep"], disallowed_tools=["Bash", "Write", "Edit"],
+            permission_mode="default", setting_sources=["user"], can_use_tool=permission,
+            output_format={"type": "json_schema", "schema": self._SCHEMA}, max_turns=30, env=env,
+        )
+
+    @staticmethod
+    def _to_review(value):
+        if not isinstance(value, dict) or value.get("decision") not in {"APPROVE", "CHANGES_REQUESTED"}:
+            return None
+        summary, findings = value.get("summary"), value.get("findings")
+        if not isinstance(summary, str) or not summary.strip() or not isinstance(findings, list):
+            return None
+        for item in findings:
+            if (not isinstance(item, dict) or item.get("severity") != "blocking"
+                    or not isinstance(item.get("file"), str) or not item["file"].strip()
+                    or not isinstance(item.get("line"), int) or item["line"] < 1
+                    or not isinstance(item.get("description"), str) or not item["description"].strip()):
+                return None
+        blocking = any(item["severity"] == "blocking" for item in findings)
+        if (value["decision"] == "APPROVE" and blocking) or (
+                value["decision"] == "CHANGES_REQUESTED" and not blocking):
+            return None
+        body = summary.strip()
+        if findings:
+            body += "\n\nFindings:\n" + "\n".join(
+                f"- [{item['severity']}] `{item['file']}:{item['line']}` — {item['description'].strip()}"
+                for item in findings)
+        if len(body) > 60000:
+            return None
+        event = "APPROVE" if value["decision"] == "APPROVE" else "REQUEST_CHANGES"
+        return {"event": event, "body": body}
 
     def launch_review(self, repo, issue, pr, head):
-        path, prompt = self.task.build(repo, issue, pr, head)
-        env = self._env()
-        command = [self.executable, "--bg", prompt, "--permission-mode", "plan",
-                   "--allowedTools", "Read", "Glob", "Grep",
-                   "--disallowedTools", f"Read({Path.home() / '.vccp'}/**)",
-                   f"Read({Path.home() / '.ssh'}/**)", f"Read({self.config_root}/**)"]
+        path, prompt = self.task.build(repo, issue, pr, head, structured=True)
+        prompt += ("\nReturn structured output only. APPROVE requires no blocking finding; "
+                   "CHANGES_REQUESTED requires a specific blocking finding supported by exact-head code.")
+        options = self._options(path)
+        sdk_result = None
+        session_id = None
+        execution_started = False
+        query = self._query or self._sdk()[-1]
+
+        async def consume():
+            nonlocal sdk_result, session_id, execution_started
+            async for message in query(prompt=prompt, options=options):
+                execution_started = True
+                if isinstance(message, self._sdk()[4]):
+                    session_id = message.data.get("session_id") or session_id
+                if isinstance(message, self._sdk()[3]):
+                    sdk_result = message
+                    session_id = getattr(message, "session_id", None) or session_id
+
         try:
-            result = self.runner(command, cwd=path, env=env, timeout=60)
+            asyncio.run(asyncio.wait_for(consume(), timeout=self.timeout_seconds))
+        except asyncio.TimeoutError:
+            raise ReviewerTaskError("claude_agent_sdk_timeout", exception_type="TimeoutError",
+                                    execution_id=session_id, execution_started=execution_started) from None
+        except ReviewerTaskError:
+            raise
         except Exception as error:
-            raise ReviewerTaskError("claude_launch", exception_type=type(error).__name__) from None
-        handle = _CLAUDE_BACKGROUND_HANDLE.search(result.stdout or "") if result.returncode == 0 else None
-        if not handle:
-            raise ReviewerTaskError("claude_launch", exception_type="ClaudeBackgroundHandleMissing",
-                                    process_status=getattr(result, "returncode", None))
-        records = self._sessions(path, env)
-        for record in records:
-            if isinstance(record, dict) and record.get("id") == handle.group(1) \
-                    and isinstance(record.get("sessionId"), str):
-                return {"execution_id": record["sessionId"]}
-        raise ReviewerTaskError("claude_session_lookup", exception_type="ClaudeSessionHandleNotObserved")
-
-    def _sessions(self, path, env):
-        result = self.runner([self.executable, "agents", "--json", "--all", "--cwd", str(path)],
-                             cwd=path, env=env, timeout=30)
-        if result.returncode != 0:
-            return []
-        try:
-            values = json.loads(result.stdout or "[]")
-            return values if isinstance(values, list) else []
-        except ValueError:
-            return []
-
-    def retry_session_evidence(self, repo, issue, pr, head):
-        """Return present/none only after a successful exact-workspace Claude query."""
-        path = self.workspace.path_for(repo, pr, head)
-        if path.is_symlink() or not path.is_dir():
-            return {"status": "unobservable", "exception_type": "ReviewerWorkspaceUnavailable"}
+            raise ReviewerTaskError("claude_agent_sdk_execution", exception_type=type(error).__name__,
+                                    execution_id=session_id, execution_started=execution_started) from None
+        if sdk_result is None or sdk_result.subtype != "success":
+            raise ReviewerTaskError("claude_agent_sdk_result", exception_type="ResultMessageInvalid",
+                                    execution_id=session_id, terminal=sdk_result is not None,
+                                    execution_started=execution_started)
+        if not session_id:
+            raise ReviewerTaskError("claude_agent_sdk_session", exception_type="SessionIdMissing",
+                                    terminal=True, execution_started=True)
+        decision = self._to_review(sdk_result.structured_output)
+        if decision is None:
+            raise ReviewerTaskError("claude_agent_sdk_result", exception_type="StructuredResultInvalid",
+                                    execution_id=session_id, terminal=True, execution_started=True)
         current = _run(["git", "rev-parse", "HEAD"], path)
         status = _run(["git", "status", "--porcelain=v1", "--untracked-files=all"], path)
-        if (current.returncode != 0 or current.stdout.strip().casefold() != head.casefold()
-                or status.returncode != 0 or status.stdout.strip()):
-            return {"status": "unobservable", "exception_type": "ReviewerWorkspaceNotCleanAtExactHead"}
-        try:
-            result = self.runner([self.executable, "agents", "--json", "--all", "--cwd", str(path)],
-                                 cwd=str(path), env=self._env(), timeout=30)
-        except Exception as error:
-            return {"status": "unobservable", "exception_type": type(error).__name__}
-        if result.returncode != 0:
-            return {"status": "unobservable", "exception_type": "ClaudeSessionQueryFailed"}
-        try:
-            records = json.loads(result.stdout or "[]")
-        except (TypeError, ValueError):
-            return {"status": "unobservable", "exception_type": "ClaudeSessionInventoryInvalid"}
-        if not isinstance(records, list):
-            return {"status": "unobservable", "exception_type": "ClaudeSessionInventoryInvalid"}
-        scoped = []
-        for record in records:
-            if not isinstance(record, dict):
-                return {"status": "unobservable", "exception_type": "ClaudeSessionInventoryInvalid"}
-            cwd = record.get("cwd")
-            if not cwd:
-                return {"status": "unobservable", "exception_type": "ClaudeSessionWorkspaceMissing"}
-            if Path(str(cwd)).expanduser().resolve() != path.resolve():
-                continue
-            scoped.append(record)
-        if not scoped:
+        if (current.returncode or current.stdout.strip().casefold() != head.casefold()
+                or status.returncode or status.stdout.strip()):
+            raise ReviewerTaskError("review_workspace_postflight", exception_type="WorkspaceChanged",
+                                    execution_id=session_id, terminal=True, execution_started=True)
+        return {"status": "completed", "execution_id": session_id, **decision}
+
+    def retry_session_evidence(self, repo, issue, pr, head, failed_execution_id=None,
+                               failed_outcome=None):
+        """Use persisted SDK completion evidence; unknown or interrupted runs fail closed."""
+        if not isinstance(failed_outcome, str):
+            return {"status": "unobservable", "exception_type": "ExecutionEvidenceUnavailable"}
+        if failed_outcome.startswith("sdk_terminal_failure:"):
+            return {"status": "terminal_failed", "execution_id": failed_execution_id,
+                    "state": "failed"}
+        if failed_outcome.startswith("sdk_not_started:") and failed_execution_id is None:
             return {"status": "none"}
-        if len(scoped) == 1:
-            session = scoped[0]
-            execution_id = session.get("sessionId")
-            state = str(session.get("state") or session.get("status") or "").casefold()
-            if isinstance(execution_id, str) and execution_id and state == "failed":
-                return {"status": "terminal_failed", "execution_id": execution_id, "state": state}
-        return {"status": "present", "count": len(scoped)}
-
-    def recover_review(self, repo, issue, pr, head):
-        """Recover only a unique Claude session scoped to this PR/head worktree."""
-        path = self.workspace.path_for(repo, pr, head)
-        if not path.is_dir() or path.is_symlink():
-            return None
-        current = _run(["git", "rev-parse", "HEAD"], path)
-        status = _run(["git", "status", "--porcelain=v1", "--untracked-files=all"], path)
-        if current.returncode or current.stdout.strip().casefold() != head.casefold() \
-                or status.returncode or status.stdout.strip():
-            return None
-        records = self._sessions(path, self._env())
-        matches = [record for record in records if isinstance(record, dict)
-                   and isinstance(record.get("sessionId"), str)
-                   and record.get("sessionId")
-                   and (not record.get("cwd") or
-                        Path(str(record["cwd"])).expanduser().resolve() == path.resolve())]
-        return matches[0]["sessionId"] if len(matches) == 1 else None
-
-    def observe_review(self, execution_id, repo, issue, pr, head):
-        path = self.workspace.path_for(repo, pr, head)
-        sessions = self._sessions(path, self._env())
-        record = next((row for row in sessions if isinstance(row, dict)
-                       and row.get("sessionId") == execution_id), None)
-        if record is None:
-            return {"status": "failed"}
-        state = str(record.get("status") or record.get("state") or "").casefold()
-        if state in {"running", "working", "busy", "queued", "pending"}:
-            return {"status": "running"}
-        transcript = self.config_root / "projects"
-        files = list(transcript.glob(f"*/{execution_id}.jsonl"))
-        if len(files) != 1 or not files[0].is_file():
-            return {"status": "failed"}
-        text_parts = []
-        for line in files[0].read_text(encoding="utf-8", errors="replace").splitlines():
-            try: message = json.loads(line)
-            except ValueError: continue
-            if message.get("type") != "assistant": continue
-            content = (message.get("message") or {}).get("content") or []
-            text_parts.extend(item.get("text", "") for item in content
-                              if isinstance(item, dict) and item.get("type") == "text")
-        decision = _decision("\n".join(text_parts))
-        if not decision: return {"status": "failed"}
-        self.workspace.remove_if_clean(repo, pr, head)
-        return {"status": "completed", **decision}
+        return {"status": "unobservable", "exception_type": "ExecutionStateUnknown"}
 
 
 class AntigravityReviewer:

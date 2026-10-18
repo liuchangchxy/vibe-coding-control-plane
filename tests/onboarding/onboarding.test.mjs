@@ -783,7 +783,11 @@ test("status trusts only an exact running clean host and avoids a lock-conflicti
     const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
     await applyOnboardingPlan({ plan, root, github });
     const configPath = path.join(root, "runtime-config.json");
-    await writeFile(configPath, JSON.stringify(localEnrollment(root)));
+    await writeFile(configPath, JSON.stringify({ ...localEnrollment(root), providers: [
+      { key: "antigravity", type: "antigravity", executable: "/bin/true" },
+      { key: "claude_agent_sdk", type: "claude_agent_sdk" },
+    ], implementer_provider: "antigravity", reviewer_provider: "claude_agent_sdk",
+      reviewer_github_identity: "reviewer-user" }));
     let output = "";
     const code = await runOnboardingCli(["status", "--repo", REPO, "--path", root, "--runtime-config", configPath], {
       stdout: { write: (text) => { output += text; } }, stderr: { write: (text) => assert.fail(text) },
@@ -797,6 +801,7 @@ test("status trusts only an exact running clean host and avoids a lock-conflicti
     assert.equal(report.overall_status, "READY");
     assert.equal(report.host_runner.pid, 1234);
     assert.equal(report.machine_activation.source, "verified_running_runtime");
+    assert.equal(report.machine_runtime.reviewer_provider, "claude_agent_sdk");
   });
 });
 
@@ -919,6 +924,45 @@ test("deploy binds explicitly selected providers once then delegates the ready r
     assert.equal(written.reviewer_provider, "claude_code");
     assert.equal(written.reviewer_github_identity, "reviewer-user");
     assert.equal(deployed.manifest.vccp.revision, REV_A);
+  });
+});
+
+test("deploy explicitly migrates an existing Claude Code Reviewer binding to Agent SDK", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
+    await applyOnboardingPlan({ plan, root, github });
+    const configPath = path.join(root, "runtime.json");
+    const initial = { ...localEnrollment(root), providers: [
+      { key: "antigravity", type: "antigravity", executable: "/bin/true" },
+      { key: "claude_code", type: "claude_code", executable: "/bin/true" },
+    ], implementer_provider: "antigravity", reviewer_provider: "claude_code",
+      reviewer_github_identity: "reviewer-user" };
+    await writeFile(configPath, JSON.stringify(initial));
+    let deployed;
+    let output = "";
+    const code = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root,
+      "--runtime-config", configPath, "--propose-revision", REV_A,
+      "--reviewer-provider", "claude_agent_sdk"], {
+      stdout: { write: (text) => { output += text; } },
+      stderr: { write: (text) => assert.fail(text) }, githubFactory: () => github,
+      runtimeRevision: REV_A,
+      hostDeployer: async (request) => {
+        deployed = request;
+        return { status: "running", revision: REV_A };
+      },
+    });
+    const report = JSON.parse(output);
+    const written = JSON.parse(await readFile(configPath, "utf8"));
+    assert.equal(code, 0);
+    assert.equal(report.overall_status, "RUNNING");
+    assert.equal(written.implementer_provider, "antigravity");
+    assert.equal(written.reviewer_provider, "claude_agent_sdk");
+    assert.equal(written.reviewer_github_identity, "reviewer-user");
+    assert.ok(written.providers.some((provider) => provider.key === "claude_code"));
+    assert.ok(written.providers.some((provider) => provider.key === "claude_agent_sdk"
+      && provider.type === "claude_agent_sdk"));
+    assert.equal(deployed.localConfig.reviewer_provider, "claude_agent_sdk");
   });
 });
 

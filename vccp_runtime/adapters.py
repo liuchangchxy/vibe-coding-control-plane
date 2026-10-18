@@ -22,7 +22,8 @@ from .github_app import (DPAPIFileCredentialSource, GitHubAppCredentialProvider,
                          GitHubHTTPError, POSIXFileCredentialSource, make_credential_source,
                          repository_from_remote)
 from .github_push import GitHubAppPushBackend
-from .providers import ANTIGRAVITY_PROVIDER, CLAUDE_CODE_PROVIDER, ProviderRouter, normalize_provider_key
+from .providers import (ANTIGRAVITY_PROVIDER, CLAUDE_AGENT_SDK_PROVIDER, CLAUDE_CODE_PROVIDER,
+                        ProviderRouter, normalize_provider_key)
 
 
 _CONVERSATION_UUID = re.compile(
@@ -1210,16 +1211,19 @@ def build_runtime(manifest: dict, local_config: dict, api=None, writer=None,
     reviewer_settings = _configured_providers_for_role(local_config, "reviewer")
     if reviewer_settings:
         from .local_reviewer import GitHubUserReviewerProvider, LocalReviewerDriver, LocalReviewerWriter
-        from .reviewer_agents import AntigravityReviewer, ClaudeCodeReviewer
+        from .reviewer_agents import AntigravityReviewer, ClaudeAgentSDKReviewer
         identity = local_config.get("reviewer_github_identity")
         if not isinstance(identity, str) or not identity.strip():
             raise ValueError("explicit local Reviewer binding requires reviewer_github_identity")
         target_repo = target_repo if app_configured else _workspace_repository(
             workspace, getattr(api, "api_url", "https://api.github.com"))
         settings = reviewer_settings[0]
+        if settings.get("type") == CLAUDE_AGENT_SDK_PROVIDER \
+                and settings.get("key") != CLAUDE_AGENT_SDK_PROVIDER:
+            raise ValueError("Claude Agent SDK Reviewer key must be claude_agent_sdk")
         reviewer_factory = {
             ANTIGRAVITY_PROVIDER: AntigravityReviewer,
-            CLAUDE_CODE_PROVIDER: ClaudeCodeReviewer,
+            CLAUDE_AGENT_SDK_PROVIDER: ClaudeAgentSDKReviewer,
         }.get(settings.get("type"))
         if reviewer_factory is None:
             raise ValueError("unsupported local Reviewer provider type")
@@ -1229,8 +1233,7 @@ def build_runtime(manifest: dict, local_config: dict, api=None, writer=None,
             settings.get("executable"), api, manifest, workspace, review_root,
             settings.get("project_config_root"),
         ) if settings.get("type") == ANTIGRAVITY_PROVIDER else reviewer_factory(
-            settings.get("executable"), api, manifest, workspace, review_root,
-            local_config.get("claude_config_root"),
+            None, api, manifest, workspace, review_root,
         )
         user_provider = GitHubUserReviewerProvider(target_repo, identity)
         reviewer_writer = LocalReviewerWriter(user_provider, workflow, target_repo, identity, manifest)

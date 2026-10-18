@@ -130,6 +130,8 @@ class LocalReviewerWriter:
         # receives a review against a later head.
         current = self._snapshot(repo, issue_number, pr_number, head_sha)
         self._pull_request(repo, pr_number, head_sha)
+        if self._formal_review_exists_for_head(repo, pr_number, head_sha):
+            return {"status": "formal_review_exists", "head_sha": head_sha.lower()}
         status, response = self.provider.request(
             "POST", f"/repos/{repo}/pulls/{pr_number}/reviews", repo,
             {"commit_id": head_sha.lower(), "event": event, "body": body.strip()},
@@ -233,7 +235,7 @@ class LocalReviewerDriver:
         normalized_head = head.casefold() if isinstance(head, str) else ""
         if (not normalized_head or not isinstance(authorization_head, str)
                 or authorization_head.casefold() != normalized_head
-                or self.provider_key != "claude_code"):
+                or self.provider_key != "claude_agent_sdk"):
             return {"status": "reviewer_retry_rejected", "reason": "authorization_or_provider_mismatch",
                     "head_sha": normalized_head or head}
         record = self.store.reviewer_execution(repo, pr, normalized_head)
@@ -255,7 +257,11 @@ class LocalReviewerDriver:
             return {"status": "reviewer_retry_rejected", "reason": "session_evidence_unavailable",
                     "head_sha": normalized_head}
         try:
-            evidence = inspect_sessions(repo, issue, pr, normalized_head)
+            evidence = (inspect_sessions(repo, issue, pr, normalized_head,
+                                         failed_execution_id=record.get("execution_id"),
+                                         failed_outcome=record.get("outcome"))
+                        if self.provider_key == "claude_agent_sdk"
+                        else inspect_sessions(repo, issue, pr, normalized_head))
         except Exception as error:
             evidence = {"status": "unobservable", "exception_type": type(error).__name__}
         if not self._retry_evidence_matches(evidence, record.get("execution_id")):
@@ -304,12 +310,19 @@ class LocalReviewerDriver:
         record, claimed = self.store.claim_reviewer_execution(
             repo, pr, head, self.provider_key)
         if not claimed:
+            if record.get("provider") != self.provider_key:
+                return {"status": "reviewer_provider_mismatch", "record_provider": record.get("provider"),
+                        "head_sha": head}
             if record["state"] == "RETRY_AUTHORIZED":
                 try:
                     if self.writer._formal_review_exists_for_head(repo, pr, head):
                         return {"status": "reviewer_retry_rejected", "reason": "formal_review_exists",
                                 "head_sha": head}
-                    evidence = self.provider.retry_session_evidence(repo, issue, pr, head)
+                    evidence = self.provider.retry_session_evidence(
+                        repo, issue, pr, head,
+                        **({"failed_execution_id": record.get("execution_id"),
+                            "failed_outcome": record.get("outcome")}
+                           if self.provider_key == "claude_agent_sdk" else {}))
                 except Exception:
                     return {"status": "reviewer_retry_rejected", "reason": "retry_evidence_unavailable",
                             "head_sha": head}
@@ -333,6 +346,19 @@ class LocalReviewerDriver:
             return {"status": "reviewer_not_relaunched", "state": None, "head_sha": head}
         if not record.get("state"):
             return {"status": "reviewer_not_relaunched", "head_sha": head}
+        if record.get("provider") != self.provider_key:
+            return {"status": "reviewer_provider_mismatch", "record_provider": record.get("provider"),
+                    "head_sha": head}
+        if record["state"] == "COMPLETED" and self.provider_key == "claude_agent_sdk":
+            try:
+                result = json.loads(record.get("outcome") or "")
+            except (TypeError, ValueError):
+                result = None
+            if isinstance(result, dict):
+                return self._submit_decision(repo, issue, pr, head, result)
+            self.store.update_reviewer_execution(repo, pr, head, "FAILED",
+                                                 outcome="completed_result_unavailable")
+            return {"status": "reviewer_result_unavailable", "head_sha": head}
         if not record.get("execution_id") and record["state"] not in {"STARTING"}:
             return {"status": "reviewer_not_relaunched", "state": record["state"],
                     "outcome": record.get("outcome"), "head_sha": head}
@@ -382,17 +408,33 @@ class LocalReviewerDriver:
             execution = self.provider.launch_review(repo, issue, pr, head)
         except Exception as error:
             diagnostic = self._launch_diagnostic(error)
+            execution_id = getattr(error, "execution_id", None)
+            if self.provider_key == "claude_agent_sdk":
+                if getattr(error, "terminal", False):
+                    outcome = "sdk_terminal_failure:" + diagnostic
+                elif getattr(error, "execution_started", False):
+                    outcome = "sdk_execution_state_unknown:" + diagnostic
+                else:
+                    outcome = "sdk_not_started:" + diagnostic
+            else:
+                outcome = "provider_launch_failed:" + diagnostic
             self.store.update_reviewer_execution(repo, pr, head, "FAILED",
-                                                 outcome="provider_launch_failed:" + diagnostic)
+                                                 execution_id=execution_id, outcome=outcome)
             return {"status": "reviewer_launch_failed", "head_sha": head, "detail": diagnostic}
         if not isinstance(execution, dict) or not execution.get("execution_id"):
             diagnostic = "stage=execution_id_persist http_status=none exception_type=ExecutionIdMissing"
             self.store.update_reviewer_execution(repo, pr, head, "FAILED",
                                                  outcome="provider_launch_unobservable:" + diagnostic)
             return {"status": "reviewer_launch_unobservable", "head_sha": head, "detail": diagnostic}
-        self.store.update_reviewer_execution(repo, pr, head, "RUNNING",
-                                             str(execution["execution_id"]))
-        return {"status": "reviewer_running", "execution_id": str(execution["execution_id"]),
+        execution_id = str(execution["execution_id"])
+        if execution.get("status") == "completed" and self.provider_key == "claude_agent_sdk":
+            result = {"event": execution.get("event"), "body": execution.get("body")}
+            self.store.update_reviewer_execution(
+                repo, pr, head, "COMPLETED", execution_id,
+                outcome=json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+            return self._submit_decision(repo, issue, pr, head, result)
+        self.store.update_reviewer_execution(repo, pr, head, "RUNNING", execution_id)
+        return {"status": "reviewer_running", "execution_id": execution_id,
                 "head_sha": head}
 
     @staticmethod
@@ -411,16 +453,19 @@ class LocalReviewerDriver:
     def _submit_decision(self, repo, issue, pr, head, result):
         event, body = result.get("event"), result.get("body")
         if event not in {"APPROVE", "REQUEST_CHANGES"} or not isinstance(body, str) or not body.strip():
-            self.store.update_reviewer_execution(repo, pr, head, "FAILED",
-                                                 outcome="invalid_reviewer_decision")
+            if self.provider_key != "claude_agent_sdk":
+                self.store.update_reviewer_execution(repo, pr, head, "FAILED",
+                                                     outcome="invalid_reviewer_decision")
             return {"status": "reviewer_invalid_decision", "head_sha": head}
         try:
             decision = self.writer.submit(issue, pr, head, event, body)
         except ValueError:
-            self.store.update_reviewer_execution(repo, pr, head, "FAILED",
-                                                 outcome="exact_head_or_github_write_rejected")
+            if self.provider_key != "claude_agent_sdk":
+                self.store.update_reviewer_execution(repo, pr, head, "FAILED",
+                                                     outcome="exact_head_or_github_write_rejected")
             return {"status": "reviewer_decision_rejected", "head_sha": head}
-        state = "DECIDED" if decision.get("status") in {"review_submitted", "already_reviewed"} else "COMPLETED"
+        state = "DECIDED" if decision.get("status") in {
+            "review_submitted", "already_reviewed", "formal_review_exists"} else "COMPLETED"
         self.store.update_reviewer_execution(repo, pr, head, state, outcome=event)
         return {"status": "review_decision_submitted", "event": event,
                 "head_sha": head, "decision_status": decision.get("status")}
