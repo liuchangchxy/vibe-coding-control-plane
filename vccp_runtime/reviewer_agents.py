@@ -200,7 +200,7 @@ class ClaudeCodeReviewer:
         path, prompt = self.task.build(repo, issue, pr, head)
         env = self._env()
         command = [self.executable, "--bg", prompt, "--permission-mode", "plan",
-                   "--permission-prompts", "none", "--allowedTools", "Read", "Glob", "Grep",
+                   "--allowedTools", "Read", "Glob", "Grep",
                    "--disallowedTools", f"Read({Path.home() / '.vccp'}/**)",
                    f"Read({Path.home() / '.ssh'}/**)", f"Read({self.config_root}/**)",
                    "--cwd", str(path)]

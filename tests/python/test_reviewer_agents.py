@@ -86,6 +86,7 @@ class ReviewerAgentTests(unittest.TestCase):
             self.assertIn("--permission-mode", launch_args)
             self.assertIn("plan", launch_args)
             self.assertIn("--allowedTools", launch_args)
+            self.assertNotIn("--permission-prompts", launch_args)
             self.assertNotIn("GH_TOKEN", launch_kwargs["env"])
             self.assertNotIn("GITHUB_TOKEN", launch_kwargs["env"])
             self.assertEqual(provider.observe_review(session, REPO, 7, 12, head), {"status": "running"})
