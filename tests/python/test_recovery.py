@@ -226,6 +226,50 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.core.store.attempt(row["attempt_id"])["phase"], "TERMINAL_UNRESOLVED")
         self.assertEqual(len(self.implementer.requests), 1)
 
+    def test_human_requeue_after_verified_no_execution_creates_a_linked_attempt(self):
+        earlier_created, _ = self.core.store.create_initial_attempt("acme/alpha", 7, "owner", 30, 60)
+        earlier_id, _ = earlier_created
+        self.core.store.mark_phase(earlier_id, "RETRY_ELIGIBLE", outcome="human_verified_no_conversation")
+        self.start(LaunchDisposition.UNKNOWN)
+        previous = self.core.store.attempts_for_repo("acme/alpha")[-1]
+        self.core.reconcile_once("acme/alpha", "owner", previous["deadline_at"] + 1)
+        earlier = self.core.store.attempt(earlier_id)
+        before = self.core.store.attempt(previous["attempt_id"])
+        self.assertEqual(before["phase"], "TERMINAL_UNRESOLVED")
+        self.assertEqual(before["launch_outcome"], "unknown")
+        self.assertIsNone(before["execution_id"])
+
+        blocked = self.workflow.observe("acme/alpha", 7)
+        self.set_snapshot(replace(blocked, coordination_state="agent-ready", terminal_labels=(), revision="human-retry"))
+        result = self.core.dispatch_initial("acme/alpha", 7, "owner")
+
+        self.assertEqual(result["status"], "launched")
+        attempts = self.core.store.attempts_for_repo("acme/alpha")
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(self.core.store.attempt(earlier_id), earlier)
+        self.assertEqual(self.core.store.attempt(previous["attempt_id"]), before)
+        recovered = attempts[-1]
+        self.assertEqual(recovered["cause_type"], "authorized_no_conversation_retry")
+        self.assertEqual(recovered["cause_id"], previous["attempt_id"])
+        self.assertEqual(recovered["execution_id"], "exec")
+
+    def test_human_requeue_does_not_retry_terminal_unknown_with_execution_id(self):
+        self.start(LaunchDisposition.UNKNOWN)
+        previous = self.core.store.attempts_for_repo("acme/alpha")[-1]
+        self.core.reconcile_once("acme/alpha", "owner", previous["deadline_at"] + 1)
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("UPDATE attempts SET execution_id='possibly-existing' WHERE attempt_id=?",
+                         (previous["attempt_id"],))
+            conn.commit()
+        blocked = self.workflow.observe("acme/alpha", 7)
+        self.set_snapshot(replace(blocked, coordination_state="agent-ready", terminal_labels=(), revision="human-retry"))
+
+        result = self.core.dispatch_initial("acme/alpha", 7, "owner")
+
+        self.assertEqual(result["status"], "initial_attempt_already_recorded")
+        self.assertEqual(len(self.core.store.attempts_for_repo("acme/alpha")), 1)
+        self.assertEqual(len(self.implementer.requests), 1)
+
     def test_claim_and_launch_phase_timeout_fail_closed_without_launch(self):
         created, _ = self.core.store.create_initial_attempt("acme/alpha", 7, "owner", 30, 60)
         attempt_id, _ = created

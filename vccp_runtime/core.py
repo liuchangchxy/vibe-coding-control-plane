@@ -369,18 +369,30 @@ class _Store:
                 "SELECT trusted, initial_confirmed FROM flows WHERE repo=? AND issue_number=?", (repo, issue)
             ).fetchone()
             prior = connection.execute(
-                "SELECT phase FROM attempts WHERE repo=? AND issue_number=? AND kind='initial_dispatch' "
-                "AND phase NOT IN ('CLAIM_FAILED','LAUNCH_NOT_STARTED','RETRY_ELIGIBLE') LIMIT 1",
+                "SELECT attempt_id,phase,launch_outcome,execution_id FROM attempts "
+                "WHERE repo=? AND issue_number=? AND kind='initial_dispatch' "
+                "ORDER BY created_at DESC,rowid DESC LIMIT 1",
                 (repo, issue),
             ).fetchone()
+            recovery_cause_id = None
             if flow and (flow["initial_confirmed"] or connection.execute(
                 "SELECT 1 FROM attempts WHERE repo=? AND issue_number=? AND kind='repair' LIMIT 1", (repo, issue)
             ).fetchone()):
                 connection.commit()
                 return None, "flow_already_started"
-            if prior and prior["phase"] not in {"CLAIM_FAILED", "LAUNCH_NOT_STARTED", "RETRY_ELIGIBLE"}:
-                connection.commit()
-                return None, "initial_attempt_already_recorded"
+            if prior:
+                if prior["phase"] in {"CLAIM_FAILED", "LAUNCH_NOT_STARTED", "RETRY_ELIGIBLE"}:
+                    pass
+                elif (prior["phase"] == "TERMINAL_UNRESOLVED"
+                      and prior["launch_outcome"] == "unknown"
+                      and not prior["execution_id"]):
+                    # The caller has freshly observed agent-ready without terminal labels.
+                    # Since terminal labels require human resolution, record the new dispatch
+                    # as an authorized retry and keep the unresolved attempt unchanged.
+                    recovery_cause_id = prior["attempt_id"]
+                else:
+                    connection.commit()
+                    return None, "initial_attempt_already_recorded"
             connection.execute(
                 "INSERT INTO flows(repo, issue_number, trusted, initial_confirmed) VALUES(?,?,0,0) "
                 "ON CONFLICT(repo, issue_number) DO UPDATE SET trusted=0, initial_confirmed=0",
@@ -390,8 +402,10 @@ class _Store:
             now = time.time()
             connection.execute(
                 "INSERT INTO attempts(attempt_id,repo,issue_number,owner_id,lease_token,kind,phase,created_at,updated_at,"
-                "phase_entered_at,deadline_at) VALUES(?,?,?,?,?,'initial_dispatch','CLAIM_INTENT',?,?,?,?)",
-                (attempt_id, repo, issue, owner, token, now, now, now, now + recovery_timeout),
+                "phase_entered_at,deadline_at,cause_type,cause_id) "
+                "VALUES(?,?,?,?,?,'initial_dispatch','CLAIM_INTENT',?,?,?,?,?,?)",
+                (attempt_id, repo, issue, owner, token, now, now, now, now + recovery_timeout,
+                 "authorized_no_conversation_retry" if recovery_cause_id else None, recovery_cause_id),
             )
             connection.commit()
             return (attempt_id, token), None
