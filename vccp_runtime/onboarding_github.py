@@ -38,8 +38,20 @@ def dispatch(request: dict, *, provider=None):
     method, path, body = endpoints[action]
     if not provider:
         raise ValueError("GitHub App provider is required")
+    additional_permissions = {}
+    if action == "createTree":
+        tree = request.get("tree") or {}
+        entries = tree.get("tree") if isinstance(tree, dict) else None
+        if isinstance(entries, list) and any(
+                isinstance(item, dict) and isinstance(item.get("path"), str)
+                and item["path"].startswith(".github/workflows/") for item in entries):
+            additional_permissions = {"workflows": "write"}
     try:
-        status, payload = provider.request(method, path, repo, body)
+        if additional_permissions:
+            status, payload = provider.request(
+                method, path, repo, body, additional_permissions=additional_permissions)
+        else:
+            status, payload = provider.request(method, path, repo, body)
     except GitHubHTTPError as error:
         if error.status == 404 and action in {"getBranch", "getBranchProtection", "getRef"}:
             return None

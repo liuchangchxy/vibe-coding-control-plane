@@ -108,6 +108,22 @@ class GitHubAppProviderTests(unittest.TestCase):
         self.assertEqual(mint[3], {"repositories": ["consumer"], "permissions": REQUIRED_PERMISSIONS})
         self.assertNotIn(SECRET_TOKEN, repr(result))
 
+    def test_additional_permission_mints_separate_scoped_token(self):
+        permissions = dict(REQUIRED_PERMISSIONS, workflows="write")
+        transport = FakeTransport(permissions=permissions)
+        provider = self.provider(transport)
+
+        default_token = provider.get_token(REPO)
+        workflow_token = provider.get_token(REPO, additional_permissions={"workflows": "write"})
+        self.assertEqual(provider.get_token(REPO, additional_permissions={"workflows": "write"}), workflow_token)
+        self.assertEqual(provider.get_token(REPO), default_token)
+        self.assertEqual(transport.token_mints, 2)
+        mints = [call[3] for call in transport.calls if call[0] == "POST" and call[1].endswith("/access_tokens")]
+        self.assertEqual(mints, [
+            {"repositories": ["consumer"], "permissions": REQUIRED_PERMISSIONS},
+            {"repositories": ["consumer"], "permissions": permissions},
+        ])
+
     def test_probe_reports_missing_installation_and_permission_without_writes(self):
         transport = FakeTransport(installed=False)
         with self.assertRaises(GitHubAppNotInstalled):

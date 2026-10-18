@@ -285,7 +285,7 @@ class GitHubAppCredentialProvider:
         self.required_permissions = dict(required_permissions or REQUIRED_PERMISSIONS)
         self.clock = clock
         self._private_key = None
-        self._tokens: dict[str, tuple[str, float]] = {}
+        self._tokens: dict[tuple[str, tuple[tuple[str, str], ...]], tuple[str, float]] = {}
 
     def _repo(self, repo: str) -> tuple[str, str]:
         if not isinstance(repo, str) or not _REPO.fullmatch(repo) or repo.casefold() != self.target_repository:
@@ -302,7 +302,8 @@ class GitHubAppCredentialProvider:
         status, response = self.transport.request(method, self.api_url + path, token, payload)
         return status, response
 
-    def _installation(self, repo: str, *, fail_on_insufficient: bool = True):
+    def _installation(self, repo: str, *, fail_on_insufficient: bool = True,
+                      required_permissions: dict[str, str] | None = None):
         owner, name = self._repo(repo)
         jwt = create_app_jwt(self.app_id, self._key(), int(self.clock()))
         status, app = self._call("GET", "/app", jwt)
@@ -324,7 +325,8 @@ class GitHubAppCredentialProvider:
         if str(account.get("login", "")).casefold() != owner.casefold():
             raise GitHubAppIdentityError("GitHub App installation owner does not match target repository")
         permissions = installation.get("permissions") or {}
-        missing = {name: level for name, level in self.required_permissions.items()
+        required = self.required_permissions if required_permissions is None else required_permissions
+        missing = {name: level for name, level in required.items()
                    if not self._permission_sufficient(permissions.get(name), level)}
         if missing and fail_on_insufficient:
             raise GitHubAppPermissionError(missing)
@@ -337,17 +339,27 @@ class GitHubAppCredentialProvider:
     def _permission_sufficient(granted, required):
         return granted == "write" if required == "write" else granted in {"read", "write"}
 
-    def get_token(self, repo: str) -> str:
+    def get_token(self, repo: str, *, additional_permissions: dict[str, str] | None = None) -> str:
         self._repo(repo)
-        cached = self._tokens.get(repo.casefold())
+        permissions = dict(self.required_permissions)
+        if additional_permissions:
+            for name, level in additional_permissions.items():
+                if not isinstance(name, str) or level not in {"read", "write"}:
+                    raise ValueError("additional GitHub App permissions are invalid")
+                if permissions.get(name) == "write" or level == "write":
+                    permissions[name] = "write"
+                else:
+                    permissions[name] = "read"
+        cache_key = (repo.casefold(), tuple(sorted(permissions.items())))
+        cached = self._tokens.get(cache_key)
         now = float(self.clock())
         if cached and cached[1] - _APPROX_TOKEN_TTL.total_seconds() > now:
             return cached[0]
-        owner, name, installation_id, missing = self._installation(repo)
+        owner, name, installation_id, missing = self._installation(repo, required_permissions=permissions)
         jwt = create_app_jwt(self.app_id, self._key(), int(self.clock()))
         _status, data = self._call(
             "POST", f"/app/installations/{installation_id}/access_tokens", jwt,
-            {"repositories": [name], "permissions": self.required_permissions},
+            {"repositories": [name], "permissions": permissions},
         )
         token = data.get("token")
         expires = data.get("expires_at")
@@ -362,18 +374,18 @@ class GitHubAppCredentialProvider:
                                                   for item in repositories if isinstance(item, dict)] != [repo.casefold()]:
             raise GitHubAppIdentityError("GitHub installation token repository scope did not match target")
         actual = data.get("permissions") or {}
-        if actual != self.required_permissions:
+        if actual != permissions:
             raise GitHubAppError("GitHub installation token permissions exceeded or missed the requested subset")
-        missing = {name: level for name, level in self.required_permissions.items()
+        missing = {name: level for name, level in permissions.items()
                    if not self._permission_sufficient(actual.get(name), level)}
         if missing:
             raise GitHubAppPermissionError(missing)
-        self._tokens[repo.casefold()] = (token, expiry)
+        self._tokens[cache_key] = (token, expiry)
         return token
 
-    def request(self, method: str, path: str, repo: str, payload=None):
+    def request(self, method: str, path: str, repo: str, payload=None, *, additional_permissions=None):
         self._repo(repo)
-        token = self.get_token(repo)
+        token = self.get_token(repo, additional_permissions=additional_permissions)
         return self._call(method, path, token, payload)
 
     def probe(self, repo: str) -> dict:
@@ -385,7 +397,7 @@ class GitHubAppCredentialProvider:
         token = self.get_token(repo)
         return {"installed": True, "permissions_sufficient": True, "missing_permissions": [],
                 "installation_id": installation_id, "repository": f"{owner}/{name}",
-                "token_cached": repo.casefold() in self._tokens}
+                "token_cached": (repo.casefold(), tuple(sorted(self.required_permissions.items()))) in self._tokens}
 
 
 def repository_from_remote(remote: str, api_url: str = "https://api.github.com") -> str | None:
