@@ -257,10 +257,20 @@ class ClaudeCodeReviewer:
             if not isinstance(record, dict):
                 return {"status": "unobservable", "exception_type": "ClaudeSessionInventoryInvalid"}
             cwd = record.get("cwd")
-            if cwd and Path(str(cwd)).expanduser().resolve() != path.resolve():
+            if not cwd:
+                return {"status": "unobservable", "exception_type": "ClaudeSessionWorkspaceMissing"}
+            if Path(str(cwd)).expanduser().resolve() != path.resolve():
                 continue
             scoped.append(record)
-        return {"status": "present", "count": len(scoped)} if scoped else {"status": "none"}
+        if not scoped:
+            return {"status": "none"}
+        if len(scoped) == 1:
+            session = scoped[0]
+            execution_id = session.get("sessionId")
+            state = str(session.get("state") or session.get("status") or "").casefold()
+            if isinstance(execution_id, str) and execution_id and state == "failed":
+                return {"status": "terminal_failed", "execution_id": execution_id, "state": state}
+        return {"status": "present", "count": len(scoped)}
 
     def recover_review(self, repo, issue, pr, head):
         """Recover only a unique Claude session scoped to this PR/head worktree."""

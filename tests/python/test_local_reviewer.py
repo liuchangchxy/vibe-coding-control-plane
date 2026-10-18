@@ -301,6 +301,29 @@ class LocalReviewerWriterTests(unittest.TestCase):
         self.assertEqual(history[0]["previous_outcome"], "provider_launch_failed:stage=issue")
         self.assertEqual(history[0]["authorized_by"], "liuchangchxy")
 
+    def test_terminal_failed_claude_session_can_retry_with_prior_execution_preserved(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = _Store(str(Path(root) / "runtime.sqlite"))
+            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_code", 10)
+            store.update_reviewer_execution(REPO, 12, HEAD, "RUNNING", "failed-session-id", now=11)
+            store.update_reviewer_execution(REPO, 12, HEAD, "FAILED",
+                                            outcome="provider_launch_failed:unsupported_option", now=12)
+            agent = FakeReviewAgent({"status": "terminal_failed", "execution_id": "failed-session-id",
+                                     "state": "failed"})
+            writer = LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO,
+                                         "liuchangchxy", MANIFEST)
+
+            result = LocalReviewerDriver(store, agent, writer, "claude_code").retry_failed(
+                REPO, 7, 12, HEAD, authorization_head=HEAD)
+
+            record = store.reviewer_execution(REPO, 12, HEAD)
+            history = store.reviewer_retry_history(REPO, 12, HEAD)
+
+        self.assertEqual(result["status"], "reviewer_running")
+        self.assertEqual(record["execution_id"], "review-session-1")
+        self.assertEqual(history[-1]["previous_execution_id"], "failed-session-id")
+        self.assertEqual(history[-1]["previous_outcome"], "provider_launch_failed:unsupported_option")
+
     def test_retry_requires_explicit_matching_authorization_sha(self):
         with tempfile.TemporaryDirectory() as root:
             store = _Store(str(Path(root) / "runtime.sqlite"))
@@ -323,6 +346,9 @@ class LocalReviewerWriterTests(unittest.TestCase):
 
     def test_retry_rejects_execution_id_or_any_exact_head_claude_session(self):
         for execution_id, evidence in (("session-already-known", {"status": "none"}),
+                                       ("session-already-known", {"status": "terminal_failed",
+                                                                   "execution_id": "different-session",
+                                                                   "state": "failed"}),
                                        (None, {"status": "present", "count": 1})):
             with self.subTest(execution_id=execution_id, evidence=evidence), \
                     tempfile.TemporaryDirectory() as root:
@@ -340,6 +366,22 @@ class LocalReviewerWriterTests(unittest.TestCase):
                 self.assertEqual(result["status"], "reviewer_retry_rejected")
                 self.assertEqual(agent.launches, [])
                 self.assertEqual(store.reviewer_retry_history(REPO, 12, HEAD), [])
+
+    def test_retry_rejects_running_session_even_when_prior_execution_id_matches(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = _Store(str(Path(root) / "runtime.sqlite"))
+            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_code", 10)
+            store.update_reviewer_execution(REPO, 12, HEAD, "RUNNING", "live-session-id", now=11)
+            store.update_reviewer_execution(REPO, 12, HEAD, "FAILED", outcome="observation failed", now=12)
+            agent = FakeReviewAgent({"status": "present", "count": 1})
+            writer = LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO,
+                                         "liuchangchxy", MANIFEST)
+
+            result = LocalReviewerDriver(store, agent, writer, "claude_code").retry_failed(
+                REPO, 7, 12, HEAD, authorization_head=HEAD)
+
+        self.assertEqual(result["status"], "reviewer_retry_rejected")
+        self.assertEqual(agent.launches, [])
 
     def test_retry_fails_closed_on_changed_or_closed_pr_and_existing_formal_review(self):
         scenarios = (
