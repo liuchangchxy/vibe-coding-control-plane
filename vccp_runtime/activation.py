@@ -17,6 +17,7 @@ from .github_app import (DPAPIFileCredentialSource, GitHubAppError,
                          POSIXFileCredentialSource, make_credential_source)
 from .github_push import GitHubAppPushBackend
 from .runner import RuntimeAlreadyRunning, RuntimeLock
+from .providers import CLAUDE_AGENT_SDK_PROVIDER
 
 _REQUIRED = (
     "database_path", "workspace", "owner_id",
@@ -98,10 +99,22 @@ def qualify_activation(manifest: dict, local_config: dict, repo: str, environ=No
             blockers.append("reviewer_github_identity is required for a local Reviewer binding")
         for settings in reviewer_settings:
             provider_type, executable = settings.get("type"), settings.get("executable")
-            if provider_type not in _PROVIDER_ADAPTERS:
+            if provider_type == "claude_agent_sdk":
+                if settings.get("key") != CLAUDE_AGENT_SDK_PROVIDER:
+                    blockers.append("Claude Agent SDK Reviewer key must be claude_agent_sdk")
+                try:
+                    from importlib.metadata import version
+                    version("claude-agent-sdk")
+                    from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
+                    if ClaudeAgentOptions is None or ResultMessage is None or query is None:
+                        raise ImportError("required Claude Agent SDK symbols are unavailable")
+                except Exception:
+                    blockers.append("Claude Agent SDK package is unavailable")
+            elif provider_type == "antigravity":
+                if not isinstance(executable, str) or not Path(executable).expanduser().is_file():
+                    blockers.append(f"required Reviewer executable is unavailable: {provider_type}")
+            else:
                 blockers.append(f"unsupported local Reviewer provider type: {provider_type}")
-            elif not isinstance(executable, str) or not Path(executable).expanduser().is_file():
-                blockers.append(f"required Reviewer executable is unavailable: {provider_type}")
         project_root = local_config.get("project_config_root")
         if any(item.get("type") == "antigravity" for item in reviewer_settings) \
                 and project_root and not Path(project_root).expanduser().is_dir():

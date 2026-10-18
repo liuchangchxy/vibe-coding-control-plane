@@ -93,14 +93,16 @@ class FakeWorkflow:
 
 
 class FakeReviewAgent:
-    def __init__(self, retry_evidence=None):
+    def __init__(self, retry_evidence=None, execution=None):
         self.launches = []
         self.observations = []
         self.retry_evidence = retry_evidence or {"status": "none"}
+        self.execution = execution or {"execution_id": "review-session-1"}
+        self.retry_arguments = []
 
     def launch_review(self, repo, issue, pr, head):
         self.launches.append((repo, issue, pr, head))
-        return {"execution_id": "review-session-1"}
+        return dict(self.execution)
 
     def observe_review(self, execution_id, repo, issue, pr, head):
         self.observations.append(execution_id)
@@ -109,7 +111,8 @@ class FakeReviewAgent:
     def recover_review(self, repo, issue, pr, head):
         return "review-session-recovered"
 
-    def retry_session_evidence(self, repo, issue, pr, head):
+    def retry_session_evidence(self, repo, issue, pr, head, **kwargs):
+        self.retry_arguments.append(kwargs)
         return self.retry_evidence
 
 
@@ -194,27 +197,49 @@ class LocalReviewerWriterTests(unittest.TestCase):
 
         self.assertFalse(any(call[0] != "GET" for call in provider.calls))
 
+    def test_formal_review_appearing_during_revalidation_prevents_duplicate_write(self):
+        class RacingProvider(FakeProvider):
+            def __init__(self):
+                super().__init__()
+                self.review_reads = 0
+
+            def request(self, method, path, repo, payload=None):
+                if path.endswith("/pulls/12/reviews?per_page=100"):
+                    self.review_reads += 1
+                    if self.review_reads == 2:
+                        self.reviews = [{"commit_id": HEAD, "state": "APPROVED"}]
+                return super().request(method, path, repo, payload)
+
+        provider = RacingProvider()
+        writer = LocalReviewerWriter(provider, FakeWorkflow(), REPO, "liuchangchxy", MANIFEST)
+
+        result = writer.submit(7, 12, HEAD, "APPROVE", "Approved.")
+
+        self.assertEqual(result["status"], "formal_review_exists")
+        self.assertFalse(any(call[0] == "POST" and call[1].endswith("/pulls/12/reviews")
+                             for call in provider.calls))
+
     def test_durable_reviewer_claim_is_unique_per_repository_pr_and_head(self):
         with tempfile.TemporaryDirectory() as root:
             store = _Store(str(Path(root) / "runtime.sqlite"))
-            first, claimed = store.claim_reviewer_execution(REPO, 12, HEAD, "claude_code", 10)
+            first, claimed = store.claim_reviewer_execution(REPO, 12, HEAD, "claude_agent_sdk", 10)
             duplicate, claimed_again = store.claim_reviewer_execution(REPO.upper(), 12, HEAD.upper(),
                                                                         "antigravity", 11)
             next_head, claimed_next = store.claim_reviewer_execution(REPO, 12, "b" * 40,
-                                                                       "claude_code", 12)
+                                                                       "claude_agent_sdk", 12)
 
         self.assertTrue(claimed)
         self.assertFalse(claimed_again)
         self.assertTrue(claimed_next)
-        self.assertEqual(first["provider"], "claude_code")
-        self.assertEqual(duplicate["provider"], "claude_code")
+        self.assertEqual(first["provider"], "claude_agent_sdk")
+        self.assertEqual(duplicate["provider"], "claude_agent_sdk")
         self.assertEqual(next_head["head_sha"], "b" * 40)
 
     def test_reviewer_execution_survives_store_restart(self):
         with tempfile.TemporaryDirectory() as root:
             database = str(Path(root) / "runtime.sqlite")
             first = _Store(database)
-            first.claim_reviewer_execution(REPO, 12, HEAD, "claude_code", 10)
+            first.claim_reviewer_execution(REPO, 12, HEAD, "claude_agent_sdk", 10)
             first.update_reviewer_execution(REPO, 12, HEAD, "RUNNING", "session-1", now=11)
             restarted = _Store(database)
             observed = restarted.reviewer_execution(REPO, 12, HEAD)
@@ -229,10 +254,10 @@ class LocalReviewerWriterTests(unittest.TestCase):
             provider = FakeReviewAgent()
             workflow = FakeWorkflow()
             writer = LocalReviewerWriter(FakeProvider(), workflow, REPO, "liuchangchxy", MANIFEST)
-            first = LocalReviewerDriver(store, provider, writer, "claude_code")
+            first = LocalReviewerDriver(store, provider, writer, "claude_agent_sdk")
 
             started = first.advance(REPO, 7, 12, HEAD)
-            restarted = LocalReviewerDriver(_Store(database), provider, writer, "claude_code")
+            restarted = LocalReviewerDriver(_Store(database), provider, writer, "claude_agent_sdk")
             observed = restarted.advance(REPO, 7, 12, HEAD)
 
         self.assertEqual(started["status"], "reviewer_running")
@@ -240,15 +265,94 @@ class LocalReviewerWriterTests(unittest.TestCase):
         self.assertEqual(len(provider.launches), 1)
         self.assertEqual(provider.observations, ["review-session-1"])
 
+    def test_sdk_completion_persists_real_session_before_formal_review_write(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = _Store(str(Path(root) / "runtime.sqlite"))
+            provider = FakeProvider()
+            states_at_formal_write = []
+            def record_state(method, path, _payload):
+                if method == "POST" and path.endswith("/pulls/12/reviews"):
+                    states_at_formal_write.append(store.reviewer_execution(REPO, 12, HEAD))
+            original_request = provider.request
+            def observed_request(method, path, repo, payload=None):
+                record_state(method, path, payload)
+                return original_request(method, path, repo, payload)
+            provider.request = observed_request
+            agent = FakeReviewAgent(execution={
+                "status": "completed", "execution_id": "sdk-session-id",
+                "event": "APPROVE", "body": "All criteria pass."})
+            writer = LocalReviewerWriter(provider, FakeWorkflow(), REPO, "liuchangchxy", MANIFEST)
+
+            result = LocalReviewerDriver(store, agent, writer, "claude_agent_sdk").advance(
+                REPO, 7, 12, HEAD)
+            record = store.reviewer_execution(REPO, 12, HEAD)
+
+        self.assertEqual(result["status"], "review_decision_submitted")
+        self.assertEqual(result["event"], "APPROVE")
+        self.assertEqual(states_at_formal_write[0]["state"], "COMPLETED")
+        self.assertEqual(states_at_formal_write[0]["execution_id"], "sdk-session-id")
+        self.assertEqual(record["state"], "DECIDED")
+        self.assertEqual(record["provider"], "claude_agent_sdk")
+
+    def test_sdk_completed_result_replays_after_store_restart_without_second_query(self):
+        class InterruptedWriteProvider(FakeProvider):
+            def request(self, method, path, repo, payload=None):
+                if path == "/graphql": raise RuntimeError("temporary GitHub write interruption")
+                return super().request(method, path, repo, payload)
+
+        with tempfile.TemporaryDirectory() as root:
+            database = str(Path(root) / "runtime.sqlite")
+            first_store = _Store(database)
+            first_agent = FakeReviewAgent(execution={
+                "status": "completed", "execution_id": "sdk-session-id",
+                "event": "APPROVE", "body": "All criteria pass."})
+            interrupted_writer = LocalReviewerWriter(InterruptedWriteProvider(), FakeWorkflow(),
+                                                    REPO, "liuchangchxy", MANIFEST)
+            first = LocalReviewerDriver(first_store, first_agent, interrupted_writer, "claude_agent_sdk")
+            with self.assertRaisesRegex(RuntimeError, "temporary GitHub write interruption"):
+                first.advance(REPO, 7, 12, HEAD)
+            completed = first_store.reviewer_execution(REPO, 12, HEAD)
+
+            restarted_agent = FakeReviewAgent()
+            writer = LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO, "liuchangchxy", MANIFEST)
+            result = LocalReviewerDriver(_Store(database), restarted_agent, writer,
+                                         "claude_agent_sdk").advance(REPO, 7, 12, HEAD)
+            decided = _Store(database).reviewer_execution(REPO, 12, HEAD)
+
+        self.assertEqual(completed["state"], "COMPLETED")
+        self.assertEqual(completed["execution_id"], "sdk-session-id")
+        self.assertEqual(result["status"], "review_decision_submitted")
+        self.assertEqual(restarted_agent.launches, [])
+        self.assertEqual(decided["state"], "DECIDED")
+
+    def test_historical_claude_code_execution_is_not_claimed_by_sdk_provider(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = _Store(str(Path(root) / "runtime.sqlite"))
+            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_code", 10)
+            store.update_reviewer_execution(REPO, 12, HEAD, "RUNNING", "legacy-cli-session", now=11)
+            agent = FakeReviewAgent()
+            writer = LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO,
+                                         "liuchangchxy", MANIFEST)
+
+            result = LocalReviewerDriver(store, agent, writer, "claude_agent_sdk").advance(
+                REPO, 7, 12, HEAD)
+            record = store.reviewer_execution(REPO, 12, HEAD)
+
+        self.assertEqual(result["status"], "reviewer_provider_mismatch")
+        self.assertEqual(result["record_provider"], "claude_code")
+        self.assertEqual(record["execution_id"], "legacy-cli-session")
+        self.assertEqual(record["state"], "RUNNING")
+        self.assertEqual(agent.launches, [])
+
     def test_restart_recovers_provider_session_after_launch_before_id_persistence(self):
         with tempfile.TemporaryDirectory() as root:
             store = _Store(str(Path(root) / "runtime.sqlite"))
-            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_code")
+            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_agent_sdk")
             provider = FakeReviewAgent()
             writer = LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO,
                                          "liuchangchxy", MANIFEST)
 
-            result = LocalReviewerDriver(store, provider, writer, "claude_code").advance(
+            result = LocalReviewerDriver(store, provider, writer, "claude_agent_sdk").advance(
                 REPO, 7, 12, HEAD)
             record = store.reviewer_execution(REPO, 12, HEAD)
 
@@ -280,13 +384,13 @@ class LocalReviewerWriterTests(unittest.TestCase):
     def test_exact_head_manual_retry_preserves_failed_evidence_and_launches_once(self):
         with tempfile.TemporaryDirectory() as root:
             store = _Store(str(Path(root) / "runtime.sqlite"))
-            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_code", 10)
+            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_agent_sdk", 10)
             store.update_reviewer_execution(REPO, 12, HEAD, "FAILED",
-                                            outcome="provider_launch_failed:stage=issue", now=11)
+                                            outcome="sdk_not_started:stage=issue", now=11)
             agent = FakeReviewAgent()
             writer = LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO,
                                          "liuchangchxy", MANIFEST)
-            driver = LocalReviewerDriver(store, agent, writer, "claude_code")
+            driver = LocalReviewerDriver(store, agent, writer, "claude_agent_sdk")
 
             result = driver.retry_failed(REPO, 7, 12, HEAD, authorization_head=HEAD)
             record = store.reviewer_execution(REPO, 12, HEAD)
@@ -298,22 +402,22 @@ class LocalReviewerWriterTests(unittest.TestCase):
         self.assertEqual(record["state"], "RUNNING")
         self.assertEqual(record["execution_id"], "review-session-1")
         self.assertEqual(len(history), 1)
-        self.assertEqual(history[0]["previous_outcome"], "provider_launch_failed:stage=issue")
+        self.assertEqual(history[0]["previous_outcome"], "sdk_not_started:stage=issue")
         self.assertEqual(history[0]["authorized_by"], "liuchangchxy")
 
-    def test_terminal_failed_claude_session_can_retry_with_prior_execution_preserved(self):
+    def test_terminal_failed_sdk_session_can_retry_with_prior_execution_preserved(self):
         with tempfile.TemporaryDirectory() as root:
             store = _Store(str(Path(root) / "runtime.sqlite"))
-            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_code", 10)
+            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_agent_sdk", 10)
             store.update_reviewer_execution(REPO, 12, HEAD, "RUNNING", "failed-session-id", now=11)
             store.update_reviewer_execution(REPO, 12, HEAD, "FAILED",
-                                            outcome="provider_launch_failed:unsupported_option", now=12)
+                                            outcome="sdk_terminal_failure:unsupported_result", now=12)
             agent = FakeReviewAgent({"status": "terminal_failed", "execution_id": "failed-session-id",
                                      "state": "failed"})
             writer = LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO,
                                          "liuchangchxy", MANIFEST)
 
-            result = LocalReviewerDriver(store, agent, writer, "claude_code").retry_failed(
+            result = LocalReviewerDriver(store, agent, writer, "claude_agent_sdk").retry_failed(
                 REPO, 7, 12, HEAD, authorization_head=HEAD)
 
             record = store.reviewer_execution(REPO, 12, HEAD)
@@ -322,18 +426,18 @@ class LocalReviewerWriterTests(unittest.TestCase):
         self.assertEqual(result["status"], "reviewer_running")
         self.assertEqual(record["execution_id"], "review-session-1")
         self.assertEqual(history[-1]["previous_execution_id"], "failed-session-id")
-        self.assertEqual(history[-1]["previous_outcome"], "provider_launch_failed:unsupported_option")
+        self.assertEqual(history[-1]["previous_outcome"], "sdk_terminal_failure:unsupported_result")
 
     def test_retry_requires_explicit_matching_authorization_sha(self):
         with tempfile.TemporaryDirectory() as root:
             store = _Store(str(Path(root) / "runtime.sqlite"))
-            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_code", 10)
+            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_agent_sdk", 10)
             store.update_reviewer_execution(REPO, 12, HEAD, "FAILED", outcome="launch failed", now=11)
             agent = FakeReviewAgent()
             writer = LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO,
                                          "liuchangchxy", MANIFEST)
 
-            result = LocalReviewerDriver(store, agent, writer, "claude_code").retry_failed(
+            result = LocalReviewerDriver(store, agent, writer, "claude_agent_sdk").retry_failed(
                 REPO, 7, 12, HEAD, authorization_head="b" * 40)
 
             record = store.reviewer_execution(REPO, 12, HEAD)
@@ -344,7 +448,7 @@ class LocalReviewerWriterTests(unittest.TestCase):
         self.assertEqual(agent.launches, [])
         self.assertEqual(history, [])
 
-    def test_retry_rejects_execution_id_or_any_exact_head_claude_session(self):
+    def test_retry_rejects_execution_id_or_unknown_sdk_session_evidence(self):
         for execution_id, evidence in (("session-already-known", {"status": "none"}),
                                        ("session-already-known", {"status": "terminal_failed",
                                                                    "execution_id": "different-session",
@@ -353,14 +457,14 @@ class LocalReviewerWriterTests(unittest.TestCase):
             with self.subTest(execution_id=execution_id, evidence=evidence), \
                     tempfile.TemporaryDirectory() as root:
                 store = _Store(str(Path(root) / "runtime.sqlite"))
-                store.claim_reviewer_execution(REPO, 12, HEAD, "claude_code", 10)
+                store.claim_reviewer_execution(REPO, 12, HEAD, "claude_agent_sdk", 10)
                 store.update_reviewer_execution(REPO, 12, HEAD, "FAILED", execution_id,
                                                 "launch failed", now=11)
                 agent = FakeReviewAgent(evidence)
                 writer = LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO,
                                              "liuchangchxy", MANIFEST)
 
-                result = LocalReviewerDriver(store, agent, writer, "claude_code").retry_failed(
+                result = LocalReviewerDriver(store, agent, writer, "claude_agent_sdk").retry_failed(
                     REPO, 7, 12, HEAD, authorization_head=HEAD)
 
                 self.assertEqual(result["status"], "reviewer_retry_rejected")
@@ -370,14 +474,14 @@ class LocalReviewerWriterTests(unittest.TestCase):
     def test_retry_rejects_running_session_even_when_prior_execution_id_matches(self):
         with tempfile.TemporaryDirectory() as root:
             store = _Store(str(Path(root) / "runtime.sqlite"))
-            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_code", 10)
+            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_agent_sdk", 10)
             store.update_reviewer_execution(REPO, 12, HEAD, "RUNNING", "live-session-id", now=11)
             store.update_reviewer_execution(REPO, 12, HEAD, "FAILED", outcome="observation failed", now=12)
             agent = FakeReviewAgent({"status": "present", "count": 1})
             writer = LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO,
                                          "liuchangchxy", MANIFEST)
 
-            result = LocalReviewerDriver(store, agent, writer, "claude_code").retry_failed(
+            result = LocalReviewerDriver(store, agent, writer, "claude_agent_sdk").retry_failed(
                 REPO, 7, 12, HEAD, authorization_head=HEAD)
 
         self.assertEqual(result["status"], "reviewer_retry_rejected")
@@ -393,29 +497,30 @@ class LocalReviewerWriterTests(unittest.TestCase):
         for provider, _ in scenarios:
             with self.subTest(provider=provider), tempfile.TemporaryDirectory() as root:
                 store = _Store(str(Path(root) / "runtime.sqlite"))
-                store.claim_reviewer_execution(REPO, 12, HEAD, "claude_code", 10)
+                store.claim_reviewer_execution(REPO, 12, HEAD, "claude_agent_sdk", 10)
                 store.update_reviewer_execution(REPO, 12, HEAD, "FAILED", outcome="launch failed", now=11)
                 agent = FakeReviewAgent()
                 writer = LocalReviewerWriter(provider, FakeWorkflow(), REPO,
                                              "liuchangchxy", MANIFEST)
 
-                result = LocalReviewerDriver(store, agent, writer, "claude_code").retry_failed(
+                result = LocalReviewerDriver(store, agent, writer, "claude_agent_sdk").retry_failed(
                     REPO, 7, 12, HEAD, authorization_head=HEAD)
 
                 self.assertEqual(result["status"], "reviewer_retry_rejected")
                 self.assertEqual(agent.launches, [])
                 self.assertEqual(store.reviewer_retry_history(REPO, 12, HEAD), [])
 
-    def test_retry_rejects_unobservable_session_inventory(self):
+    def test_retry_fails_closed_when_sdk_execution_state_is_unknown(self):
         with tempfile.TemporaryDirectory() as root:
             store = _Store(str(Path(root) / "runtime.sqlite"))
-            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_code", 10)
-            store.update_reviewer_execution(REPO, 12, HEAD, "FAILED", outcome="launch failed", now=11)
-            agent = FakeReviewAgent({"status": "unobservable", "exception_type": "ClaudeSessionQueryFailed"})
+            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_agent_sdk", 10)
+            store.update_reviewer_execution(REPO, 12, HEAD, "FAILED", "possibly-running",
+                                            outcome="sdk_execution_state_unknown:transport", now=11)
+            agent = FakeReviewAgent({"status": "unobservable", "exception_type": "ExecutionStateUnknown"})
             writer = LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO,
                                          "liuchangchxy", MANIFEST)
 
-            result = LocalReviewerDriver(store, agent, writer, "claude_code").retry_failed(
+            result = LocalReviewerDriver(store, agent, writer, "claude_agent_sdk").retry_failed(
                 REPO, 7, 12, HEAD, authorization_head=HEAD)
 
         self.assertEqual(result["status"], "reviewer_retry_rejected")
@@ -428,7 +533,7 @@ class LocalReviewerWriterTests(unittest.TestCase):
             writer = LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO,
                                          "liuchangchxy", MANIFEST)
 
-            result = LocalReviewerDriver(store, agent, writer, "claude_code").advance(REPO, 7, 12, HEAD)
+            result = LocalReviewerDriver(store, agent, writer, "claude_agent_sdk").advance(REPO, 7, 12, HEAD)
             record = store.reviewer_execution(REPO, 12, HEAD)
 
         self.assertEqual(result["status"], "reviewer_launch_failed")

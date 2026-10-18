@@ -677,9 +677,9 @@ class AdapterTests(unittest.TestCase):
                 "github_app": {"app_id": "1", "credential_source": {"type": "test"}},
                 "providers": [
                     {"key": "antigravity", "type": "antigravity", "executable": "language_server"},
-                    {"key": "claude_code", "type": "claude_code", "executable": "claude"},
+                    {"key": "claude_agent_sdk", "type": "claude_agent_sdk"},
                 ],
-                "implementer_provider": "claude_code", "reviewer_provider": "antigravity",
+                "implementer_provider": "antigravity", "reviewer_provider": "claude_agent_sdk",
                 "reviewer_github_identity": "liuchangchxy",
             }
             class CredentialProvider:
@@ -687,8 +687,10 @@ class AdapterTests(unittest.TestCase):
             wired = build_runtime(MANIFEST, local, api=FakeAPI(), writer=FakeWriter(),
                                   credential_provider=CredentialProvider(), push_backend=object())
 
-            self.assertEqual(wired.router.primary, "claude_code")
-            self.assertEqual(wired.local_reviewer.provider_key, "antigravity")
+            from vccp_runtime.reviewer_agents import ClaudeAgentSDKReviewer
+            self.assertEqual(wired.router.primary, "antigravity")
+            self.assertEqual(wired.local_reviewer.provider_key, "claude_agent_sdk")
+            self.assertIsInstance(wired.local_reviewer.provider, ClaudeAgentSDKReviewer)
             self.assertIs(wired.lifecycle.local_reviewer, wired.local_reviewer)
 
     def test_generic_app_runtime_needs_no_prebuilt_helpers_and_generates_attempt_wrappers(self):

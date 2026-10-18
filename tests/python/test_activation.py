@@ -176,5 +176,43 @@ class ActivationTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "ready")
 
+    def test_readiness_accepts_sdk_reviewer_without_claude_cli_executable(self):
+        config = dict(self.config, providers=[
+            {"key": "antigravity", "type": "antigravity", "executable": str(self.executable)},
+            {"key": "claude_agent_sdk", "type": "claude_agent_sdk"},
+        ], implementer_provider="antigravity", reviewer_provider="claude_agent_sdk",
+            reviewer_github_identity="reviewer")
+
+        with patch("vccp_runtime.local_reviewer.GitHubUserReviewerProvider.verify_identity",
+                   return_value={"login": "reviewer", "verified": True}):
+            result = self._qualify(config=config)
+
+        self.assertEqual(result["status"], "ready")
+
+    def test_missing_agent_sdk_package_blocks_sdk_reviewer_readiness(self):
+        from importlib.metadata import PackageNotFoundError
+        config = dict(self.config, providers=[
+            {"key": "antigravity", "type": "antigravity", "executable": str(self.executable)},
+            {"key": "claude_agent_sdk", "type": "claude_agent_sdk"},
+        ], implementer_provider="antigravity", reviewer_provider="claude_agent_sdk",
+            reviewer_github_identity="reviewer")
+        with patch("importlib.metadata.version", side_effect=PackageNotFoundError):
+            result = self._qualify(config=config)
+
+        self.assertEqual(result["status"], "not_ready")
+        self.assertIn("Claude Agent SDK package is unavailable", result["blockers"])
+
+    def test_sdk_reviewer_requires_canonical_provider_key(self):
+        config = dict(self.config, providers=[
+            {"key": "antigravity", "type": "antigravity", "executable": str(self.executable)},
+            {"key": "another_name", "type": "claude_agent_sdk"},
+        ], implementer_provider="antigravity", reviewer_provider="another_name",
+            reviewer_github_identity="reviewer")
+
+        result = self._qualify(config=config)
+
+        self.assertEqual(result["status"], "not_ready")
+        self.assertIn("Claude Agent SDK Reviewer key must be claude_agent_sdk", result["blockers"])
+
 
 if __name__ == "__main__": unittest.main()
