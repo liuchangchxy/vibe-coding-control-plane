@@ -46,6 +46,11 @@ def dispatch(request: dict, *, provider=None):
                 isinstance(item, dict) and isinstance(item.get("path"), str)
                 and item["path"].startswith(".github/workflows/") for item in entries):
             additional_permissions = {"workflows": "write"}
+    elif action == "createRef":
+        requested_permissions = request.get("additional_permissions") or {}
+        if requested_permissions and requested_permissions != {"workflows": "write"}:
+            raise ValueError("unsupported additional GitHub App permission for reference creation")
+        additional_permissions = requested_permissions
     try:
         if additional_permissions:
             status, payload = provider.request(

@@ -48,3 +48,16 @@ test("a locally cached commit is rejected when the public source cannot provide 
 
   assert.equal(await client.getCommit(SOURCE, revision), null);
 });
+
+test("createRef forwards narrowly requested permissions to the App bridge", async () => {
+  let request;
+  const client = new AppGitHubClient({ runtimeConfig: { github_app: {}, target_repository: CONSUMER } });
+  client.request = async (...args) => { request = args; return { ref: "created" }; };
+
+  await client.createRef(CONSUMER, { ref: "refs/heads/codex-vccp-deploy-plan", sha: "abc" }, { workflows: "write" });
+
+  assert.deepEqual(request, ["createRef", CONSUMER, {
+    ref: { ref: "refs/heads/codex-vccp-deploy-plan", sha: "abc" },
+    additional_permissions: { workflows: "write" },
+  }]);
+});
