@@ -181,7 +181,7 @@ test("maintenance publisher creates a deterministic removal PR and adopts it on 
     execFileSync("git", ["-C", root, "add", "."]);
     execFileSync("git", ["-C", root, "commit", "-qm", "install"]);
     const base = execFileSync("git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-    const calls = { tree: null, pulls: 0 };
+    const calls = { tree: null, pulls: 0, refPermissions: [] };
     const prs = [];
     const github = {
       async listPullRequests() { return prs; },
@@ -192,17 +192,22 @@ test("maintenance publisher creates a deterministic removal PR and adopts it on 
       async createBlob() { return { sha: "unused" }; },
       async createTree(_repo, tree) { calls.tree = tree; return { sha: "new-tree" }; },
       async createCommit() { return { sha: "d".repeat(40) }; },
-      async createRef(_repo, ref) { return { ref: ref.ref }; },
+      async createRef(_repo, ref, additionalPermissions) { calls.refPermissions.push(additionalPermissions); return { ref: ref.ref }; },
       async createPullRequest(_repo, pr) { calls.pulls += 1; const value = { number: 12, html_url: "https://github.com/example/consumer/pull/12", head: { ref: pr.head, sha: "d".repeat(40) }, base: { ref: "main" } }; prs.push(value); return value; },
     };
     const plan = { command: "remove", repo: REPO, plan_id: "f".repeat(64), snapshot: { base_branch: "main", base_branch_sha: base },
-      items: [{ path: ".github/control-plane.yml", status: "delete", sha256: sha("owned\n") }] };
+      items: [{ path: ".github/control-plane.yml", status: "delete", sha256: sha("owned\n") },
+        { path: ".github/workflows/managed.yml", status: "delete" }] };
     const first = await publishMaintenancePlan({ plan, github, root });
     const second = await publishMaintenancePlan({ plan, github, root });
     assert.equal(first.status, "open", JSON.stringify(first));
     assert.equal(second.adopted, true);
     assert.equal(calls.pulls, 1);
-    assert.deepEqual(calls.tree.tree, [{ path: ".github/control-plane.yml", mode: "100644", type: "blob", sha: null }]);
+    assert.deepEqual(calls.tree.tree, [
+      { path: ".github/control-plane.yml", mode: "100644", type: "blob", sha: null },
+      { path: ".github/workflows/managed.yml", mode: "100644", type: "blob", sha: null },
+    ]);
+    assert.deepEqual(calls.refPermissions[0], { workflows: "write" });
     assert.match(first.branch, /^codex-vccp-remove-/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });

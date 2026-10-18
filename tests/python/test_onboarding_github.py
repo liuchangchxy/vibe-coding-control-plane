@@ -36,6 +36,14 @@ class OnboardingGitHubTests(unittest.TestCase):
 
         self.assertEqual(provider.calls[0][4], {})
 
+    def test_workflow_ref_requests_additional_workflows_permission(self):
+        provider = Provider()
+        dispatch({"action": "createRef", "repo": "owner/repo",
+                  "ref": {"ref": "refs/heads/codex-vccp-deploy-plan", "sha": "abc"},
+                  "additional_permissions": {"workflows": "write"}}, provider=provider)
+
+        self.assertEqual(provider.calls[0][4], {"additional_permissions": {"workflows": "write"}})
+
 
 if __name__ == "__main__":
     unittest.main()
