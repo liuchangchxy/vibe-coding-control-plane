@@ -210,10 +210,11 @@ class ReviewerAgentTests(unittest.TestCase):
             head = git(source, "rev-parse", "HEAD")
             reviews = Path(temp) / "reviews"
             calls = []
+            payload = ["[]"]
 
             def runner(command, cwd=None, env=None, timeout=30):
                 calls.append((command, cwd, env, timeout))
-                return SimpleNamespace(returncode=0, stdout="[]", stderr="")
+                return SimpleNamespace(returncode=0, stdout=payload[0], stderr="")
 
             provider = ClaudeCodeReviewer("/usr/bin/claude", FakeAPI(head), MANIFEST,
                                           str(source), str(reviews), runner=runner, environ={})
@@ -221,9 +222,14 @@ class ReviewerAgentTests(unittest.TestCase):
             git(source, "worktree", "add", "--detach", str(workspace), head)
 
             evidence = provider.retry_session_evidence(REPO, 7, 12, head)
+            payload[0] = json.dumps([{"sessionId": "failed-session", "cwd": str(workspace),
+                                      "state": "failed"}])
+            failed_evidence = provider.retry_session_evidence(REPO, 7, 12, head)
 
         self.assertEqual(evidence, {"status": "none"})
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(failed_evidence, {"status": "terminal_failed", "execution_id": "failed-session",
+                                          "state": "failed"})
+        self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][0][1:4], ["agents", "--json", "--all"])
         self.assertEqual(calls[0][1], str(workspace))
 

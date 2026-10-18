@@ -918,7 +918,8 @@ class _Store:
 
     def authorize_reviewer_retry(self, repo: str, pr_number: int, head_sha: str,
                                  provider: str, authorization_head_sha: str,
-                                 authorized_by: str, now: float | None = None):
+                                 authorized_by: str, now: float | None = None,
+                                 failed_execution_id: str | None = None):
         """Append explicit authorization and atomically arm one FAILED exact-head retry."""
         normalized_head = head_sha.casefold() if isinstance(head_sha, str) else ""
         normalized_authorization = (authorization_head_sha.casefold()
@@ -934,15 +935,15 @@ class _Store:
                 "SELECT * FROM reviewer_executions WHERE repo=? AND pr_number=? AND head_sha=?",
                 (_repo_key(repo), pr_number, normalized_head),
             ).fetchone()
-            if (row is None or row["state"] != "FAILED" or row["execution_id"] is not None
-                    or row["provider"] != provider):
+            if (row is None or row["state"] != "FAILED"
+                    or row["execution_id"] != failed_execution_id or row["provider"] != provider):
                 connection.rollback()
                 return False
             cursor = connection.execute(
                 "UPDATE reviewer_executions SET state='RETRY_AUTHORIZED',updated_at=? "
                 "WHERE repo=? AND pr_number=? AND head_sha=? AND provider=? "
-                "AND state='FAILED' AND execution_id IS NULL",
-                (timestamp, _repo_key(repo), pr_number, normalized_head, provider),
+                "AND state='FAILED' AND execution_id IS ?",
+                (timestamp, _repo_key(repo), pr_number, normalized_head, provider, failed_execution_id),
             )
             if cursor.rowcount != 1:
                 connection.rollback()
@@ -965,26 +966,28 @@ class _Store:
             connection.close()
 
     def claim_authorized_reviewer_retry(self, repo: str, pr_number: int, head_sha: str,
-                                        provider: str, now: float | None = None):
+                                        provider: str, now: float | None = None,
+                                        failed_execution_id: str | None = None):
         """Consume one authorization and reserve the retry without removing history."""
         timestamp = time.time() if now is None else float(now)
         normalized_head = head_sha.casefold()
         connection = self.transaction()
         try:
             authorization = connection.execute(
-                "SELECT authorization_id FROM reviewer_retry_authorizations "
+                "SELECT * FROM reviewer_retry_authorizations "
                 "WHERE repo=? AND pr_number=? AND head_sha=? AND consumed_at IS NULL "
                 "ORDER BY authorization_id DESC LIMIT 1",
                 (_repo_key(repo), pr_number, normalized_head),
             ).fetchone()
-            if authorization is None:
+            if (authorization is None or authorization["previous_state"] != "FAILED"
+                    or authorization["previous_execution_id"] != failed_execution_id):
                 connection.rollback()
                 return None, False
             cursor = connection.execute(
-                "UPDATE reviewer_executions SET state='STARTING',started_at=?,updated_at=?,outcome=NULL "
+                "UPDATE reviewer_executions SET state='STARTING',execution_id=NULL,started_at=?,updated_at=?,outcome=NULL "
                 "WHERE repo=? AND pr_number=? AND head_sha=? AND provider=? "
-                "AND state='RETRY_AUTHORIZED' AND execution_id IS NULL",
-                (timestamp, timestamp, _repo_key(repo), pr_number, normalized_head, provider),
+                "AND state='RETRY_AUTHORIZED' AND execution_id IS ?",
+                (timestamp, timestamp, _repo_key(repo), pr_number, normalized_head, provider, failed_execution_id),
             )
             if cursor.rowcount != 1:
                 connection.rollback()

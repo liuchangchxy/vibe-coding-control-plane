@@ -238,7 +238,6 @@ class LocalReviewerDriver:
                     "head_sha": normalized_head or head}
         record = self.store.reviewer_execution(repo, pr, normalized_head)
         if (not record or record.get("state") != "FAILED"
-                or record.get("execution_id") is not None
                 or record.get("provider") != self.provider_key):
             return {"status": "reviewer_retry_rejected", "reason": "execution_not_retryable",
                     "head_sha": normalized_head}
@@ -259,7 +258,7 @@ class LocalReviewerDriver:
             evidence = inspect_sessions(repo, issue, pr, normalized_head)
         except Exception as error:
             evidence = {"status": "unobservable", "exception_type": type(error).__name__}
-        if not isinstance(evidence, dict) or evidence.get("status") != "none":
+        if not self._retry_evidence_matches(evidence, record.get("execution_id")):
             return {"status": "reviewer_retry_rejected", "reason": "session_evidence_present_or_unknown",
                     "head_sha": normalized_head,
                     "exception_type": evidence.get("exception_type") if isinstance(evidence, dict) else None}
@@ -273,11 +272,22 @@ class LocalReviewerDriver:
             return {"status": "reviewer_retry_rejected", "reason": "operator_identity_unverified",
                     "head_sha": normalized_head}
         authorized = self.store.authorize_reviewer_retry(
-            repo, pr, normalized_head, self.provider_key, authorization_head, operator)
+            repo, pr, normalized_head, self.provider_key, authorization_head, operator,
+            failed_execution_id=record.get("execution_id"))
         if not authorized:
             return {"status": "reviewer_retry_rejected", "reason": "failed_state_changed",
                     "head_sha": normalized_head}
         return self.advance(repo, issue, pr, normalized_head)
+
+    @staticmethod
+    def _retry_evidence_matches(evidence: dict, failed_execution_id: str | None) -> bool:
+        if not isinstance(evidence, dict):
+            return False
+        if failed_execution_id is None:
+            return evidence.get("status") == "none"
+        return (evidence.get("status") == "terminal_failed"
+                and evidence.get("state") == "failed"
+                and evidence.get("execution_id") == failed_execution_id)
 
     def advance(self, repo: str, issue: int, pr: int, head: str):
         try:
@@ -303,11 +313,12 @@ class LocalReviewerDriver:
                 except Exception:
                     return {"status": "reviewer_retry_rejected", "reason": "retry_evidence_unavailable",
                             "head_sha": head}
-                if not isinstance(evidence, dict) or evidence.get("status") != "none":
+                if not self._retry_evidence_matches(evidence, record.get("execution_id")):
                     return {"status": "reviewer_retry_rejected", "reason": "session_evidence_present_or_unknown",
                             "head_sha": head}
                 record, claimed = self.store.claim_authorized_reviewer_retry(
-                    repo, pr, head, self.provider_key)
+                    repo, pr, head, self.provider_key,
+                    failed_execution_id=record.get("execution_id"))
                 if not claimed:
                     return {"status": "reviewer_retry_claim_lost", "head_sha": head}
             else:
