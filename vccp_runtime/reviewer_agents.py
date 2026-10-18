@@ -202,8 +202,7 @@ class ClaudeCodeReviewer:
         command = [self.executable, "--bg", prompt, "--permission-mode", "plan",
                    "--allowedTools", "Read", "Glob", "Grep",
                    "--disallowedTools", f"Read({Path.home() / '.vccp'}/**)",
-                   f"Read({Path.home() / '.ssh'}/**)", f"Read({self.config_root}/**)",
-                   "--cwd", str(path)]
+                   f"Read({Path.home() / '.ssh'}/**)", f"Read({self.config_root}/**)"]
         try:
             result = self.runner(command, cwd=path, env=env, timeout=60)
         except Exception as error:

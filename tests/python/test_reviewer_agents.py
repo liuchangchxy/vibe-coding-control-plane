@@ -83,6 +83,9 @@ class ReviewerAgentTests(unittest.TestCase):
             launch_args, launch_kwargs = commands[0]
             self.assertEqual(execution["execution_id"], session)
             self.assertEqual(git(root / "reviews" / "owner_repo" / "12" / head, "rev-parse", "HEAD"), head)
+            self.assertNotIn("--cwd", launch_args)
+            self.assertEqual(Path(launch_kwargs["cwd"]).resolve(),
+                             (root / "reviews" / "owner_repo" / "12" / head).resolve())
             self.assertIn("--permission-mode", launch_args)
             self.assertIn("plan", launch_args)
             self.assertIn("--allowedTools", launch_args)
