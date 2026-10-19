@@ -199,41 +199,44 @@ def compute_repair_key(repo: str, pr_number: int, head_sha: str) -> str:
     return f"repair:{_repo_key(repo)}:pr:{pr_number}:head:{head_sha.strip().lower()}"
 
 
-def _validate_legacy_evidence_attestation(attestation, repo: str, issue_number: int,
-                                         pr_number: int, head_sha: str,
-                                         exhausted_attempt_id: str,
-                                         authorized_by: str) -> dict:
-    """Validate that maintainer legacy evidence strictly binds to the exact historical attempt."""
+def _validate_legacy_maintenance_override(attestation, repo: str, issue_number: int,
+                                          pr_number: int, head_sha: str,
+                                          exhausted_attempt_id: str,
+                                          authorized_by: str) -> dict:
+    """Validate an explicit maintainer override bound to one exact exhausted flow."""
     if isinstance(attestation, str):
         try:
             attestation = json.loads(attestation)
         except Exception:
-            raise ValueError("legacy evidence attestation must be valid JSON")
+            raise ValueError("legacy maintenance override must be valid JSON")
     if not isinstance(attestation, dict):
-        raise ValueError("legacy evidence attestation must be a JSON object")
+        raise ValueError("legacy maintenance override must be a JSON object")
 
     req_repo = attestation.get("repo")
     req_issue = attestation.get("issue") if "issue" in attestation else attestation.get("issue_number")
     req_pr = attestation.get("pr") if "pr" in attestation else attestation.get("pr_number")
     req_head = attestation.get("head_sha") or attestation.get("head")
     req_attempt = attestation.get("exhausted_attempt_id") or attestation.get("attempt_id")
-    req_source = attestation.get("evidence_source") or attestation.get("source")
+    req_kind = attestation.get("kind")
+    req_reason = attestation.get("reason")
     req_authorizer = attestation.get("authorized_by") or attestation.get("attested_by")
 
     if not isinstance(req_repo, str) or req_repo.strip().casefold() != repo.casefold():
-        raise ValueError("legacy evidence repo does not match target candidate")
+        raise ValueError("legacy override repo does not match target candidate")
     if req_issue != issue_number:
-        raise ValueError("legacy evidence issue number does not match target candidate")
+        raise ValueError("legacy override issue number does not match target candidate")
     if req_pr != pr_number:
-        raise ValueError("legacy evidence PR number does not match target candidate")
+        raise ValueError("legacy override PR number does not match target candidate")
     if not isinstance(req_head, str) or req_head.strip().casefold() != head_sha.casefold():
-        raise ValueError("legacy evidence HEAD SHA does not match target candidate")
+        raise ValueError("legacy override HEAD SHA does not match target candidate")
     if not isinstance(req_attempt, str) or req_attempt.strip() != exhausted_attempt_id:
-        raise ValueError("legacy evidence exhausted attempt ID does not match target candidate")
-    if not isinstance(req_source, str) or not req_source.strip():
-        raise ValueError("legacy evidence must document verified historical execution source")
+        raise ValueError("legacy override exhausted attempt ID does not match target candidate")
+    if req_kind != "legacy_maintenance_override":
+        raise ValueError("legacy override kind must be legacy_maintenance_override")
+    if not isinstance(req_reason, str) or not req_reason.strip():
+        raise ValueError("legacy override requires a maintenance reason")
     if not isinstance(req_authorizer, str) or req_authorizer.strip().casefold() != authorized_by.casefold():
-        raise ValueError("legacy evidence authorizer identity does not match authorized_by")
+        raise ValueError("legacy override authorizer identity does not match authorized_by")
 
     return attestation
 
@@ -364,7 +367,7 @@ class _Store:
                     capacity INTEGER NOT NULL,
                     activated INTEGER NOT NULL DEFAULT 0,
                     consumed_at REAL,
-                    legacy_evidence_attestation TEXT
+                    legacy_maintenance_override TEXT
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS repair_continuations_cause_idx
                     ON repair_continuations(repo, issue_number, pr_number, head_sha, cause_type, cause_id);
@@ -424,8 +427,8 @@ class _Store:
             continuation_columns = {row[1] for row in connection.execute("PRAGMA table_info(repair_continuations)")}
             if "consumed_at" not in continuation_columns:
                 connection.execute("ALTER TABLE repair_continuations ADD COLUMN consumed_at REAL")
-            if "legacy_evidence_attestation" not in continuation_columns:
-                connection.execute("ALTER TABLE repair_continuations ADD COLUMN legacy_evidence_attestation TEXT")
+            if "legacy_maintenance_override" not in continuation_columns:
+                connection.execute("ALTER TABLE repair_continuations ADD COLUMN legacy_maintenance_override TEXT")
             connection.execute(
                 "UPDATE flows SET repair_count=(SELECT COUNT(*) FROM attempts WHERE attempts.repo=flows.repo "
                 "AND attempts.issue_number=flows.issue_number AND attempts.kind='repair' "
@@ -924,7 +927,7 @@ class _Store:
     def continuation_for_candidate(self, candidate: RepairCandidate):
         with closing(self._connect()) as connection:
             row = connection.execute(
-                "SELECT authorization_id,activated,consumed_at,legacy_evidence_attestation FROM repair_continuations WHERE repo=? AND issue_number=? "
+                "SELECT authorization_id,activated,consumed_at,legacy_maintenance_override FROM repair_continuations WHERE repo=? AND issue_number=? "
                 "AND pr_number=? AND head_sha=? AND cause_type=? AND cause_id=? "
                 "ORDER BY authorized_at DESC LIMIT 1",
                 (_repo_key(candidate.repo), candidate.issue_number, candidate.pr_number,
@@ -933,7 +936,7 @@ class _Store:
             return dict(row) if row else None
 
     def authorize_continuation(self, candidate: RepairCandidate, authorized_by: str,
-                               legacy_evidence_attestation: str | None = None):
+                               legacy_maintenance_override: str | None = None):
         connection = self.transaction()
         try:
             exhausted_id = self.exhaustion_for_candidate(candidate)
@@ -941,16 +944,16 @@ class _Store:
                 connection.commit()
                 return {"status": "matching_budget_exhaustion_not_found"}
             existing = connection.execute(
-                "SELECT authorization_id,activated,legacy_evidence_attestation FROM repair_continuations WHERE repo=? AND issue_number=? "
+                "SELECT authorization_id,activated,legacy_maintenance_override FROM repair_continuations WHERE repo=? AND issue_number=? "
                 "AND pr_number=? AND head_sha=? AND cause_type=? AND cause_id=?",
                 (_repo_key(candidate.repo), candidate.issue_number, candidate.pr_number,
                  candidate.head_sha.lower(), candidate.cause_type, candidate.cause_id),
             ).fetchone()
             if existing:
-                if legacy_evidence_attestation and not existing["activated"]:
+                if legacy_maintenance_override and not existing["activated"]:
                     connection.execute(
-                        "UPDATE repair_continuations SET legacy_evidence_attestation=? WHERE authorization_id=?",
-                        (legacy_evidence_attestation, existing["authorization_id"]),
+                        "UPDATE repair_continuations SET legacy_maintenance_override=? WHERE authorization_id=?",
+                        (legacy_maintenance_override, existing["authorization_id"]),
                     )
                 connection.commit()
                 return {"status": "already_authorized", "authorization_id": existing["authorization_id"],
@@ -965,11 +968,11 @@ class _Store:
             authorization_id = str(uuid4())
             connection.execute(
                 "INSERT INTO repair_continuations(authorization_id,repo,issue_number,pr_number,head_sha,"
-                "cause_type,cause_id,exhausted_attempt_id,authorized_by,authorized_at,capacity,legacy_evidence_attestation) "
+                "cause_type,cause_id,exhausted_attempt_id,authorized_by,authorized_at,capacity,legacy_maintenance_override) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (authorization_id, _repo_key(candidate.repo), candidate.issue_number, candidate.pr_number,
                  candidate.head_sha.lower(), candidate.cause_type, candidate.cause_id, exhausted_id,
-                 authorized_by, time.time(), REPAIRS_PER_CONTINUATION, legacy_evidence_attestation),
+                 authorized_by, time.time(), REPAIRS_PER_CONTINUATION, legacy_maintenance_override),
             )
             connection.commit()
             return {"status": "authorized_pending_activation", "authorization_id": authorization_id,
@@ -980,11 +983,11 @@ class _Store:
         finally:
             connection.close()
 
-    def update_legacy_attestation(self, authorization_id: str, legacy_evidence_attestation: str):
+    def update_legacy_maintenance_override(self, authorization_id: str, legacy_maintenance_override: str):
         with closing(self._connect()) as connection:
             connection.execute(
-                "UPDATE repair_continuations SET legacy_evidence_attestation=? WHERE authorization_id=? AND activated=0",
-                (legacy_evidence_attestation, authorization_id),
+                "UPDATE repair_continuations SET legacy_maintenance_override=? WHERE authorization_id=? AND activated=0",
+                (legacy_maintenance_override, authorization_id),
             )
             connection.commit()
 
@@ -1011,7 +1014,7 @@ class _Store:
             return [dict(row) for row in rows]
 
     def restore_budget_stopped_flow(self, candidate: RepairCandidate):
-        """Restore trust only from a terminalized, budget-known flow with durable push proof."""
+        """Restore a budget-stopped flow from a completed push receipt or exact maintainer override."""
         repo = _repo_key(candidate.repo)
         connection = self.transaction()
         try:
@@ -1044,9 +1047,9 @@ class _Store:
                     has_push = True
                     break
             if not has_push:
-                # Historical compatibility fallback: if controlled_pushes has 0 rows for this repo,
+                # Historical compatibility override: when controlled_pushes has no repo rows,
                 # require:
-                # 1. An explicit maintainer legacy evidence attestation verifying the exact attempt and source.
+                # 1. An explicit maintainer override bound to this exact exhausted flow.
                 # 2. A matching BUDGET_EXHAUSTED attempt with ordinal > 0.
                 # 3. All prior attempts in history have launch_outcome == "confirmed" and valid execution_id.
                 # 4. The attempt preceding BUDGET_EXHAUSTED has resulting_head_sha == candidate.head_sha.
@@ -1055,16 +1058,16 @@ class _Store:
                 ).fetchone()["count"]
                 if repo_push_count == 0 and exhausted:
                     grant = connection.execute(
-                        "SELECT authorization_id, authorized_by, legacy_evidence_attestation "
+                        "SELECT authorization_id, authorized_by, legacy_maintenance_override "
                         "FROM repair_continuations WHERE repo=? AND issue_number=? AND pr_number=? "
                         "AND head_sha=? AND cause_type=? AND cause_id=? AND consumed_at IS NULL",
                         (repo, candidate.issue_number, candidate.pr_number, candidate.head_sha.lower(),
                          candidate.cause_type, candidate.cause_id),
                     ).fetchone()
-                    if grant and grant["legacy_evidence_attestation"]:
+                    if grant and grant["legacy_maintenance_override"]:
                         try:
-                            _validate_legacy_evidence_attestation(
-                                grant["legacy_evidence_attestation"],
+                            _validate_legacy_maintenance_override(
+                                grant["legacy_maintenance_override"],
                                 repo=repo,
                                 issue_number=candidate.issue_number,
                                 pr_number=candidate.pr_number,
@@ -1871,20 +1874,20 @@ class RuntimeCore:
         return self._launch(launch_request, admission)
 
     def authorize_repair_continuation(self, candidate: RepairCandidate, authorized_by: str,
-                                      legacy_evidence_attestation: str | dict | None = None):
+                                      legacy_maintenance_override: str | dict | None = None):
         """Explicitly reopen one exact exhausted cause; never launch from this command."""
         if (not isinstance(authorized_by, str) or not authorized_by.strip()
                 or candidate.cause_type not in _REPAIR_CAUSES
                 or not _SHA_RE.fullmatch(candidate.head_sha or "")):
             return {"status": "invalid_authorization"}
         serialized_attestation = None
-        if legacy_evidence_attestation is not None:
+        if legacy_maintenance_override is not None:
             try:
                 exhausted_id = self.store.exhaustion_for_candidate(candidate)
                 if not exhausted_id:
                     return {"status": "matching_budget_exhaustion_not_found"}
-                validated = _validate_legacy_evidence_attestation(
-                    legacy_evidence_attestation,
+                validated = _validate_legacy_maintenance_override(
+                    legacy_maintenance_override,
                     repo=candidate.repo,
                     issue_number=candidate.issue_number,
                     pr_number=candidate.pr_number,
@@ -1894,7 +1897,7 @@ class RuntimeCore:
                 )
                 serialized_attestation = json.dumps(validated, sort_keys=True)
             except ValueError as error:
-                return {"status": "invalid_legacy_evidence_attestation", "detail": str(error)}
+                return {"status": "invalid_legacy_maintenance_override", "detail": str(error)}
         try:
             snapshot = self.workflow.observe(candidate.repo, candidate.issue_number)
         except Exception as error:
@@ -1920,7 +1923,7 @@ class RuntimeCore:
         )
         if existing and replay_evidence_current:
             if serialized_attestation:
-                self.store.update_legacy_attestation(existing["authorization_id"], serialized_attestation)
+                self.store.update_legacy_maintenance_override(existing["authorization_id"], serialized_attestation)
             flow = self.store.flow(candidate.repo, candidate.issue_number)
             if not flow or not flow.get("trusted") or not flow.get("initial_confirmed"):
                 if not self.store.restore_budget_stopped_flow(candidate):
@@ -1933,7 +1936,8 @@ class RuntimeCore:
             if not existing["activated"]:
                 self.store.activate_continuation(existing["authorization_id"])
                 return {"status": "authorized", "authorization_id": existing["authorization_id"],
-                        "recovered": True}
+                        "recovered": True,
+                        "legacy_maintenance_override_applied": bool(serialized_attestation)}
             return {"status": "already_authorized", "authorization_id": existing["authorization_id"]}
         valid = (
             snapshot.issue_open and snapshot.coordination_state == "needs-human"

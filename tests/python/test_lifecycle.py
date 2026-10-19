@@ -927,7 +927,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(alpha["items"][0]["status"], "WAITING_REVIEW")
         self.assertEqual(beta["items"][0]["status"], "WAITING_REVIEW")
 
-    def test_restore_budget_stopped_flow_succeeds_with_historical_attempt_provenance(self):
+    def test_restore_budget_stopped_flow_requires_explicit_legacy_maintenance_override(self):
         store = self.core.store
         repo = self.repo
         issue_number = 42
@@ -1008,31 +1008,40 @@ class LifecycleTests(unittest.TestCase):
             formal_review_head_sha=head_sha,
         )
 
-        # 1. Authorization WITHOUT legacy evidence attestation fails closed as untrusted_provenance
+        # 1. Authorization WITHOUT legacy maintenance override fails closed as untrusted_provenance
         unattested = self.core.authorize_repair_continuation(candidate, "maintainer")
         self.assertEqual(unattested["status"], "untrusted_provenance")
+        pending = store.continuation_for_candidate(candidate)
+        self.assertEqual(pending["authorization_id"], unattested["authorization_id"])
         flow = store.flow(repo, issue_number)
         self.assertFalse(flow["trusted"])
 
-        # 2. Authorization with invalid attestation (wrong exhausted_attempt_id) fails
+        # 2. Authorization with invalid override (wrong exhausted_attempt_id) fails
         bad_attestation = {
             "repo": repo, "issue": issue_number, "pr": pr_number, "head_sha": head_sha,
-            "exhausted_attempt_id": "wrong-id", "source": "transcript:app-git-push.cmd",
+            "exhausted_attempt_id": "wrong-id", "kind": "legacy_maintenance_override", "reason": "Reviewed historical incident",
             "authorized_by": "maintainer",
         }
         invalid_res = self.core.authorize_repair_continuation(candidate, "maintainer",
-                                                               legacy_evidence_attestation=bad_attestation)
-        self.assertEqual(invalid_res["status"], "invalid_legacy_evidence_attestation")
+                                                               legacy_maintenance_override=bad_attestation)
+        self.assertEqual(invalid_res["status"], "invalid_legacy_maintenance_override")
 
-        # 3. Authorization with valid attestation successfully binds and restores trusted flow
+        unsupported_claim = {**bad_attestation, "exhausted_attempt_id": "stop-1", "kind": "verified_push"}
+        invalid_kind = self.core.authorize_repair_continuation(
+            candidate, "maintainer", legacy_maintenance_override=unsupported_claim)
+        self.assertEqual(invalid_kind["status"], "invalid_legacy_maintenance_override")
+
+        # 3. Authorization with valid override successfully binds and restores trusted flow
         valid_attestation = {
             "repo": repo, "issue": issue_number, "pr": pr_number, "head_sha": head_sha,
-            "exhausted_attempt_id": "stop-1", "source": "transcript:app-git-push.cmd",
+            "exhausted_attempt_id": "stop-1", "kind": "legacy_maintenance_override", "reason": "Reviewed historical incident",
             "authorized_by": "maintainer",
         }
         auth1 = self.core.authorize_repair_continuation(candidate, "maintainer",
-                                                        legacy_evidence_attestation=valid_attestation)
+                                                        legacy_maintenance_override=valid_attestation)
         self.assertEqual(auth1["status"], "authorized")
+        self.assertEqual(auth1["authorization_id"], pending["authorization_id"])
+        self.assertTrue(auth1["legacy_maintenance_override_applied"])
 
         # Verify continuation is recorded and flow is restored to trusted
         flow = store.flow(repo, issue_number)
@@ -1042,6 +1051,7 @@ class LifecycleTests(unittest.TestCase):
         # Second authorization returns already_authorized (idempotent)
         auth2 = self.core.authorize_repair_continuation(candidate, "maintainer")
         self.assertEqual(auth2["status"], "already_authorized")
+        self.assertEqual(auth2["authorization_id"], pending["authorization_id"])
 
         # Calling dispatch_repair successfully admits and launches Repair #4
         dispatched = self.core.dispatch_repair(candidate)

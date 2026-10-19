@@ -1012,7 +1012,7 @@ class TestCredentialProviderConstruction(unittest.TestCase):
 
 
 class TestWindowsWrapperRuntimeIsolation(unittest.TestCase):
-    def test_windows_wrapper_embeds_pythonpath_and_pythonnousersite(self):
+    def test_windows_wrapper_embeds_exact_runtime_pythonpath(self):
         import sys
         from unittest.mock import patch
         from vccp_runtime.adapters import WorkspaceWriteGuard
@@ -1046,7 +1046,7 @@ class TestWindowsWrapperRuntimeIsolation(unittest.TestCase):
             self.assertTrue(wrapper_cmd.is_file())
             content = wrapper_cmd.read_text(encoding="utf-8")
             self.assertIn("set \"PYTHONPATH=", content)
-            self.assertIn("set \"PYTHONNOUSERSITE=1\"", content)
+            self.assertNotIn("PYTHONNOUSERSITE", content)
             self.assertIn("set \"VCCP_CONTROLLED_PUSH=1\"", content)
 
             context_json = wrapper_cmd.parent / "runtime-context.json"
@@ -1055,6 +1055,20 @@ class TestWindowsWrapperRuntimeIsolation(unittest.TestCase):
             self.assertIn("runtime_root", context_data)
             expected_root = str(Path(__file__).resolve().parent.parent.parent)
             self.assertEqual(context_data["runtime_root"], expected_root)
+
+    def test_controlled_cli_fails_closed_on_runtime_root_mismatch(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context_path = Path(temp_dir) / "context.json"
+            context_path.write_text(json.dumps({
+                "github_app": {}, "repo": "owner/repo", "workspace": temp_dir,
+                "runtime_root": str(Path(temp_dir) / "wrong-runtime"),
+            }), encoding="utf-8")
+            with mock.patch.object(controlled_cli, "_provider", side_effect=AssertionError("provider must not load")), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                result = controlled_cli.run(["--context", str(context_path), "complete-no-change"])
+            self.assertEqual(result, 2)
 
 
 if __name__ == "__main__": unittest.main()

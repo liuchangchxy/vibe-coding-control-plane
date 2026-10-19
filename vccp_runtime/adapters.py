@@ -992,7 +992,7 @@ class WorkspaceWriteGuard:
                 completion_wrapper = root / ("complete-no-change.cmd" if windows else "complete-no-change")
                 command = f'"{python}" -m vccp_runtime.controlled_cli --context "{context_path}"'
                 if windows:
-                    env_prefix = f'set "PYTHONPATH={runtime_root}"\r\nset "PYTHONNOUSERSITE=1"\r\n'
+                    env_prefix = f'set "PYTHONPATH={runtime_root}"\r\n'
                     github_wrapper.write_text(f'@echo off\r\nsetlocal\r\n{env_prefix}'
                                               f'{command} app-gh %*\r\nexit /b %ERRORLEVEL%\r\n',
                                               encoding="utf-8")
