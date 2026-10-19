@@ -32,7 +32,7 @@ The production runner exposes the explicit operator entry point:
 python -m vccp_runtime.runner --manifest <manifest> --runtime-config <runtime-config> --repo OWNER/REPO --authorize-repair-continuation --issue ISSUE --pr PR --head-sha FULL_40_CHAR_SHA --authorized-by MAINTAINER_ID
 ```
 
-It records the authorization and restores the Issue's matching active coordination label. The normal Runner then dispatches the exact cause; the authorization command itself never launches an Implementer.
+It records the authorization and restores the Issue's matching active coordination label. It can run while the resident Runner is active because it makes no dispatch and relies on SQLite transactions plus GitHub compare-and-set. The normal Runner then dispatches the exact cause; the authorization command itself never launches an Implementer.
 
 Dispatcher admits a candidate only when the workflow is valid, its cause is recognized, the exact current SHA matches the cause, that logical head has not already consumed a repair, budget remains, and no terminal/cancellation blocker exists. Logical repair identity is `repair:<repo>:pr:<pr_number>:head:<failed_or_rejected_head_sha>`. Replayed observations for a head cannot create duplicate logical repairs. Repairs continue on the same linked PR and implementation branch. Stale CI failures and reviews cannot authorize work against a newer SHA. Exceeding the budget transitions to `needs-human`.
 

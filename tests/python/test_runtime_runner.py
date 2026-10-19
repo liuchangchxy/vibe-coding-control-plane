@@ -262,7 +262,7 @@ class RuntimeRunnerTests(unittest.TestCase):
                                   ("retry", "owner/repo", 7, 12, head, head), "release"])
         self.assertEqual(json.loads(output.getvalue())["execution_id"], "claude-session")
 
-    def test_repair_continuation_cli_binds_explicit_target_and_persisted_cause(self):
+    def test_repair_continuation_cli_binds_target_without_stopping_resident_runner(self):
         head = "a" * 40
         events = []
         class Lock:
@@ -298,9 +298,9 @@ class RuntimeRunnerTests(unittest.TestCase):
                                   "--issue", "57", "--pr", "58", "--head-sha", head,
                                   "--authorized-by", "maintainer"])
         self.assertEqual(result, 0)
-        self.assertEqual(events[-2], ("authorize", "owner/repo", 57, 58, head,
-                                      "reviewer_rejection", "review-123", "implement/57", "maintainer"))
-        self.assertEqual(events[-1], "release")
+        self.assertEqual(events, [("identity", "owner/repo", "state.db"),
+                                  ("authorize", "owner/repo", 57, 58, head,
+                                   "reviewer_rejection", "review-123", "implement/57", "maintainer")])
         self.assertEqual(json.loads(output.getvalue())["status"], "authorized")
 
     def test_cli_rejects_target_or_enrollment_mismatch_before_runtime_construction(self):

@@ -247,25 +247,29 @@ def main(argv=None):
     if _workspace_repository(local["workspace"], api_url).casefold() != args.repo.casefold():
         parser.error("workspace origin does not match --repo")
     lock = RuntimeLock(args.repo, local["database_path"])
+    if args.authorize_repair_continuation:
+        # This command only persists a bounded grant and updates one Issue label;
+        # SQLite transactions and GitHub compare-and-set make it safe alongside
+        # the resident Dispatcher, which owns RuntimeLock for its whole lifetime.
+        runtime = build_runtime(manifest, local)
+        snapshot = runtime.workflow.observe(args.repo, args.issue)
+        matches = [row for row in runtime.core.store.attempts_for_repo(args.repo)
+                   if row["issue_number"] == args.issue and row["pr_number"] == args.pr
+                   and row["expected_head_sha"] == args.head_sha.lower()
+                   and row["phase"] == "BUDGET_EXHAUSTED"]
+        causes = {(row["cause_type"], row["cause_id"]) for row in matches}
+        if (len(causes) != 1 or snapshot.pr_number != args.pr or not snapshot.pr_branch):
+            result = {"status": "authorization_evidence_stale_or_invalid"}
+        else:
+            cause_type, cause_id = next(iter(causes))
+            candidate = RepairCandidate(args.repo, args.issue, args.pr, args.head_sha.lower(),
+                                        snapshot.pr_branch, cause_type, cause_id, local["owner_id"])
+            result = runtime.core.authorize_repair_continuation(candidate, args.authorized_by)
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 0 if result.get("status") in {"authorized", "already_authorized"} else 2
     try:
         with lock:
             runtime = build_runtime(manifest, local)
-            if args.authorize_repair_continuation:
-                snapshot = runtime.workflow.observe(args.repo, args.issue)
-                matches = [row for row in runtime.core.store.attempts_for_repo(args.repo)
-                           if row["issue_number"] == args.issue and row["pr_number"] == args.pr
-                           and row["expected_head_sha"] == args.head_sha.lower()
-                           and row["phase"] == "BUDGET_EXHAUSTED"]
-                causes = {(row["cause_type"], row["cause_id"]) for row in matches}
-                if (len(causes) != 1 or snapshot.pr_number != args.pr or not snapshot.pr_branch):
-                    result = {"status": "authorization_evidence_stale_or_invalid"}
-                else:
-                    cause_type, cause_id = next(iter(causes))
-                    candidate = RepairCandidate(args.repo, args.issue, args.pr, args.head_sha.lower(),
-                                                snapshot.pr_branch, cause_type, cause_id, local["owner_id"])
-                    result = runtime.core.authorize_repair_continuation(candidate, args.authorized_by)
-                print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-                return 0 if result.get("status") in {"authorized", "already_authorized"} else 2
             if args.retry_reviewer:
                 if runtime.local_reviewer is None:
                     parser.error("configured runtime has no Local Reviewer")
