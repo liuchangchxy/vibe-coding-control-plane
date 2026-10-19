@@ -552,6 +552,55 @@ class RuntimeCoreTests(unittest.TestCase):
                          "continuation_limit_exhausted")
         self.assertEqual(len(self.implementer.requests), 9)  # initial plus eight repairs
 
+    def test_grant_for_one_head_and_cause_does_not_expand_automatic_budget(self):
+        self.establish_flow()
+        for ordinal in range(1, 6):
+            cause = "implementation_failure" if ordinal in {1, 3, 5} else "reviewer_rejection"
+            candidate = self.candidate(sha=f"{ordinal:040x}", cause=cause,
+                                       cause_id=f"cause-{ordinal}")
+            state = "agent-working" if cause == "implementation_failure" else "changes-requested"
+            self.workflow.set_snapshot(repair_snapshot(candidate, state=state, revision=20 + ordinal))
+            self.assertEqual(self.core.dispatch_repair(candidate)["status"], "launched")
+
+        authorized = self.candidate(sha="6" * 40, cause="reviewer_rejection", cause_id="review-A")
+        self.workflow.set_snapshot(repair_snapshot(authorized, state="changes-requested", revision=30))
+        self.assertEqual(self.core.dispatch_repair(authorized)["status"], "budget_exhausted")
+        self.workflow.set_snapshot(replace(self.workflow.current, coordination_state="needs-human",
+                                           terminal_labels=("needs-human",), revision="31"))
+        self.assertEqual(self.core.authorize_repair_continuation(authorized, "maintainer")["status"],
+                         "authorized")
+
+        other_cause = self.candidate(sha="7" * 40, cause="reviewer_rejection", cause_id="review-B")
+        self.workflow.set_snapshot(repair_snapshot(other_cause, state="changes-requested", revision=32))
+        self.assertEqual(self.core.dispatch_repair(other_cause)["status"], "budget_exhausted")
+        self.assertEqual(len(self.implementer.requests), 6)  # initial plus five automatic repairs
+
+    def test_ci_grant_cannot_be_spent_by_reviewer_candidate(self):
+        self.establish_flow()
+        for ordinal in range(1, 6):
+            cause = "implementation_failure" if ordinal in {1, 3, 5} else "reviewer_rejection"
+            candidate = self.candidate(sha=f"{ordinal:040x}", cause=cause,
+                                       cause_id=f"cause-{ordinal}")
+            state = "agent-working" if cause == "implementation_failure" else "changes-requested"
+            self.workflow.set_snapshot(repair_snapshot(candidate, state=state, revision=20 + ordinal))
+            self.assertEqual(self.core.dispatch_repair(candidate)["status"], "launched")
+
+        ci_head = "6" * 40
+        ci = self.candidate(sha=ci_head, cause="implementation_failure",
+                            cause_id=f"ci:{ci_head}:Unit:66:failure")
+        self.workflow.set_snapshot(replace(repair_snapshot(ci, state="agent-working", revision=30),
+                                           check_runs=({"name": "Unit", "id": 66, "head_sha": ci_head,
+                                                        "status": "completed", "conclusion": "failure"},)))
+        self.assertEqual(self.core.dispatch_repair(ci)["status"], "budget_exhausted")
+        self.workflow.set_snapshot(replace(self.workflow.current, coordination_state="needs-human",
+                                           terminal_labels=("needs-human",), revision="31"))
+        self.assertEqual(self.core.authorize_repair_continuation(ci, "maintainer")["status"], "authorized")
+
+        reviewer = self.candidate(sha="7" * 40, cause="reviewer_rejection", cause_id="review-B")
+        self.workflow.set_snapshot(repair_snapshot(reviewer, state="changes-requested", revision=32))
+        self.assertEqual(self.core.dispatch_repair(reviewer)["status"], "budget_exhausted")
+        self.assertEqual(len(self.implementer.requests), 6)
+
     def test_ci_cause_requires_latest_run_for_same_required_check_and_head(self):
         candidate = self.candidate(sha="d" * 40, cause="implementation_failure",
                                    cause_id=f"ci:{'d' * 40}:Unit:100:failure")

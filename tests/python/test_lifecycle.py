@@ -288,13 +288,34 @@ class LifecycleTests(unittest.TestCase):
             pr_head_sha=next_head, formal_review_state=None, formal_review_id=None,
             formal_review_head_sha=None,
             check_runs=({"name": "Unit", "id": 90, "head_sha": next_head,
+                         "status": "completed", "conclusion": "failure"},))
+        automatic = run_once(runtime, self.repo, "owner", now=204.5)
+        self.assertEqual(automatic["lifecycle"]["items"][0]["trigger"], "ci_repair")
+        self.assertEqual(automatic["lifecycle"]["items"][0]["status"], "launched")
+        repair5 = [row for row in self.core.store.attempts_for_repo(self.repo)
+                   if row["kind"] == "repair" and row["phase"] == "LAUNCH_CONFIRMED"][-1]
+        self.assertEqual((repair5["repair_ordinal"], repair5["cause_type"]), (5, "implementation_failure"))
+        self.assertIsNotNone(self.core.store.continuation_for_candidate(candidate)["consumed_at"])
+        self.assertEqual(len(self.implementer.launches), 6)  # initial + 3 history + authorized #4 + automatic #5
+        final_head = "e" * 40
+        push_id = self.core.store.begin_controlled_push(repair5["attempt_id"], self.repo,
+                                                        PROVIDER, "implement/7", final_head, 204.75)
+        self.assertIsNotNone(push_id)
+        self.assertTrue(self.core.store.complete_controlled_push(push_id, final_head, 204.8))
+        self.assertTrue(self.core.store.bind_pr(repair5["attempt_id"], 44, "implement/7", final_head, 204.9))
+        self.workflow.snapshots[(self.repo, self.issue)] = replace(
+            self.workflow.snapshots[(self.repo, self.issue)], revision="r11",
+            coordination_state="agent-working", terminal_labels=(), active_labels=("agent-working",),
+            pr_head_sha=final_head, formal_review_state=None, formal_review_id=None,
+            formal_review_head_sha=None,
+            check_runs=({"name": "Unit", "id": 91, "head_sha": final_head,
                          "status": "completed", "conclusion": "success"},))
         ci = run_once(runtime, self.repo, "owner", now=205)
         self.assertEqual(ci["lifecycle"]["items"][0]["status"], "WAITING_REVIEW")
         self.workflow.snapshots[(self.repo, self.issue)] = replace(
-            self.workflow.snapshots[(self.repo, self.issue)], revision="r11",
+            self.workflow.snapshots[(self.repo, self.issue)], revision="r12",
             formal_review_state="APPROVED", formal_review_id="review-approved",
-            formal_review_head_sha=next_head)
+            formal_review_head_sha=final_head)
         approved = run_once(runtime, self.repo, "owner", now=206)
         self.assertEqual(approved["lifecycle"]["items"][0]["status"], "WAITING_MERGE")
         self.workflow.snapshots[(self.repo, self.issue)] = replace(
@@ -303,6 +324,55 @@ class LifecycleTests(unittest.TestCase):
         merged = run_once(runtime, self.repo, "owner", now=207)
         self.assertEqual(merged["lifecycle"]["items"][0]["status"], "merged_success")
         self.assertEqual(self.core.store.lifecycle_state(self.repo, self.issue)["phase"], "MERGED_SUCCESS")
+
+    def test_stale_unconsumed_grant_does_not_block_successful_review_and_merge(self):
+        failed = self.failure()
+        self.update(check_runs=failed)
+        head = SHA
+        cause_id = f"ci:{head}:Unit:2:failure"
+        candidate = RepairCandidate(self.repo, self.issue, 44, head, "implement/7",
+                                    "implementation_failure", cause_id, "owner")
+        initial = self.core.store.attempts_for_repo(self.repo)[0]
+        with closing(sqlite3.connect(self.db)) as connection:
+            connection.execute("UPDATE attempts SET phase='LAUNCH_CONFIRMED' WHERE attempt_id=?",
+                               (initial["attempt_id"],))
+            connection.commit()
+        push_id = self.core.store.begin_controlled_push(initial["attempt_id"], self.repo,
+                                                        PROVIDER, "implement/7", head, 102)
+        self.assertIsNotNone(push_id)
+        self.assertTrue(self.core.store.complete_controlled_push(push_id, head, 103))
+        self.core.store.bind_pr(initial["attempt_id"], 44, "implement/7", head, 104)
+        self.core.store.local_terminal(initial["attempt_id"], "STOPPED_CANCELLED", 101)
+        with closing(sqlite3.connect(self.db)) as connection:
+            connection.execute("UPDATE flows SET trusted=0,initial_confirmed=0,repair_budget_known=1,repair_count=0 "
+                               "WHERE repo=? AND issue_number=?",
+                               (self.repo, self.issue))
+            connection.execute(
+                "INSERT INTO attempts(attempt_id,repo,issue_number,owner_id,lease_token,kind,cause_type,cause_id,"
+                "repair_key,repair_ordinal,expected_head_sha,pr_number,branch,phase,created_at,updated_at) "
+                "VALUES('legacy-stale-stop',?,?,?,'','repair',?,?,?,?,?,?,?,'BUDGET_EXHAUSTED',104,104)",
+                (self.repo, self.issue, "owner", "implementation_failure", cause_id,
+                 compute_repair_key(self.repo, 44, head) + ":budget:legacy-stale-stop", 1,
+                 head, 44, "implement/7"),
+            )
+            connection.commit()
+        self.update(coordination_state="needs-human", terminal_labels=("needs-human",), active_labels=(),
+                    revision="r2")
+        self.assertEqual(self.core.authorize_repair_continuation(candidate, "maintainer")["status"], "authorized")
+
+        self.update(coordination_state="agent-working", terminal_labels=(), active_labels=("agent-working",),
+                    check_runs=self.accepted(), formal_review_state="APPROVED",
+                    formal_review_id="review-approved", formal_review_head_sha=head, revision="r3")
+        runtime = SimpleNamespace(core=self.core, workflow=self.workflow, lifecycle=self.driver())
+        waiting = run_once(runtime, self.repo, "owner", now=200)
+        self.assertEqual(waiting["lifecycle"]["items"][0]["status"], "WAITING_MERGE")
+        self.assertIsNone(self.core.store.continuation_for_candidate(candidate)["consumed_at"])
+        self.assertEqual(len(self.implementer.launches), 1)
+        self.update(pr_merged=True, pr_state="closed", pr_open=False, issue_open=False, revision="r4")
+        merged = run_once(runtime, self.repo, "owner", now=201)
+        self.assertEqual(merged["lifecycle"]["items"][0]["status"], "merged_success")
+        self.assertEqual(len(self.implementer.launches), 1)
+        self.assertEqual(self.core.store.attempt("legacy-stale-stop")["phase"], "BUDGET_EXHAUSTED")
     def test_ci_repair_in_flight_suppresses_old_head_lifecycle_without_deadline_change(self):
         driver = self.driver()
         self.assertEqual(driver.advance_once(self.repo, "owner", 100)["items"][0]["status"], "WAITING_CI")

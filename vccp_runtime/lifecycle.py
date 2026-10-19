@@ -297,9 +297,9 @@ class LifecycleDriver:
                                                 grant["cause_type"], grant["cause_id"], owner_id)
                     results.append({"issue": issue, "trigger": "authorized_repair_continuation",
                                     **self.core.dispatch_repair(candidate)})
-                else:
-                    results.append({"issue": issue, "status": "authorized_continuation_stale"})
-                continue
+                    continue
+                # A grant is only an admission token. If its cause went stale,
+                # let the ordinary exact-head CI/review/merge lifecycle proceed.
             if state and state["phase"] in {"WAITING_REVIEW", "WAITING_MERGE"} \
                     and state["head_sha"].casefold() != head:
                 deadline = self._set_waiting(repo_key, issue, "WAITING_CI", head, current)
