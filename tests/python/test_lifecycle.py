@@ -927,5 +927,153 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(alpha["items"][0]["status"], "WAITING_REVIEW")
         self.assertEqual(beta["items"][0]["status"], "WAITING_REVIEW")
 
+    def test_restore_budget_stopped_flow_requires_explicit_legacy_maintenance_override(self):
+        store = self.core.store
+        repo = self.repo
+        issue_number = 42
+        pr_number = 58
+        branch = "implement/58"
+        head_sha = "c" * 40
+
+        # Setup an untrusted, stopped flow representing 3 prior repairs and BUDGET_EXHAUSTED
+        with closing(store._connect()) as conn:
+            conn.execute(
+                "INSERT INTO flows(repo, issue_number, trusted, initial_confirmed, pr_number, branch, repair_count, repair_budget_known) "
+                "VALUES(?, ?, 0, 0, ?, ?, 3, 1)",
+                (repo, issue_number, pr_number, branch)
+            )
+            # Initial attempt
+            conn.execute(
+                "INSERT INTO attempts(attempt_id, repo, issue_number, owner_id, lease_token, kind, phase, "
+                "pr_number, branch, expected_head_sha, resulting_head_sha, launch_outcome, execution_id, created_at, updated_at, phase_entered_at) "
+                "VALUES('init-1', ?, ?, 'owner', '', 'initial_dispatch', 'STOPPED_CANCELLED', ?, ?, ?, ?, 'confirmed', 'exec-1', 1, 1, 1)",
+                (repo, issue_number, pr_number, branch, SHA, SHA)
+            )
+            # Repair attempt 1
+            conn.execute(
+                "INSERT INTO attempts(attempt_id, repo, issue_number, owner_id, lease_token, kind, phase, "
+                "pr_number, branch, expected_head_sha, resulting_head_sha, launch_outcome, execution_id, created_at, updated_at, phase_entered_at) "
+                "VALUES('repair-1', ?, ?, 'owner', '', 'repair', 'STOPPED_CANCELLED', ?, ?, ?, ?, 'confirmed', 'exec-2', 2, 2, 2)",
+                (repo, issue_number, pr_number, branch, SHA, "1" * 40)
+            )
+            # Repair attempt 2
+            conn.execute(
+                "INSERT INTO attempts(attempt_id, repo, issue_number, owner_id, lease_token, kind, phase, "
+                "pr_number, branch, expected_head_sha, resulting_head_sha, launch_outcome, execution_id, created_at, updated_at, phase_entered_at) "
+                "VALUES('repair-2', ?, ?, 'owner', '', 'repair', 'STOPPED_CANCELLED', ?, ?, ?, ?, 'confirmed', 'exec-3', 3, 3, 3)",
+                (repo, issue_number, pr_number, branch, "1" * 40, "2" * 40)
+            )
+            # Repair attempt 3 (preceding attempt with resulting_head_sha == candidate.head_sha)
+            conn.execute(
+                "INSERT INTO attempts(attempt_id, repo, issue_number, owner_id, lease_token, kind, phase, "
+                "pr_number, branch, expected_head_sha, resulting_head_sha, launch_outcome, execution_id, created_at, updated_at, phase_entered_at) "
+                "VALUES('repair-3', ?, ?, 'owner', '', 'repair', 'STOPPED_CANCELLED', ?, ?, ?, ?, 'confirmed', 'exec-4', 4, 4, 4)",
+                (repo, issue_number, pr_number, branch, "2" * 40, head_sha)
+            )
+            # Budget exhausted attempt (repair_ordinal=4, phase=BUDGET_EXHAUSTED)
+            conn.execute(
+                "INSERT INTO attempts(attempt_id, repo, issue_number, owner_id, lease_token, kind, cause_type, cause_id, "
+                "phase, pr_number, branch, expected_head_sha, repair_ordinal, created_at, updated_at, phase_entered_at) "
+                "VALUES('stop-1', ?, ?, 'owner', '', 'repair', 'reviewer_rejection', 'rev-1', "
+                "'BUDGET_EXHAUSTED', ?, ?, ?, 4, 5, 5, 5)",
+                (repo, issue_number, pr_number, branch, head_sha)
+            )
+            conn.commit()
+
+        candidate = RepairCandidate(
+            repo=repo, issue_number=issue_number, owner_id="owner", cause_type="reviewer_rejection",
+            cause_id="rev-1", head_sha=head_sha, pr_number=pr_number, branch=branch
+        )
+
+        # Without an existing pending grant, restore_budget_stopped_flow fails
+        self.assertFalse(store.restore_budget_stopped_flow(candidate))
+
+        # Setup workflow snapshot in needs-human state
+        self._snapshot(
+            repo, issue_number,
+            coordination_state="needs-human",
+            terminal_labels=("needs-human",),
+            active_labels=("changes-requested",),
+            canonical_relationship_valid=True,
+            canonical_link_count=1,
+            open_linked_pr_count=1,
+            pr_number=pr_number,
+            pr_open=True,
+            pr_state="open",
+            pr_linked_issue=issue_number,
+            pr_head_sha=head_sha,
+            pr_branch=branch,
+            formal_review_state="CHANGES_REQUESTED",
+            formal_review_id="rev-1",
+            formal_review_head_sha=head_sha,
+        )
+
+        # 1. Authorization WITHOUT legacy maintenance override fails closed as untrusted_provenance
+        unattested = self.core.authorize_repair_continuation(candidate, "maintainer")
+        self.assertEqual(unattested["status"], "untrusted_provenance")
+        pending = store.continuation_for_candidate(candidate)
+        self.assertEqual(pending["authorization_id"], unattested["authorization_id"])
+        flow = store.flow(repo, issue_number)
+        self.assertFalse(flow["trusted"])
+
+        # 2. Authorization with invalid override (wrong exhausted_attempt_id) fails
+        bad_attestation = {
+            "repo": repo, "issue": issue_number, "pr": pr_number, "head_sha": head_sha,
+            "exhausted_attempt_id": "wrong-id", "kind": "legacy_maintenance_override", "reason": "Reviewed historical incident",
+            "authorized_by": "maintainer",
+        }
+        invalid_res = self.core.authorize_repair_continuation(candidate, "maintainer",
+                                                               legacy_maintenance_override=bad_attestation)
+        self.assertEqual(invalid_res["status"], "invalid_legacy_maintenance_override")
+
+        unsupported_claim = {**bad_attestation, "exhausted_attempt_id": "stop-1", "kind": "verified_push"}
+        invalid_kind = self.core.authorize_repair_continuation(
+            candidate, "maintainer", legacy_maintenance_override=unsupported_claim)
+        self.assertEqual(invalid_kind["status"], "invalid_legacy_maintenance_override")
+
+        # 3. Authorization with valid override successfully binds and restores trusted flow
+        valid_attestation = {
+            "repo": repo, "issue": issue_number, "pr": pr_number, "head_sha": head_sha,
+            "exhausted_attempt_id": "stop-1", "kind": "legacy_maintenance_override", "reason": "Reviewed historical incident",
+            "authorized_by": "maintainer",
+        }
+        auth1 = self.core.authorize_repair_continuation(candidate, "maintainer",
+                                                        legacy_maintenance_override=valid_attestation)
+        self.assertEqual(auth1["status"], "authorized")
+        self.assertEqual(auth1["authorization_id"], pending["authorization_id"])
+        self.assertTrue(auth1["legacy_maintenance_override_applied"])
+
+        # Verify continuation is recorded and flow is restored to trusted
+        flow = store.flow(repo, issue_number)
+        self.assertTrue(flow["trusted"])
+        self.assertTrue(flow["initial_confirmed"])
+
+        # Second authorization returns already_authorized (idempotent)
+        auth2 = self.core.authorize_repair_continuation(candidate, "maintainer")
+        self.assertEqual(auth2["status"], "already_authorized")
+        self.assertEqual(auth2["authorization_id"], pending["authorization_id"])
+
+        # Calling dispatch_repair successfully admits and launches Repair #4
+        dispatched = self.core.dispatch_repair(candidate)
+        self.assertEqual(dispatched["status"], "launched")
+        self.assertEqual(dispatched["ordinal"], 4)
+        self.assertEqual(dispatched["repair_key"], compute_repair_key(candidate.repo, candidate.pr_number, candidate.head_sha))
+
+        # Continuation is now marked consumed
+        cont = store.continuation_for_candidate(candidate)
+        self.assertIsNotNone(cont["consumed_at"])
+
+        # 4. Repair #4 executes and records a real controlled push
+        attempt_id = dispatched["attempt_id"]
+        push_id = store.begin_controlled_push(attempt_id, repo, "antigravity", branch, head_sha)
+        self.assertIsNotNone(push_id)
+        self.assertTrue(store.complete_controlled_push(push_id, head_sha))
+
+        # Verify that controlled_pushes now has a durable completed row
+        with closing(store._connect()) as conn:
+            push_rows = conn.execute("SELECT * FROM controlled_pushes WHERE attempt_id=?", (attempt_id,)).fetchall()
+            self.assertEqual(len(push_rows), 1)
+            self.assertEqual(push_rows[0]["phase"], "completed")
+
 
 if __name__ == "__main__": unittest.main()

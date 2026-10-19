@@ -1011,4 +1011,64 @@ class TestCredentialProviderConstruction(unittest.TestCase):
             _make_credential_provider(invalid_config, "owner/repo")
 
 
+class TestWindowsWrapperRuntimeIsolation(unittest.TestCase):
+    def test_windows_wrapper_embeds_exact_runtime_pythonpath(self):
+        import sys
+        from unittest.mock import patch
+        from vccp_runtime.adapters import WorkspaceWriteGuard
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            git_dir = temp_path / ".git"
+            git_dir.mkdir()
+            hooks_path = [None]
+            def fake_runner(args, **kwargs):
+                if args[:2] == ["git", "rev-parse"]:
+                    return SimpleNamespace(returncode=0, stdout=str(git_dir) + "\n")
+                if args[:4] == ["git", "config", "--local", "core.hooksPath"]:
+                    hooks_path[0] = args[4]
+                    return SimpleNamespace(returncode=0, stdout="")
+                if "core.hooksPath" in args:
+                    if hooks_path[0]:
+                        return SimpleNamespace(returncode=0, stdout=hooks_path[0] + "\n")
+                    return SimpleNamespace(returncode=1, stdout="")
+                return SimpleNamespace(returncode=0, stdout="")
+
+            guard = WorkspaceWriteGuard(runner=fake_runner)
+            launch_context = {
+                "python_executable": sys.executable,
+                "github_app": {"app_id": "123", "credential_source": {"type": "posix_file", "path": "p"}},
+                "repo": "owner/repo",
+                "workspace": str(temp_path),
+            }
+            guard_res = guard.install(str(temp_path), "att-123", provider="antigravity",
+                                      launch_context=launch_context, is_windows=True)
+            wrapper_cmd = Path(guard_res.git_push_command)
+            self.assertTrue(wrapper_cmd.is_file())
+            content = wrapper_cmd.read_text(encoding="utf-8")
+            self.assertIn("set \"PYTHONPATH=", content)
+            self.assertNotIn("PYTHONNOUSERSITE", content)
+            self.assertIn("set \"VCCP_CONTROLLED_PUSH=1\"", content)
+
+            context_json = wrapper_cmd.parent / "runtime-context.json"
+            self.assertTrue(context_json.is_file())
+            context_data = json.loads(context_json.read_text(encoding="utf-8"))
+            self.assertIn("runtime_root", context_data)
+            expected_root = str(Path(__file__).resolve().parent.parent.parent)
+            self.assertEqual(context_data["runtime_root"], expected_root)
+
+    def test_controlled_cli_fails_closed_on_runtime_root_mismatch(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context_path = Path(temp_dir) / "context.json"
+            context_path.write_text(json.dumps({
+                "github_app": {}, "repo": "owner/repo", "workspace": temp_dir,
+                "runtime_root": str(Path(temp_dir) / "wrong-runtime"),
+            }), encoding="utf-8")
+            with mock.patch.object(controlled_cli, "_provider", side_effect=AssertionError("provider must not load")), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                result = controlled_cli.run(["--context", str(context_path), "complete-no-change"])
+            self.assertEqual(result, 2)
+
+
 if __name__ == "__main__": unittest.main()

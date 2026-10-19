@@ -75,6 +75,11 @@ def run(argv=None) -> int:
     try:
         args = _parser().parse_args(argv)
         context = _load_context(args.context)
+        if "runtime_root" in context:
+            expected_root = Path(context["runtime_root"]).resolve()
+            actual_root = Path(__file__).resolve().parent.parent
+            if actual_root != expected_root:
+                raise GitHubAppError("controlled CLI module resolution does not match expected runtime")
         provider = _provider(context)
         repo = context["repo"]
         if args.command == "complete-no-change":

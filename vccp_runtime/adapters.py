@@ -926,7 +926,9 @@ class WorkspaceWriteGuard:
 
     def install(self, workspace: str, attempt_id: str, app_git_push: str | None = None,
                 inherited_environment: dict | None = None, *,
-                provider: str, launch_context: dict | None = None) -> WorkspaceGuard:
+                provider: str, launch_context: dict | None = None,
+                is_windows: bool | None = None) -> WorkspaceGuard:
+        windows = os.name == "nt" if is_windows is None else bool(is_windows)
         result = self.runner(["git", "rev-parse", "--absolute-git-dir"], cwd=workspace,
                              text=True, capture_output=True, check=False)
         if result.returncode != 0 or not result.stdout.strip():
@@ -975,22 +977,29 @@ class WorkspaceWriteGuard:
                 python = str(launch_context["python_executable"])
                 if not python or any(c in python for c in ('"', "%", "\r", "\n")):
                     raise ValueError("runtime Python path cannot be represented safely by the wrapper")
+                runtime_root = Path(__file__).resolve().parent.parent
                 context_path = root / "runtime-context.json"
                 context = dict(launch_context)
                 context.pop("python_executable", None)
+                context["runtime_root"] = str(runtime_root)
                 context_path.write_text(json.dumps(context, ensure_ascii=False), encoding="utf-8")
-                if os.name == "nt" and any(c in str(context_path) for c in ('"', "%", "\r", "\n")):
+                if windows and any(c in str(context_path) for c in ('"', "%", "\r", "\n")):
                     raise ValueError("runtime context path cannot be represented safely by the wrapper")
-                github_wrapper = root / ("app-gh.cmd" if os.name == "nt" else "app-gh")
-                wrapper = root / ("app-git-push.cmd" if os.name == "nt" else "app-git-push")
-                completion_wrapper = root / ("complete-no-change.cmd" if os.name == "nt" else "complete-no-change")
+                if windows and any(c in str(runtime_root) for c in ('"', "%", "\r", "\n")):
+                    raise ValueError("runtime root path cannot be represented safely by the wrapper")
+                github_wrapper = root / ("app-gh.cmd" if windows else "app-gh")
+                wrapper = root / ("app-git-push.cmd" if windows else "app-git-push")
+                completion_wrapper = root / ("complete-no-change.cmd" if windows else "complete-no-change")
                 command = f'"{python}" -m vccp_runtime.controlled_cli --context "{context_path}"'
-                if os.name == "nt":
-                    github_wrapper.write_text(f'@echo off\r\n{command} app-gh %*\r\nexit /b %ERRORLEVEL%\r\n',
+                if windows:
+                    env_prefix = f'set "PYTHONPATH={runtime_root}"\r\n'
+                    github_wrapper.write_text(f'@echo off\r\nsetlocal\r\n{env_prefix}'
+                                              f'{command} app-gh %*\r\nexit /b %ERRORLEVEL%\r\n',
                                               encoding="utf-8")
-                    wrapper.write_text('@echo off\r\nsetlocal\r\nset "VCCP_CONTROLLED_PUSH=1"\r\n'
+                    wrapper.write_text(f'@echo off\r\nsetlocal\r\n{env_prefix}set "VCCP_CONTROLLED_PUSH=1"\r\n'
                                        f'{command} git-push %*\r\nexit /b %ERRORLEVEL%\r\n', encoding="utf-8")
-                    completion_wrapper.write_text(f'@echo off\r\n{command} complete-no-change\r\nexit /b %ERRORLEVEL%\r\n', encoding="utf-8")
+                    completion_wrapper.write_text(f'@echo off\r\nsetlocal\r\n{env_prefix}'
+                                                  f'{command} complete-no-change\r\nexit /b %ERRORLEVEL%\r\n', encoding="utf-8")
                 else:
                     github_wrapper.write_text("#!/bin/sh\nexec " + command + ' app-gh "$@"\n', encoding="utf-8")
                     wrapper.write_text("#!/bin/sh\nVCCP_CONTROLLED_PUSH=1 export VCCP_CONTROLLED_PUSH\n"
@@ -1005,8 +1014,8 @@ class WorkspaceWriteGuard:
                 if not app_git_push:
                     raise ValueError("controlled push command is required")
                 github_command = None
-                wrapper = root / ("app-git-push.cmd" if os.name == "nt" else "app-git-push")
-                if os.name == "nt":
+                wrapper = root / ("app-git-push.cmd" if windows else "app-git-push")
+                if windows:
                     if any(c in app_git_push for c in ('"', "%", "\r", "\n")):
                         raise ValueError("controlled push path cannot be represented safely by the Windows shim")
                     wrapper.write_text(
