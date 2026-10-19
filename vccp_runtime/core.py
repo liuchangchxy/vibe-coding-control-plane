@@ -987,6 +987,25 @@ class _Store:
                 if push:
                     has_push = True
                     break
+            if not has_push:
+                # Historical compatibility fallback: if controlled_pushes has 0 rows for this repo,
+                # verify that the resulting head SHA matches the candidate and is anchored by an authorized,
+                # confirmed attempt in this exact flow.
+                repo_push_count = connection.execute(
+                    "SELECT COUNT(*) AS count FROM controlled_pushes WHERE repo=?", (repo,)
+                ).fetchone()["count"]
+                if repo_push_count == 0:
+                    matching_attempt = any(
+                        row["pr_number"] == candidate.pr_number
+                        and row["branch"] == candidate.branch
+                        and (row["resulting_head_sha"] or "").lower() == candidate.head_sha.lower()
+                        and row["launch_outcome"] == "confirmed"
+                        and row["execution_id"]
+                        for row in [*initial, *dispatched]
+                        if "resulting_head_sha" in row.keys()
+                    )
+                    if matching_attempt:
+                        has_push = True
             valid = (flow is not None and not flow["trusted"] and not flow["initial_confirmed"]
                      and flow["repair_budget_known"] and flow["repair_count"] == len(dispatched)
                      and flow["pr_number"] == candidate.pr_number and flow["branch"] == candidate.branch

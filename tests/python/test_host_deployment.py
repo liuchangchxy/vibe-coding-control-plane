@@ -1,12 +1,14 @@
 import plistlib
 import hashlib
+import json
 from contextlib import closing
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from vccp_runtime.host_deployment import reconcile_macos_launch_agent, remove_macos_launch_agent
+from vccp_runtime.host_deployment import (reconcile_macos_launch_agent, remove_macos_launch_agent,
+                                          reconcile_windows_sidecar, remove_windows_sidecar)
 
 
 class HostDeploymentTests(unittest.TestCase):
@@ -247,6 +249,55 @@ class HostDeploymentTests(unittest.TestCase):
                 user_id="501", readiness=lambda: {"status": "not_ready"}, runner=runner, environ={})
             self.assertEqual(result["status"], "blocked")
             self.assertNotIn("bootstrap", [call[1] for call in calls if call[0] == "launchctl"])
+
+    def test_reconcile_windows_sidecar_creates_definition(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            manifest = root / "manifest.json"
+            manifest.write_text("{}", encoding="utf-8")
+            config = root / "runtime.json"
+            config.write_text("{}", encoding="utf-8")
+            sidecar = root / "sidecar.json"
+            calls = []
+            def runner(args, **kwargs):
+                calls.append(args)
+                return SimpleNamespace(returncode=1, stdout="", stderr="")
+
+            result = reconcile_windows_sidecar(
+                repo="owner/repo", runtime_root=str(runtime),
+                manifest_path=str(manifest), runtime_config_path=str(config),
+                database_path=str(root / "state.sqlite"), python_executable=r"C:\python\python.exe",
+                sidecar_path=str(sidecar), readiness=lambda: {"status": "ready"}, runner=runner
+            )
+            self.assertEqual(result["status"], "running")
+            self.assertEqual(result["mechanism"], "windows_sidecar")
+            self.assertTrue(sidecar.is_file())
+            content = json.loads(sidecar.read_text(encoding="utf-8"))
+            self.assertEqual(content["command"], "C:/python/python.exe")
+            self.assertIn("--repo", content["args"])
+            self.assertEqual(content["env"]["PYTHONPATH"], runtime.resolve().as_posix())
+
+    def test_remove_windows_sidecar_removes_proven_sidecar(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            config = root / "runtime.json"
+            config.write_text("{}", encoding="utf-8")
+            sidecar = root / "sidecar.json"
+            sidecar.write_text(json.dumps({
+                "args": ["-m", "vccp_runtime.runner", "--runtime-config", str(config.resolve()),
+                         "--repo", "owner/repo"]
+            }), encoding="utf-8")
+            def runner(args, **kwargs):
+                return SimpleNamespace(returncode=1, stdout="", stderr="")
+
+            result = remove_windows_sidecar(
+                repo="owner/repo", database_path=str(root / "state.sqlite"),
+                runtime_config_path=str(config), sidecar_path=str(sidecar), runner=runner
+            )
+            self.assertEqual(result["status"], "removed")
+            self.assertFalse(sidecar.exists())
 
 
 if __name__ == "__main__":

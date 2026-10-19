@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import hashlib
+import json
 from contextlib import closing
 from pathlib import Path
 import plistlib
@@ -251,3 +252,214 @@ def remove_macos_launch_agent(*, repo: str, database_path: str, runtime_config_p
         destination.unlink()
     return {"status": "removed" if loaded or had_plist else "already_removed",
             "mechanism": "launchd", "label": label, "runner_stopped": True, "runtime_lock_released": True}
+
+
+def _valid_existing_sidecar(sidecar_path: Path, repo: str) -> bool:
+    try:
+        data = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        return False
+    args = data.get("args")
+    return (isinstance(args, list)
+            and "-m" in args and args[args.index("-m") + 1:args.index("-m") + 2] == ["vccp_runtime.runner"]
+            and "--repo" in args and args[args.index("--repo") + 1:args.index("--repo") + 2] == [repo])
+
+
+def _find_windows_runner_processes(repo: str, runner=subprocess.run) -> list[int]:
+    # Query running processes matching vccp_runtime.runner and repo
+    result = _run(["tasklist", "/FO", "CSV", "/V"], runner)
+    pids = []
+    if result.returncode == 0 and result.stdout:
+        import csv
+        import io
+        try:
+            reader = csv.reader(io.StringIO(result.stdout))
+            headers = next(reader, None)
+            for row in reader:
+                if len(row) >= 2:
+                    image_name = row[0].casefold()
+                    pid_str = row[1]
+                    window_title = row[-1] if len(row) > 8 else ""
+                    if "python" in image_name:
+                        try:
+                            pid = int(pid_str)
+                            # Verify full commandline with wmic or powershell if needed
+                            pids.append(pid)
+                        except ValueError:
+                            pass
+        except Exception:
+            pass
+    # Refine pids using powershell or wmic to match exact repo and module
+    matching_pids = []
+    if pids:
+        # Use powershell Get-CimInstance to check commandline
+        ps_cmd = [
+            "powershell", "-NoProfile", "-NonInteractive", "-Command",
+            f"Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*vccp_runtime.runner*' -and $_.CommandLine -like '*{repo}*' }} | Select-Object -ExpandProperty ProcessId"
+        ]
+        ps_res = _run(ps_cmd, runner)
+        if ps_res.returncode == 0 and ps_res.stdout:
+            for line in ps_res.stdout.strip().splitlines():
+                line = line.strip()
+                if line.isdigit():
+                    matching_pids.append(int(line))
+        else:
+            # Fallback if powershell CimInstance was not used
+            for pid in pids:
+                chk = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                            f"(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').CommandLine"], runner)
+                if chk.returncode == 0 and "vccp_runtime.runner" in (chk.stdout or "") and repo in (chk.stdout or ""):
+                    matching_pids.append(pid)
+    return matching_pids
+
+
+def reconcile_windows_sidecar(*, repo: str, runtime_root: str, manifest_path: str,
+                              runtime_config_path: str, database_path: str,
+                              python_executable: str, sidecar_path: str,
+                              readiness, runner=subprocess.run, environ=None) -> dict:
+    """Stop, reconcile, qualify, and verify one exact-revision Windows AntiGravity Sidecar."""
+    runtime = Path(runtime_root).expanduser().resolve()
+    destination = Path(sidecar_path).expanduser()
+    if not re.fullmatch(r"[^/]+/[^/]+", repo) or not runtime.is_dir():
+        return {"status": "blocked", "reason": "Consumer identity or exact runtime checkout is unavailable"}
+
+    manifest_file = Path(manifest_path).expanduser().resolve()
+    config_file = Path(runtime_config_path).expanduser().resolve()
+    norm_py = Path(python_executable).resolve().as_posix()
+    norm_manifest = manifest_file.as_posix()
+    norm_config = config_file.as_posix()
+    norm_runtime = runtime.as_posix()
+
+    expected_args = ["-m", "vccp_runtime.runner", "--manifest", norm_manifest,
+                     "--runtime-config", norm_config, "--repo", repo,
+                     "--continuous", "--poll-interval", "15"]
+    expected_env = {"PYTHONPATH": norm_runtime, "PYTHONUTF8": "1"}
+
+    existing_pids = _find_windows_runner_processes(repo, runner)
+
+    if destination.is_file():
+        if not _valid_existing_sidecar(destination, repo):
+            return {"status": "blocked", "reason": "existing sidecar file belongs to another job"}
+        try:
+            current = json.loads(destination.read_text(encoding="utf-8"))
+            current_cmd = Path(current.get("command", "")).as_posix()
+            current_args = current.get("args")
+            current_env = current.get("env") or {}
+            if (current_cmd.casefold() == norm_py.casefold()
+                    and current_args == expected_args
+                    and current_env.get("PYTHONPATH") == norm_runtime
+                    and current_env.get("PYTHONUTF8") == "1"
+                    and len(existing_pids) == 1):
+                return {"status": "running", "no_op": True, "mechanism": "windows_sidecar",
+                        "sidecar_path": str(destination), "pid": existing_pids[0],
+                        "revision": runtime.name, "runtime_root": str(runtime)}
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    # If runner processes exist, stop them safely before updating sidecar
+    if existing_pids:
+        for pid in existing_pids:
+            stopped = _run(["taskkill", "/PID", str(pid), "/T", "/F"], runner)
+            if stopped.returncode != 0:
+                return {"status": "blocked", "reason": f"existing Consumer Runner process {pid} could not be stopped"}
+        # Wait up to 5s for lock to be released
+        time.sleep(0.5)
+        for _ in range(20):
+            if not _find_windows_runner_processes(repo, runner):
+                break
+            time.sleep(0.2)
+        else:
+            return {"status": "blocked", "reason": "existing Consumer Runner processes still active after stop"}
+
+    definition = {
+        "display_name": f"{repo} VCCP Generic Runtime",
+        "description": f"Authoritative VCCP Generic Runtime for {repo}",
+        "command": norm_py,
+        "args": expected_args,
+        "restart_policy": "always",
+        "env": expected_env,
+    }
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + f".{os.getpid()}.tmp")
+    try:
+        temporary.write_text(json.dumps(definition, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.replace(temporary, destination)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+    qualified = readiness()
+    if not isinstance(qualified, dict) or qualified.get("status") != "ready":
+        return {"status": "blocked", "reason": "machine readiness did not pass", "readiness": qualified}
+
+    # Verify RuntimeLock is acquirable now that old runner is stopped
+    try:
+        with RuntimeLock(repo, database_path):
+            pass
+    except RuntimeAlreadyRunning:
+        return {"status": "blocked", "reason": "Consumer RuntimeLock is still held after stopping prior Runner"}
+
+    return {"status": "running", "mechanism": "windows_sidecar", "sidecar_path": str(destination),
+            "revision": runtime.name, "runtime_root": str(runtime)}
+
+
+def remove_windows_sidecar(*, repo: str, database_path: str, runtime_config_path: str,
+                           sidecar_path: str, runner=subprocess.run) -> dict:
+    """Stop one proven Consumer sidecar Runner, verify process/lock released, then remove its sidecar."""
+    problem = _active_work(repo, database_path)
+    if problem:
+        return {"status": "blocked", "reason": problem}
+
+    destination = Path(sidecar_path).expanduser()
+    had_sidecar = destination.exists()
+
+    if destination.is_symlink():
+        return {"status": "blocked", "reason": "Sidecar config is a symlink; ownership cannot be removed safely"}
+
+    if destination.exists():
+        if not _valid_existing_sidecar(destination, repo):
+            return {"status": "blocked", "reason": "Sidecar config ownership cannot be proven for this Consumer"}
+        try:
+            current = json.loads(destination.read_text(encoding="utf-8"))
+            args = current.get("args", [])
+            configured_runtime = args[args.index("--runtime-config") + 1]
+            if Path(configured_runtime).resolve() != Path(runtime_config_path).expanduser().resolve():
+                return {"status": "blocked", "reason": "Sidecar runtime config does not match the requested Consumer config"}
+        except (OSError, ValueError, IndexError, TypeError, json.JSONDecodeError):
+            return {"status": "blocked", "reason": "Sidecar runtime config ownership cannot be proven"}
+
+    existing_pids = _find_windows_runner_processes(repo, runner)
+    if existing_pids:
+        for pid in existing_pids:
+            stopped = _run(["taskkill", "/PID", str(pid), "/T", "/F"], runner)
+            if stopped.returncode != 0:
+                return {"status": "blocked", "reason": f"Consumer Runner process {pid} could not be stopped"}
+        time.sleep(0.5)
+        for _ in range(20):
+            if not _find_windows_runner_processes(repo, runner):
+                break
+            time.sleep(0.2)
+        else:
+            return {"status": "blocked", "reason": "Consumer Runner process remains after stop"}
+
+    problem = _active_work(repo, database_path)
+    if problem:
+        return {"status": "blocked", "reason": problem}
+
+    try:
+        with RuntimeLock(repo, database_path):
+            pass
+    except RuntimeAlreadyRunning:
+        return {"status": "blocked", "reason": "Consumer RuntimeLock is still held after stop"}
+    except OSError as error:
+        return {"status": "blocked", "reason": f"RuntimeLock release could not be verified: {error}"}
+
+    if destination.exists():
+        destination.unlink()
+
+    return {"status": "removed" if had_sidecar or existing_pids else "already_removed",
+            "mechanism": "windows_sidecar", "sidecar_path": str(destination),
+            "runner_stopped": True, "runtime_lock_released": True}
