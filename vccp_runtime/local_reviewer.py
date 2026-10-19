@@ -231,6 +231,7 @@ class LocalReviewerDriver:
             raise ValueError("an explicit Local Reviewer provider binding is required")
         self.store, self.provider, self.writer = store, provider, writer
         self.provider_key = provider_key
+        self._sdk_checkpoint_cache = {}
 
     def retry_failed(self, repo: str, issue: int, pr: int, head: str,
                      authorization_head: str):
@@ -316,15 +317,30 @@ class LocalReviewerDriver:
         return value
 
     def _record_sdk_checkpoint(self, repo, pr, head, checkpoint):
+        key = (repo.casefold(), pr, head.casefold())
+        previous = self._sdk_checkpoint_cache.get(key)
+        identity = (checkpoint.get("phase"), checkpoint.get("session_id"),
+                    checkpoint.get("resume_count"), checkpoint.get("total_turns"))
+        if previous is not None:
+            previous_identity = (previous.get("phase"), previous.get("session_id"),
+                                 previous.get("resume_count"), previous.get("total_turns"))
+            if identity == previous_identity:
+                if (checkpoint.get("phase") == "completed"
+                        and checkpoint.get("result") != previous.get("result")):
+                    raise RuntimeError("conflicting completed Reviewer checkpoint")
+                return
         outcome = _SDK_CHECKPOINT_PREFIX + json.dumps(
             checkpoint, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
         if not self.store.update_reviewer_execution(repo, pr, head, "RUNNING",
                                                     checkpoint.get("session_id"), outcome):
             raise RuntimeError("Reviewer execution checkpoint could not be persisted")
+        self._sdk_checkpoint_cache[key] = dict(checkpoint)
 
     def _continue_sdk_checkpoint(self, repo, issue, pr, head, record, checkpoint):
         session_id = checkpoint["session_id"]
         if session_id != record.get("execution_id"):
+            self.store.update_reviewer_execution(
+                repo, pr, head, "FAILED", outcome="sdk_terminal_failure:checkpoint_session_mismatch")
             return {"status": "reviewer_execution_failed", "reason": "checkpoint_session_mismatch",
                     "head_sha": head}
         if checkpoint["phase"] == "completed":
@@ -372,6 +388,7 @@ class LocalReviewerDriver:
             next_checkpoint, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
         if not self.store.claim_reviewer_resume(repo, pr, head, session_id, expected, desired):
             return {"status": "reviewer_retry_claim_lost", "head_sha": head}
+        self._sdk_checkpoint_cache[(repo.casefold(), pr, head.casefold())] = next_checkpoint
         try:
             execution = self.provider.resume_review(
                 repo, issue, pr, head, session_id, checkpoint["resume_count"],
@@ -574,9 +591,8 @@ class LocalReviewerDriver:
     def _submit_decision(self, repo, issue, pr, head, result):
         event, body = result.get("event"), result.get("body")
         if event not in {"APPROVE", "REQUEST_CHANGES"} or not isinstance(body, str) or not body.strip():
-            if self.provider_key != "claude_agent_sdk":
-                self.store.update_reviewer_execution(repo, pr, head, "FAILED",
-                                                     outcome="invalid_reviewer_decision")
+            self.store.update_reviewer_execution(repo, pr, head, "FAILED",
+                                                 outcome="invalid_reviewer_decision")
             return {"status": "reviewer_invalid_decision", "head_sha": head}
         try:
             decision = self.writer.submit(issue, pr, head, event, body)

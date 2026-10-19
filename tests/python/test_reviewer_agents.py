@@ -56,6 +56,8 @@ class ResultError(Exception):
         self.subtype = "success"
         self.errors = []
         self.result = ("API Error: overloaded (token=sk-ant-sensitive) "
+                       "github_pat_11AA11A_" + "G" * 70 + " "
+                       "ghp_" + "A" * 36 + " " + "ghs_" + "B" * 36 + " "
                        "ANTHROPIC_AUTH_TOKEN=secret_value "
                        '{"ANTHROPIC_AUTH_TOKEN":"secret_value",'
                        '"x-api-key":"another_secret",'
@@ -387,6 +389,9 @@ class ReviewerAgentTests(unittest.TestCase):
         self.assertIn("terminal_reason=api_error", raised.exception.sdk_detail)
         self.assertIn("API Error: overloaded", raised.exception.sdk_detail)
         self.assertNotIn("sk-ant-sensitive", raised.exception.sdk_detail)
+        self.assertNotIn("github_pat_11AA11A_" + "G" * 70, raised.exception.sdk_detail)
+        self.assertNotIn("ghp_" + "A" * 36, raised.exception.sdk_detail)
+        self.assertNotIn("ghs_" + "B" * 36, raised.exception.sdk_detail)
         self.assertNotIn("secret_value", raised.exception.sdk_detail)
         self.assertNotIn("another_secret", raised.exception.sdk_detail)
         self.assertNotIn("dXNlcjpwYXNz", raised.exception.sdk_detail)

@@ -251,7 +251,9 @@ class ClaudeAgentSDKReviewer:
                             "[redacted private key]", detail, flags=re.DOTALL)
             detail = re.sub(r"\s+", " ", detail).strip()
             detail = re.sub(r"(?i)\bBearer\s+\S+", "Bearer [redacted]", detail)
-            detail = re.sub(r"(?i)\b(?:sk-ant-|gh[pousr]_)[A-Za-z0-9_-]{8,}", "[redacted]", detail)
+            detail = re.sub(
+                r"(?i)\b(?:sk-ant-|gh[pousr]_|github_pat_)[A-Za-z0-9_-]{8,}",
+                "[redacted]", detail)
             credential_name = (r"[A-Z0-9_-]*(?:TOKEN|API[_-]?KEY|SECRET|PASSWORD|"
                                r"PRIVATE[_-]?KEY|ACCESS[_-]?KEY|AUTHORIZATION|COOKIE)")
             credential_value = r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^,;\s}]+)'''
