@@ -12,6 +12,8 @@ from urllib.request import Request, urlopen
 
 from .runtime_checkout import _SHA
 
+MAX_REVIEWER_TURNS = 45
+
 
 def _run(command, cwd=None, env=None, timeout=30):
     return subprocess.run(command, cwd=cwd, env=env, text=True, encoding="utf-8",
@@ -281,7 +283,8 @@ class ClaudeAgentSDKReviewer:
             cwd=str(path),
             tools=["Read", "Glob", "Grep"], disallowed_tools=["Bash", "Write", "Edit"],
             permission_mode="default", setting_sources=["user"], can_use_tool=permission,
-            output_format={"type": "json_schema", "schema": self._SCHEMA}, max_turns=30, env=env,
+            output_format={"type": "json_schema", "schema": self._SCHEMA},
+            max_turns=MAX_REVIEWER_TURNS, env=env,
         )
 
     @staticmethod

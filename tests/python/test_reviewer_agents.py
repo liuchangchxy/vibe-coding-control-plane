@@ -139,6 +139,7 @@ class ReviewerAgentTests(unittest.TestCase):
             self.assertEqual(options.tools, ["Read", "Glob", "Grep"])
             self.assertEqual(options.disallowed_tools, ["Bash", "Write", "Edit"])
             self.assertEqual(options.setting_sources, ["user"])
+            self.assertEqual(options.max_turns, 45)
             self.assertEqual(options.env["ANTHROPIC_BASE_URL"], environ["ANTHROPIC_BASE_URL"])
             self.assertEqual(options.env["ANTHROPIC_AUTH_TOKEN"], environ["ANTHROPIC_AUTH_TOKEN"])
             self.assertNotIn("GH_TOKEN", options.env)
