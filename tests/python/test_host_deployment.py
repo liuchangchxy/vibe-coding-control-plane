@@ -2,6 +2,7 @@ import plistlib
 import hashlib
 import json
 from contextlib import closing
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -290,7 +291,7 @@ class HostDeploymentTests(unittest.TestCase):
             runtime = root / "runtime"
             runtime.mkdir()
             manifest = root / "manifest.json"
-            manifest.write_text("{}", encoding="utf-8")
+            manifest.write_text(json.dumps({"vccp": {"revision": runtime.name}}), encoding="utf-8")
             config = root / "runtime.json"
             config.write_text("{}", encoding="utf-8")
             sidecar = root / "sidecar.json"
@@ -328,16 +329,67 @@ class HostDeploymentTests(unittest.TestCase):
             self.assertIn("--repo", content["args"])
             self.assertEqual(content["env"]["PYTHONPATH"], runtime.resolve().as_posix())
 
-    def test_reconcile_windows_sidecar_blocks_if_runner_process_not_running(self):
+    def test_reconcile_windows_sidecar_blocks_if_manifest_revision_mismatch(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
             runtime = root / "runtime"
             runtime.mkdir()
             manifest = root / "manifest.json"
-            manifest.write_text("{}", encoding="utf-8")
+            manifest.write_text(json.dumps({"vccp": {"revision": "other-rev"}}), encoding="utf-8")
             config = root / "runtime.json"
             config.write_text("{}", encoding="utf-8")
             sidecar = root / "sidecar.json"
+
+            result = reconcile_windows_sidecar(
+                repo="owner/repo", runtime_root=str(runtime),
+                manifest_path=str(manifest), runtime_config_path=str(config),
+                database_path=str(root / "state.sqlite"), python_executable=r"C:\python\python.exe",
+                sidecar_path=str(sidecar), readiness=lambda: {"status": "ready"}, runner=subprocess.run
+            )
+            self.assertEqual(result["status"], "blocked")
+            self.assertIn("does not match manifest pin", result["reason"])
+
+    def test_reconcile_windows_sidecar_rolls_back_if_readiness_fails(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({"vccp": {"revision": runtime.name}}), encoding="utf-8")
+            config = root / "runtime.json"
+            config.write_text("{}", encoding="utf-8")
+            sidecar = root / "sidecar.json"
+            old_definition = {"command": "old_python", "args": ["-m", "vccp_runtime.runner", "--repo", "owner/repo"]}
+            sidecar.write_text(json.dumps(old_definition), encoding="utf-8")
+
+            result = reconcile_windows_sidecar(
+                repo="owner/repo", runtime_root=str(runtime),
+                manifest_path=str(manifest), runtime_config_path=str(config),
+                database_path=str(root / "state.sqlite"), python_executable=r"C:\python\python.exe",
+                sidecar_path=str(sidecar), readiness=lambda: {"status": "blocked", "detail": "failed preflight"},
+                runner=subprocess.run
+            )
+            self.assertEqual(result["status"], "blocked")
+            self.assertTrue(result["rolled_back"])
+            self.assertIn("readiness did not pass", result["reason"])
+            # Sidecar content restored to old definition
+            restored = json.loads(sidecar.read_text(encoding="utf-8"))
+            self.assertEqual(restored["command"], "old_python")
+
+    def test_reconcile_windows_sidecar_rolls_back_if_runner_process_not_verified(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({"vccp": {"revision": runtime.name}}), encoding="utf-8")
+            config = root / "runtime.json"
+            config.write_text("{}", encoding="utf-8")
+            sidecar = root / "sidecar.json"
+            old_definition = {"command": "old_python", "args": ["-m", "vccp_runtime.runner", "--repo", "owner/repo"]}
+            sidecar.write_text(json.dumps(old_definition), encoding="utf-8")
+
+            # Runner reports 0 processes running after restart
             def runner(args, **kwargs):
                 return SimpleNamespace(returncode=0, stdout='"ProcessId","Name","CommandLine"\n', stderr="")
 
@@ -348,7 +400,106 @@ class HostDeploymentTests(unittest.TestCase):
                 sidecar_path=str(sidecar), readiness=lambda: {"status": "ready"}, runner=runner
             )
             self.assertEqual(result["status"], "blocked")
-            self.assertIn("not running", result["reason"])
+            self.assertTrue(result["rolled_back"])
+            self.assertIn("failed to verify", result["reason"])
+            restored = json.loads(sidecar.read_text(encoding="utf-8"))
+            self.assertEqual(restored["command"], "old_python")
+
+    def test_reconcile_windows_sidecar_rejects_old_pid_and_rolls_back(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({"vccp": {"revision": runtime.name}}), encoding="utf-8")
+            config = root / "runtime.json"
+            config.write_text("{}", encoding="utf-8")
+            sidecar = root / "sidecar.json"
+            old_definition = {"command": "old_python", "args": ["-m", "vccp_runtime.runner", "--repo", "owner/repo"]}
+            sidecar.write_text(json.dumps(old_definition), encoding="utf-8")
+
+            # Process 100 was running initially and still running with PID 100 (never terminated or restarted)
+            csv_old = (
+                '"ProcessId","Name","CommandLine"\n'
+                f'"100","python.exe","C:/python/python.exe -m vccp_runtime.runner --manifest {manifest.resolve().as_posix()} --runtime-config {config.resolve().as_posix()} --repo owner/repo --continuous --poll-interval 15"\n'
+            )
+            def runner(args, **kwargs):
+                return SimpleNamespace(returncode=0, stdout=csv_old, stderr="")
+
+            result = reconcile_windows_sidecar(
+                repo="owner/repo", runtime_root=str(runtime),
+                manifest_path=str(manifest), runtime_config_path=str(config),
+                database_path=str(root / "state.sqlite"), python_executable=r"C:\python\python.exe",
+                sidecar_path=str(sidecar), readiness=lambda: {"status": "ready"}, runner=runner
+            )
+            self.assertEqual(result["status"], "blocked")
+            # Old process couldn't be stopped or remained active after stop
+            self.assertIn("Runner process", result["reason"])
+
+    def test_reconcile_windows_sidecar_with_antigravity_language_server(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({"vccp": {"revision": runtime.name}}), encoding="utf-8")
+            config = root / "runtime.json"
+            config.write_text("{}", encoding="utf-8")
+            sidecar = root / "easyexam-vccp" / "sidecar.json"
+            sidecar.parent.mkdir(parents=True)
+
+            ls_calls = []
+            expected_args = ["-m", "vccp_runtime.runner", "--manifest", manifest.resolve().as_posix(),
+                             "--runtime-config", config.resolve().as_posix(), "--repo", "owner/repo",
+                             "--continuous", "--poll-interval", "15"]
+
+            from unittest.mock import patch
+
+            def fake_ls_call(method, payload=None, timeout=3.0):
+                ls_calls.append((method, payload))
+                if method == "GetSidecars":
+                    return {
+                        "sidecars": [{
+                            "sidecarId": "easyexam-vccp",
+                            "status": "SIDECAR_STATUS_RUNNING",
+                            "config": {
+                                "command": "C:/python/python.exe",
+                                "args": expected_args,
+                                "env": {"PYTHONPATH": runtime.resolve().as_posix(), "PYTHONUTF8": "1"},
+                            }
+                        }]
+                    }
+                if method == "ManageSidecar":
+                    return {"success": True}
+                return None
+
+            csv_empty = '"ProcessId","Name","CommandLine"\n'
+            csv_running = (
+                '"ProcessId","Name","CommandLine"\n'
+                f'"777","python.exe","C:/python/python.exe -m vccp_runtime.runner --manifest {manifest.resolve().as_posix()} --runtime-config {config.resolve().as_posix()} --repo owner/repo --continuous --poll-interval 15"\n'
+            )
+            observations = iter([csv_empty, csv_running])
+            def runner(args, **kwargs):
+                if args[:4] == ["powershell", "-NoProfile", "-NonInteractive", "-Command"]:
+                    try:
+                        return SimpleNamespace(returncode=0, stdout=next(observations), stderr="")
+                    except StopIteration:
+                        return SimpleNamespace(returncode=0, stdout=csv_running, stderr="")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch("vccp_runtime.host_deployment._antigravity_ls_call", side_effect=fake_ls_call):
+                result = reconcile_windows_sidecar(
+                    repo="owner/repo", runtime_root=str(runtime),
+                    manifest_path=str(manifest), runtime_config_path=str(config),
+                    database_path=str(root / "state.sqlite"), python_executable=r"C:\python\python.exe",
+                    sidecar_path=str(sidecar), readiness=lambda: {"status": "ready"}, runner=runner
+                )
+
+            self.assertEqual(result["status"], "running")
+            self.assertEqual(result["pid"], 777)
+            methods_called = [c[0] for c in ls_calls]
+            self.assertIn("ManageSidecar", methods_called)
+            self.assertIn("GetSidecars", methods_called)
 
     def test_remove_windows_sidecar_removes_proven_sidecar(self):
         with tempfile.TemporaryDirectory() as root:

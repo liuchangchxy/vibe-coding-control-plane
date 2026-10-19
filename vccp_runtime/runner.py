@@ -203,6 +203,8 @@ def main(argv=None):
     parser.add_argument("--authorize-reviewer-retry-for", metavar="SHA",
                         help="explicitly authorize retry for this exact full SHA")
     parser.add_argument("--authorized-by", help="human maintainer identity recorded in the repair ledger")
+    parser.add_argument("--legacy-evidence-attestation",
+                        help="JSON string or file path containing maintainer legacy push evidence attestation")
     parser.add_argument("--poll-interval", type=float, default=30.0)
     args = parser.parse_args(argv)
     retry_values = (args.issue, args.pr, args.head_sha, args.authorize_reviewer_retry_for)
@@ -228,6 +230,8 @@ def main(argv=None):
             parser.error("--authorize-reviewer-retry-for requires --retry-reviewer")
     elif args.authorized_by is not None:
         parser.error("--authorized-by requires --authorize-repair-continuation")
+    if args.legacy_evidence_attestation is not None and not args.authorize_repair_continuation:
+        parser.error("--legacy-evidence-attestation requires --authorize-repair-continuation")
     manifest, local = _load(args.manifest), _load(args.runtime_config)
     try:
         _validate_runtime_revision(manifest)
@@ -264,7 +268,19 @@ def main(argv=None):
             cause_type, cause_id = next(iter(causes))
             candidate = RepairCandidate(args.repo, args.issue, args.pr, args.head_sha.lower(),
                                         snapshot.pr_branch, cause_type, cause_id, local["owner_id"])
-            result = runtime.core.authorize_repair_continuation(candidate, args.authorized_by)
+            legacy_attestation = None
+            if args.legacy_evidence_attestation:
+                att_file = Path(args.legacy_evidence_attestation)
+                if att_file.is_file():
+                    legacy_attestation = att_file.read_text(encoding="utf-8")
+                else:
+                    legacy_attestation = args.legacy_evidence_attestation
+            if legacy_attestation is not None:
+                result = runtime.core.authorize_repair_continuation(
+                    candidate, args.authorized_by, legacy_evidence_attestation=legacy_attestation
+                )
+            else:
+                result = runtime.core.authorize_repair_continuation(candidate, args.authorized_by)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0 if result.get("status") in {"authorized", "already_authorized"} else 2
     try:

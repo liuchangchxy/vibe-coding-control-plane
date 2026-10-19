@@ -11,6 +11,7 @@ import re
 import subprocess
 import sqlite3
 import time
+import urllib.request
 
 from .runner import RuntimeLock, RuntimeAlreadyRunning
 
@@ -325,6 +326,54 @@ def _find_windows_runner_processes(repo: str, runtime_config_path: str | None = 
     return matching_pids
 
 
+def _antigravity_ls_call(method: str, payload: dict | None = None, timeout: float = 3.0) -> dict | None:
+    addr = os.environ.get("ANTIGRAVITY_LS_ADDRESS", "127.0.0.1:4577")
+    token = os.environ.get("ANTIGRAVITY_CSRF_TOKEN", "")
+    url = f"http://{addr}/exa.language_server_pb.LanguageServerService/{method}"
+    data = json.dumps(payload or {}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data,
+        headers={"Content-Type": "application/json", "x-codeium-csrf-token": token}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _antigravity_ls_get_sidecar(sidecar_id: str, repo: str) -> dict | None:
+    data = _antigravity_ls_call("GetSidecars")
+    if not isinstance(data, dict):
+        return None
+    sidecars = data.get("sidecars") or []
+    for sc in sidecars:
+        if sc.get("sidecarId") == sidecar_id:
+            return sc
+    for sc in sidecars:
+        cfg = sc.get("config") or {}
+        args = cfg.get("args") or []
+        if "--repo" in args and args[args.index("--repo") + 1:args.index("--repo") + 2] == [repo]:
+            return sc
+    return None
+
+
+def _antigravity_ls_manage(sidecar_id: str, action: int) -> bool:
+    res = _antigravity_ls_call("ManageSidecar", {"sidecar_id": sidecar_id, "action": action})
+    return isinstance(res, dict)
+
+
+def _rollback_windows_sidecar(destination: Path, backup_content: str | None, sidecar_id: str):
+    if backup_content is not None:
+        destination.write_text(backup_content, encoding="utf-8")
+        _antigravity_ls_manage(sidecar_id, 7)  # UPDATE
+        _antigravity_ls_manage(sidecar_id, 2)  # ENABLE
+    else:
+        if destination.exists():
+            destination.unlink()
+        _antigravity_ls_manage(sidecar_id, 1)  # DISABLE
+
+
 def reconcile_windows_sidecar(*, repo: str, runtime_root: str, manifest_path: str,
                               runtime_config_path: str, database_path: str,
                               python_executable: str, sidecar_path: str,
@@ -342,33 +391,56 @@ def reconcile_windows_sidecar(*, repo: str, runtime_root: str, manifest_path: st
     norm_config = config_file
     norm_runtime = _normalize_path_str(runtime)
 
+    # 1. Verify manifest exists and pins the exact revision matching runtime_root
+    try:
+        manifest_data = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+        pinned_rev = manifest_data.get("vccp", {}).get("revision")
+        if not pinned_rev or pinned_rev.casefold() != runtime.name.casefold():
+            return {"status": "blocked",
+                    "reason": f"runtime root revision ({runtime.name}) does not match manifest pin ({pinned_rev})"}
+    except (OSError, json.JSONDecodeError, AttributeError) as error:
+        return {"status": "blocked", "reason": f"manifest could not be loaded: {error}"}
+
+    sidecar_id = destination.parent.name
     expected_args = ["-m", "vccp_runtime.runner", "--manifest", norm_manifest,
                      "--runtime-config", norm_config, "--repo", repo,
                      "--continuous", "--poll-interval", "15"]
     expected_env = {"PYTHONPATH": norm_runtime, "PYTHONUTF8": "1"}
 
-    existing_pids = _find_windows_runner_processes(repo, runtime_config_path, runner)
-
+    # 2. Inspect destination sidecar and backup if exists
+    backup_content = None
     if destination.is_file():
         if not _valid_existing_sidecar(destination, repo):
             return {"status": "blocked", "reason": "existing sidecar file belongs to another job"}
         try:
-            current = json.loads(destination.read_text(encoding="utf-8"))
+            backup_content = destination.read_text(encoding="utf-8")
+        except OSError:
+            pass
+
+    existing_pids = _find_windows_runner_processes(repo, runtime_config_path, runner)
+    old_pids = set(existing_pids)
+
+    # Fast path: already running with exact configuration and active process
+    if backup_content and len(existing_pids) == 1:
+        try:
+            current = json.loads(backup_content)
             current_cmd = _normalize_path_str(current.get("command", ""))
             current_args = current.get("args")
             current_env = current.get("env") or {}
             if (current_cmd.casefold() == norm_py.casefold()
                     and current_args == expected_args
                     and current_env.get("PYTHONPATH") == norm_runtime
-                    and current_env.get("PYTHONUTF8") == "1"
-                    and len(existing_pids) == 1):
-                return {"status": "running", "no_op": True, "mechanism": "windows_sidecar",
-                        "sidecar_path": str(destination), "pid": existing_pids[0],
-                        "revision": runtime.name, "runtime_root": str(runtime)}
+                    and current_env.get("PYTHONUTF8") == "1"):
+                ls_sc = _antigravity_ls_get_sidecar(sidecar_id, repo)
+                if ls_sc is None or ls_sc.get("status") == "SIDECAR_STATUS_RUNNING":
+                    return {"status": "running", "no_op": True, "mechanism": "windows_sidecar",
+                            "sidecar_path": str(destination), "pid": existing_pids[0],
+                            "revision": runtime.name, "runtime_root": str(runtime)}
         except (OSError, json.JSONDecodeError):
             pass
 
-    # If runner processes exist, stop them safely before updating sidecar
+    # 3. Stop existing runners
+    _antigravity_ls_manage(sidecar_id, 1)  # DISABLE via LS supervisor
     if existing_pids:
         for pid in existing_pids:
             stopped = _run(["taskkill", "/PID", str(pid), "/T", "/F"], runner)
@@ -392,6 +464,7 @@ def reconcile_windows_sidecar(*, repo: str, runtime_root: str, manifest_path: st
         "env": expected_env,
     }
 
+    # 4. Write new sidecar atomically
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(destination.name + f".{os.getpid()}.tmp")
     try:
@@ -403,27 +476,54 @@ def reconcile_windows_sidecar(*, repo: str, runtime_root: str, manifest_path: st
         except FileNotFoundError:
             pass
 
+    # 5. Machine readiness qualification
     qualified = readiness()
     if not isinstance(qualified, dict) or qualified.get("status") != "ready":
-        return {"status": "blocked", "reason": "machine readiness did not pass", "readiness": qualified}
+        _rollback_windows_sidecar(destination, backup_content, sidecar_id)
+        return {"status": "blocked", "reason": "machine readiness did not pass", "readiness": qualified,
+                "rolled_back": True}
 
-    # Verify RuntimeLock is acquirable now that old runner is stopped
+    # 6. Verify RuntimeLock is acquirable now that old runner is stopped
     try:
         with RuntimeLock(repo, database_path):
             pass
     except RuntimeAlreadyRunning:
-        return {"status": "blocked", "reason": "Consumer RuntimeLock is still held after stopping prior Runner"}
+        _rollback_windows_sidecar(destination, backup_content, sidecar_id)
+        return {"status": "blocked", "reason": "Consumer RuntimeLock is still held after stopping prior Runner",
+                "rolled_back": True}
 
-    # Verify that the Runner process is observed running under the reconciled config
+    # 7. Signal AntiGravity LS to update and start the sidecar
+    _antigravity_ls_manage(sidecar_id, 7)  # UPDATE
+    _antigravity_ls_manage(sidecar_id, 2)  # ENABLE
+
+    # 8. Observe and verify the new Runner process
     observed_pids = []
+    verified = False
     for _ in range(20):
         observed_pids = _find_windows_runner_processes(repo, runtime_config_path, runner)
-        if len(observed_pids) == 1:
-            break
-        time.sleep(0.2)
+        if len(observed_pids) == 1 and observed_pids[0] not in old_pids:
+            ls_sc = _antigravity_ls_get_sidecar(sidecar_id, repo)
+            if ls_sc is not None:
+                cfg = ls_sc.get("config") or {}
+                env = cfg.get("env") or {}
+                if (ls_sc.get("status") == "SIDECAR_STATUS_RUNNING"
+                        and env.get("PYTHONPATH") == norm_runtime
+                        and cfg.get("args") == expected_args):
+                    verified = True
+                    break
+            else:
+                verified = True
+                break
+        time.sleep(0.25)
 
-    if len(observed_pids) != 1:
-        return {"status": "blocked", "reason": "reconciled Consumer Runner process is not running"}
+    if not verified or len(observed_pids) != 1:
+        for pid in observed_pids:
+            if pid not in old_pids:
+                _run(["taskkill", "/PID", str(pid), "/T", "/F"], runner)
+        _rollback_windows_sidecar(destination, backup_content, sidecar_id)
+        return {"status": "blocked",
+                "reason": f"reconciled Consumer Runner process failed to verify (observed: {observed_pids})",
+                "rolled_back": True}
 
     return {"status": "running", "mechanism": "windows_sidecar", "sidecar_path": str(destination),
             "pid": observed_pids[0], "revision": runtime.name, "runtime_root": str(runtime)}
@@ -438,6 +538,7 @@ def remove_windows_sidecar(*, repo: str, database_path: str, runtime_config_path
 
     destination = Path(sidecar_path).expanduser()
     had_sidecar = destination.exists()
+    sidecar_id = destination.parent.name
 
     if destination.is_symlink():
         return {"status": "blocked", "reason": "Sidecar config is a symlink; ownership cannot be removed safely"}
@@ -454,6 +555,7 @@ def remove_windows_sidecar(*, repo: str, database_path: str, runtime_config_path
         except (OSError, ValueError, IndexError, TypeError, json.JSONDecodeError):
             return {"status": "blocked", "reason": "Sidecar runtime config ownership cannot be proven"}
 
+    _antigravity_ls_manage(sidecar_id, 1)  # DISABLE via LS supervisor
     existing_pids = _find_windows_runner_processes(repo, runtime_config_path, runner)
     if existing_pids:
         for pid in existing_pids:

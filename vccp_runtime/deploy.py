@@ -24,9 +24,14 @@ def _resolve_windows_sidecar_path(repo: str, local_config: dict) -> str:
         Path.home() / ".gemini" / "config" / "sidecars" / f"{hyphen_slug}-vccp" / "sidecar.json",
         Path.home() / ".gemini" / "config" / "sidecars" / f"{compact_slug}-vccp" / "sidecar.json",
     ]
-    for candidate in candidates:
-        if candidate.is_file():
-            return str(candidate)
+    existing = [candidate for candidate in candidates if candidate.is_file()]
+    if len(existing) > 1:
+        raise ValueError(
+            f"ambiguous multiple Windows Sidecar definitions exist for {repo}: "
+            f"{', '.join(str(c) for c in existing)}; remove or consolidate before deploying"
+        )
+    if len(existing) == 1:
+        return str(existing[0])
     return str(candidates[0])
 
 
@@ -65,7 +70,11 @@ def deploy_host(*, repo: str, manifest: dict, local_config: dict,
         return {**result, "revision": revision, "runtime_root": str(runtime_root),
                 "readiness": readiness_result.get("value")}
     if selected_platform == "win32":
-        sidecar_path = _resolve_windows_sidecar_path(repo, local_config)
+        try:
+            sidecar_path = _resolve_windows_sidecar_path(repo, local_config)
+        except ValueError as error:
+            return {"status": "blocked", "revision": revision, "runtime_root": str(runtime_root),
+                    "reason": str(error)}
         readiness_result = {}
         def readiness_after_stop():
             qualified = full_readiness(runtime_root)
@@ -97,7 +106,10 @@ def remove_host(*, repo: str, local_config: dict, runtime_config_path: str,
         except KeyError:
             return {"status": "blocked", "reason": "runtime config lacks the Consumer database identity required to verify RuntimeLock"}
     if selected_platform == "win32":
-        sidecar_path = _resolve_windows_sidecar_path(repo, local_config)
+        try:
+            sidecar_path = _resolve_windows_sidecar_path(repo, local_config)
+        except ValueError as error:
+            return {"status": "blocked", "reason": str(error)}
         try:
             return remove_windows_sidecar(repo=repo, database_path=local_config["database_path"],
                 runtime_config_path=runtime_config_path,

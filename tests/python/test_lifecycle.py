@@ -1008,17 +1008,38 @@ class LifecycleTests(unittest.TestCase):
             formal_review_head_sha=head_sha,
         )
 
-        # First authorization creates a pending grant
-        auth1 = self.core.authorize_repair_continuation(candidate, "maintainer")
+        # 1. Authorization WITHOUT legacy evidence attestation fails closed as untrusted_provenance
+        unattested = self.core.authorize_repair_continuation(candidate, "maintainer")
+        self.assertEqual(unattested["status"], "untrusted_provenance")
+        flow = store.flow(repo, issue_number)
+        self.assertFalse(flow["trusted"])
+
+        # 2. Authorization with invalid attestation (wrong exhausted_attempt_id) fails
+        bad_attestation = {
+            "repo": repo, "issue": issue_number, "pr": pr_number, "head_sha": head_sha,
+            "exhausted_attempt_id": "wrong-id", "source": "transcript:app-git-push.cmd",
+            "authorized_by": "maintainer",
+        }
+        invalid_res = self.core.authorize_repair_continuation(candidate, "maintainer",
+                                                               legacy_evidence_attestation=bad_attestation)
+        self.assertEqual(invalid_res["status"], "invalid_legacy_evidence_attestation")
+
+        # 3. Authorization with valid attestation successfully binds and restores trusted flow
+        valid_attestation = {
+            "repo": repo, "issue": issue_number, "pr": pr_number, "head_sha": head_sha,
+            "exhausted_attempt_id": "stop-1", "source": "transcript:app-git-push.cmd",
+            "authorized_by": "maintainer",
+        }
+        auth1 = self.core.authorize_repair_continuation(candidate, "maintainer",
+                                                        legacy_evidence_attestation=valid_attestation)
         self.assertEqual(auth1["status"], "authorized")
-        auth_id = auth1["authorization_id"]
 
         # Verify continuation is recorded and flow is restored to trusted
         flow = store.flow(repo, issue_number)
         self.assertTrue(flow["trusted"])
         self.assertTrue(flow["initial_confirmed"])
 
-        # Second authorization returns already_authorized
+        # Second authorization returns already_authorized (idempotent)
         auth2 = self.core.authorize_repair_continuation(candidate, "maintainer")
         self.assertEqual(auth2["status"], "already_authorized")
 
@@ -1031,6 +1052,18 @@ class LifecycleTests(unittest.TestCase):
         # Continuation is now marked consumed
         cont = store.continuation_for_candidate(candidate)
         self.assertIsNotNone(cont["consumed_at"])
+
+        # 4. Repair #4 executes and records a real controlled push
+        attempt_id = dispatched["attempt_id"]
+        push_id = store.begin_controlled_push(attempt_id, repo, "antigravity", branch, head_sha)
+        self.assertIsNotNone(push_id)
+        self.assertTrue(store.complete_controlled_push(push_id, head_sha))
+
+        # Verify that controlled_pushes now has a durable completed row
+        with closing(store._connect()) as conn:
+            push_rows = conn.execute("SELECT * FROM controlled_pushes WHERE attempt_id=?", (attempt_id,)).fetchall()
+            self.assertEqual(len(push_rows), 1)
+            self.assertEqual(push_rows[0]["phase"], "completed")
 
 
 if __name__ == "__main__": unittest.main()
