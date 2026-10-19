@@ -17,9 +17,36 @@ from typing import Iterable, Protocol
 from uuid import uuid4
 
 
-MAX_AUTOMATED_REPAIRS = 3
+MAX_AUTOMATED_REPAIRS = 5
+MAX_REPAIRS_PER_CAUSE = 3
+MAX_HUMAN_CONTINUATIONS = 3
+REPAIRS_PER_CONTINUATION = 1
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 _REPAIR_CAUSES = {"implementation_failure", "reviewer_rejection"}
+
+
+def _ci_cause_is_current(candidate: "RepairCandidate", snapshot: "WorkflowSnapshot") -> bool:
+    parts = candidate.cause_id.split(":", 2)
+    if len(parts) != 3 or parts[0] != "ci" or parts[1].casefold() != candidate.head_sha.casefold():
+        return False
+    evidence = parts[2].split(";")
+    if not evidence or any(not item for item in evidence):
+        return False
+    for item in evidence:
+        try:
+            name, run_id, conclusion = item.rsplit(":", 2)
+        except ValueError:
+            return False
+        matching = [run for run in snapshot.check_runs if run.get("name") == name
+                    and str(run.get("head_sha", "")).casefold() == candidate.head_sha.casefold()]
+        if not matching:
+            return False
+        current = max(matching, key=lambda run: (str(run.get("started_at") or ""),
+                                                  int(run.get("id") or 0)))
+        if (str(current.get("id")) != run_id or current.get("status") != "completed"
+                or current.get("conclusion") != conclusion):
+            return False
+    return True
 
 
 class LaunchDisposition(StrEnum):
@@ -38,9 +65,12 @@ class RuntimeConfig:
             raise ValueError("generic runtime requires manifest schema_version 2")
         contract = manifest.get("issue_contract")
         limit = contract.get("max_automated_repairs") if isinstance(contract, dict) else None
-        if limit != MAX_AUTOMATED_REPAIRS:
-            raise ValueError("issue_contract.max_automated_repairs must be 3")
-        return cls(max_automated_repairs=limit)
+        # v2 manifests deployed before classified budgets pin this value to 3.
+        # Keep accepting them; the runtime now applies category caps plus a hard
+        # total cap so CI noise cannot consume every Reviewer repair.
+        if limit not in {3, MAX_AUTOMATED_REPAIRS}:
+            raise ValueError("issue_contract.max_automated_repairs must be 3 or 5")
+        return cls(max_automated_repairs=MAX_AUTOMATED_REPAIRS)
 
 
 @dataclass(frozen=True)
@@ -134,6 +164,9 @@ class WorkflowPort(Protocol):
     def transition_coordination_state(
         self, repo: str, issue_number: int, expected_state: str, new_state: str, expected_revision: str
     ) -> bool: ...
+
+    def restore_repair_coordination_state(self, repo: str, issue_number: int, new_state: str,
+                                          expected_revision: str) -> bool: ...
 
     def discover_active(self, repo: str) -> list[int]: ...
 
@@ -278,6 +311,23 @@ class _Store:
                     previous_outcome TEXT,
                     consumed_at REAL
                 );
+                CREATE TABLE IF NOT EXISTS repair_continuations (
+                    authorization_id TEXT PRIMARY KEY,
+                    repo TEXT NOT NULL,
+                    issue_number INTEGER NOT NULL,
+                    pr_number INTEGER NOT NULL,
+                    head_sha TEXT NOT NULL,
+                    cause_type TEXT NOT NULL,
+                    cause_id TEXT NOT NULL,
+                    exhausted_attempt_id TEXT NOT NULL UNIQUE,
+                    authorized_by TEXT NOT NULL,
+                    authorized_at REAL NOT NULL,
+                    capacity INTEGER NOT NULL,
+                    activated INTEGER NOT NULL DEFAULT 0,
+                    consumed_at REAL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS repair_continuations_cause_idx
+                    ON repair_continuations(repo, issue_number, pr_number, head_sha, cause_type, cause_id);
                 CREATE INDEX IF NOT EXISTS attempts_flow_idx
                     ON attempts(repo, issue_number, kind, repair_ordinal);
                 """
@@ -309,6 +359,12 @@ class _Store:
                 connection.execute("UPDATE attempts SET implementer_provider='antigravity' "
                                    "WHERE launch_outcome IN ('confirmed','unknown','definitely_not_started')")
             connection.execute("UPDATE attempts SET phase_entered_at=created_at WHERE phase_entered_at IS NULL")
+            # A budget marker records a rejected candidate, not an admitted dispatch.
+            # Release its legacy logical-head uniqueness key so an authorized retry
+            # can use that key exactly once without replacing the historical row.
+            connection.execute("UPDATE attempts SET repair_key=repair_key||':budget:'||attempt_id "
+                               "WHERE phase='BUDGET_EXHAUSTED' AND repair_key IS NOT NULL "
+                               "AND instr(repair_key, ':budget:')=0")
             if migrating_bound_head:
                 # Older P2-D1 code stored the bound head in expected_head_sha.
                 # Preserve it as resulting evidence and invalidate any lost repair baseline.
@@ -325,6 +381,9 @@ class _Store:
                 connection.execute("ALTER TABLE flows ADD COLUMN repair_count INTEGER NOT NULL DEFAULT 0")
             if "repair_budget_known" not in flow_columns:
                 connection.execute("ALTER TABLE flows ADD COLUMN repair_budget_known INTEGER NOT NULL DEFAULT 1")
+            continuation_columns = {row[1] for row in connection.execute("PRAGMA table_info(repair_continuations)")}
+            if "consumed_at" not in continuation_columns:
+                connection.execute("ALTER TABLE repair_continuations ADD COLUMN consumed_at REAL")
             connection.execute(
                 "UPDATE flows SET repair_count=(SELECT COUNT(*) FROM attempts WHERE attempts.repo=flows.repo "
                 "AND attempts.issue_number=flows.issue_number AND attempts.kind='repair' "
@@ -646,10 +705,24 @@ class _Store:
         repo = _repo_key(candidate.repo)
         connection = self.transaction()
         try:
+            base_key = compute_repair_key(candidate.repo, candidate.pr_number, candidate.head_sha)
+            continuation = connection.execute(
+                "SELECT authorization_id,capacity FROM repair_continuations WHERE repo=? AND issue_number=? "
+                "AND pr_number=? AND head_sha=? AND cause_type=? AND cause_id=? AND activated=1 "
+                "AND capacity=1 AND consumed_at IS NULL AND EXISTS ("
+                "SELECT 1 FROM attempts stop WHERE stop.attempt_id=repair_continuations.exhausted_attempt_id "
+                "AND stop.repo=repair_continuations.repo AND stop.issue_number=repair_continuations.issue_number "
+                "AND stop.pr_number=repair_continuations.pr_number "
+                "AND stop.expected_head_sha=repair_continuations.head_sha "
+                "AND stop.cause_type=repair_continuations.cause_type "
+                "AND stop.cause_id=repair_continuations.cause_id AND stop.phase='BUDGET_EXHAUSTED') "
+                "ORDER BY authorized_at DESC LIMIT 1",
+                (repo, candidate.issue_number, candidate.pr_number, candidate.head_sha.lower(),
+                 candidate.cause_type, candidate.cause_id),
+            ).fetchone()
+            key = base_key
             duplicate = connection.execute(
-                "SELECT attempt_id, phase, repair_ordinal FROM attempts WHERE repair_key=?", (
-                    compute_repair_key(candidate.repo, candidate.pr_number, candidate.head_sha),
-                ),
+                "SELECT attempt_id, phase, repair_ordinal FROM attempts WHERE repair_key=?", (key,)
             ).fetchone()
             if duplicate:
                 connection.commit()
@@ -665,10 +738,14 @@ class _Store:
             if not flow["repair_budget_known"]:
                 connection.commit()
                 return {"status": "repair_budget_unknown"}
+            recovered_provenance = bool(continuation) or self._has_verified_budget_recovery(
+                connection, candidate)
+            initial_phases = ("'LAUNCH_CONFIRMED','PR_BOUND','STOPPED_CANCELLED'"
+                              if recovered_provenance else "'LAUNCH_CONFIRMED','PR_BOUND'")
             initial = connection.execute(
                 "SELECT phase FROM attempts WHERE repo=? AND issue_number=? "
                 "AND kind IN ('initial_dispatch','adopted') "
-                "AND phase IN ('LAUNCH_CONFIRMED','PR_BOUND') LIMIT 1", (repo, candidate.issue_number)
+                f"AND phase IN ({initial_phases}) LIMIT 1", (repo, candidate.issue_number)
             ).fetchone()
             if initial is None:
                 connection.commit()
@@ -678,33 +755,67 @@ class _Store:
             ):
                 connection.commit()
                 return {"status": "wrong_pr_or_branch"}
+            if not continuation:
+                prior_stop = connection.execute(
+                    "SELECT attempt_id,repair_ordinal FROM attempts WHERE repo=? AND issue_number=? "
+                    "AND pr_number=? AND expected_head_sha=? AND cause_type=? AND cause_id=? "
+                    "AND phase='BUDGET_EXHAUSTED' ORDER BY created_at DESC LIMIT 1",
+                    (repo, candidate.issue_number, candidate.pr_number, candidate.head_sha.lower(),
+                     candidate.cause_type, candidate.cause_id),
+                ).fetchone()
+                if prior_stop:
+                    connection.commit()
+                    return {"status": "duplicate", "attempt_id": prior_stop["attempt_id"],
+                            "ordinal": prior_stop["repair_ordinal"]}
             recorded_count = connection.execute(
                 "SELECT COUNT(*) AS count FROM attempts WHERE repo=? AND issue_number=? AND kind='repair' "
                 "AND phase != 'BUDGET_EXHAUSTED'",
                 (repo, candidate.issue_number),
             ).fetchone()["count"]
             count = max(flow["repair_count"], recorded_count)
-            if count >= max_repairs:
+            category_count = connection.execute(
+                "SELECT COUNT(*) AS count FROM attempts WHERE repo=? AND issue_number=? "
+                "AND kind='repair' AND cause_type=? AND phase!='BUDGET_EXHAUSTED'",
+                (repo, candidate.issue_number, candidate.cause_type),
+            ).fetchone()["count"]
+            consumed_grants = connection.execute(
+                "SELECT cause_type,COUNT(*) AS count FROM repair_continuations "
+                "WHERE repo=? AND issue_number=? AND consumed_at IS NOT NULL GROUP BY cause_type",
+                (repo, candidate.issue_number),
+            ).fetchall()
+            authorized_count = sum(row["count"] for row in consumed_grants)
+            authorized_category = sum(row["count"] for row in consumed_grants
+                                      if row["cause_type"] == candidate.cause_type)
+            automatic_count = max(0, count - authorized_count)
+            automatic_category_count = max(0, category_count - authorized_category)
+            exhausted = not continuation and (
+                automatic_count >= max_repairs
+                or automatic_category_count >= MAX_REPAIRS_PER_CAUSE
+            )
+            if exhausted:
                 attempt_id = str(uuid4())
                 now = time.time()
-                key = compute_repair_key(candidate.repo, candidate.pr_number, candidate.head_sha)
+                budget_key = f"{key}:budget:{attempt_id}"
                 connection.execute(
                     "INSERT INTO attempts(attempt_id,repo,issue_number,owner_id,lease_token,kind,cause_type,cause_id,"
                     "repair_key,repair_ordinal,expected_head_sha,pr_number,branch,phase,created_at,updated_at,phase_entered_at) "
                     "VALUES(?,?,?,?,?,'repair',?,?,?,?,?,?,?,'BUDGET_EXHAUSTED',?,?,?)",
                     (attempt_id, repo, candidate.issue_number, candidate.owner_id, "", candidate.cause_type,
-                     candidate.cause_id, key, count + 1, candidate.head_sha.lower(), candidate.pr_number,
+                     candidate.cause_id, budget_key, count + 1, candidate.head_sha.lower(), candidate.pr_number,
                      candidate.branch, now, now, now),
                 )
                 connection.commit()
-                return {"status": "budget_exhausted", "attempt_id": attempt_id, "ordinal": count + 1}
+                return {"status": "budget_exhausted", "attempt_id": attempt_id, "ordinal": count + 1,
+                        "category": candidate.cause_type, "category_count": category_count,
+                        "global_limit": max_repairs, "category_limit": MAX_REPAIRS_PER_CAUSE,
+                        "automatic_count": automatic_count,
+                        "automatic_category_count": automatic_category_count}
             token = self._acquire_lease(connection, repo, candidate.issue_number, candidate.owner_id, ttl)
             if token is None:
                 connection.commit()
                 return {"status": "lease_held"}
             attempt_id = str(uuid4())
             now = time.time()
-            key = compute_repair_key(candidate.repo, candidate.pr_number, candidate.head_sha)
             connection.execute(
                 "INSERT INTO attempts(attempt_id,repo,issue_number,owner_id,lease_token,kind,cause_type,cause_id,"
                 "repair_key,repair_ordinal,expected_head_sha,pr_number,branch,phase,created_at,updated_at,"
@@ -720,8 +831,176 @@ class _Store:
             )
             connection.execute("UPDATE flows SET repair_count=? WHERE repo=? AND issue_number=?",
                                (count + 1, repo, candidate.issue_number))
+            if continuation:
+                consumed = connection.execute(
+                    "UPDATE repair_continuations SET consumed_at=? WHERE authorization_id=? "
+                    "AND activated=1 AND consumed_at IS NULL",
+                    (now, continuation["authorization_id"]),
+                )
+                if consumed.rowcount != 1:
+                    raise RuntimeError("repair continuation was concurrently consumed")
             connection.commit()
             return {"status": "admitted", "attempt_id": attempt_id, "ordinal": count + 1, "repair_key": key, "lease_token": token}
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _has_verified_budget_recovery(connection, candidate: RepairCandidate):
+        """Accept cancelled Initial history only after a consumed grant produced a verified push."""
+        repo = _repo_key(candidate.repo)
+        row = connection.execute(
+            "SELECT 1 FROM repair_continuations g "
+            "JOIN attempts stop ON stop.attempt_id=g.exhausted_attempt_id "
+            "JOIN attempts repair ON repair.repo=g.repo AND repair.issue_number=g.issue_number "
+            "AND repair.pr_number=g.pr_number AND repair.kind='repair' "
+            "AND repair.expected_head_sha=g.head_sha AND repair.cause_type=g.cause_type "
+            "AND repair.cause_id=g.cause_id "
+            "AND repair.repair_key=('repair:' || g.repo || ':pr:' || g.pr_number || ':head:' || g.head_sha) "
+            "JOIN controlled_pushes push ON push.attempt_id=repair.attempt_id "
+            "AND push.repo=repair.repo AND push.destination_ref=repair.branch AND push.phase='completed' "
+            "WHERE g.repo=? AND g.issue_number=? AND g.pr_number=? AND g.consumed_at IS NOT NULL "
+            "AND g.activated=1 AND stop.phase='BUDGET_EXHAUSTED' "
+            "AND repair.launch_outcome='confirmed' AND repair.execution_id IS NOT NULL LIMIT 1",
+            (repo, candidate.issue_number, candidate.pr_number),
+        ).fetchone()
+        return row is not None
+
+    def exhaustion_for_candidate(self, candidate: RepairCandidate):
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT attempt_id FROM attempts WHERE repo=? AND issue_number=? AND pr_number=? "
+                "AND expected_head_sha=? AND cause_type=? AND cause_id=? AND phase='BUDGET_EXHAUSTED' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (_repo_key(candidate.repo), candidate.issue_number, candidate.pr_number,
+                 candidate.head_sha.lower(), candidate.cause_type, candidate.cause_id),
+            ).fetchone()
+            return row["attempt_id"] if row else None
+
+    def continuation_for_candidate(self, candidate: RepairCandidate):
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT authorization_id,activated,consumed_at FROM repair_continuations WHERE repo=? AND issue_number=? "
+                "AND pr_number=? AND head_sha=? AND cause_type=? AND cause_id=? "
+                "ORDER BY authorized_at DESC LIMIT 1",
+                (_repo_key(candidate.repo), candidate.issue_number, candidate.pr_number,
+                 candidate.head_sha.lower(), candidate.cause_type, candidate.cause_id),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def authorize_continuation(self, candidate: RepairCandidate, authorized_by: str):
+        connection = self.transaction()
+        try:
+            exhausted_id = self.exhaustion_for_candidate(candidate)
+            if not exhausted_id:
+                connection.commit()
+                return {"status": "matching_budget_exhaustion_not_found"}
+            existing = connection.execute(
+                "SELECT authorization_id,activated FROM repair_continuations WHERE repo=? AND issue_number=? "
+                "AND pr_number=? AND head_sha=? AND cause_type=? AND cause_id=?",
+                (_repo_key(candidate.repo), candidate.issue_number, candidate.pr_number,
+                 candidate.head_sha.lower(), candidate.cause_type, candidate.cause_id),
+            ).fetchone()
+            if existing:
+                connection.commit()
+                return {"status": "already_authorized", "authorization_id": existing["authorization_id"],
+                        "activated": bool(existing["activated"])}
+            count = connection.execute(
+                "SELECT COUNT(*) AS count FROM repair_continuations WHERE repo=? AND issue_number=?",
+                (_repo_key(candidate.repo), candidate.issue_number),
+            ).fetchone()["count"]
+            if count >= MAX_HUMAN_CONTINUATIONS:
+                connection.commit()
+                return {"status": "continuation_limit_exhausted", "limit": MAX_HUMAN_CONTINUATIONS}
+            authorization_id = str(uuid4())
+            connection.execute(
+                "INSERT INTO repair_continuations(authorization_id,repo,issue_number,pr_number,head_sha,"
+                "cause_type,cause_id,exhausted_attempt_id,authorized_by,authorized_at,capacity) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (authorization_id, _repo_key(candidate.repo), candidate.issue_number, candidate.pr_number,
+                 candidate.head_sha.lower(), candidate.cause_type, candidate.cause_id, exhausted_id,
+                 authorized_by, time.time(), REPAIRS_PER_CONTINUATION),
+            )
+            connection.commit()
+            return {"status": "authorized_pending_activation", "authorization_id": authorization_id,
+                    "exhausted_attempt_id": exhausted_id, "capacity": REPAIRS_PER_CONTINUATION}
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def activate_continuation(self, authorization_id: str):
+        with closing(self._connect()) as connection:
+            connection.execute("UPDATE repair_continuations SET activated=1 WHERE authorization_id=?",
+                               (authorization_id,))
+            connection.commit()
+
+    def active_continuations(self, repo: str):
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT * FROM repair_continuations WHERE repo=? AND activated=1 AND consumed_at IS NULL",
+                (_repo_key(repo),),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def pending_continuations(self, repo: str):
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT * FROM repair_continuations WHERE repo=? AND activated=0 AND consumed_at IS NULL",
+                (_repo_key(repo),),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def restore_budget_stopped_flow(self, candidate: RepairCandidate):
+        """Restore trust only from a terminalized, budget-known flow with durable push proof."""
+        repo = _repo_key(candidate.repo)
+        connection = self.transaction()
+        try:
+            flow = connection.execute(
+                "SELECT * FROM flows WHERE repo=? AND issue_number=?", (repo, candidate.issue_number)
+            ).fetchone()
+            exhausted = connection.execute(
+                "SELECT attempt_id FROM attempts WHERE repo=? AND issue_number=? AND pr_number=? "
+                "AND expected_head_sha=? AND cause_type=? AND cause_id=? AND phase='BUDGET_EXHAUSTED'",
+                (repo, candidate.issue_number, candidate.pr_number, candidate.head_sha.lower(),
+                 candidate.cause_type, candidate.cause_id),
+            ).fetchone()
+            history = connection.execute(
+                "SELECT * FROM attempts WHERE repo=? AND issue_number=? ORDER BY created_at,attempt_id",
+                (repo, candidate.issue_number),
+            ).fetchall()
+            dispatched = [row for row in history if row["kind"] == "repair"
+                          and row["phase"] != "BUDGET_EXHAUSTED"]
+            initial = [row for row in history if row["kind"] in {"initial_dispatch", "adopted"}]
+            has_push = False
+            for row in [*initial, *dispatched]:
+                if row["pr_number"] != candidate.pr_number or row["branch"] != candidate.branch:
+                    continue
+                push = connection.execute(
+                    "SELECT 1 FROM controlled_pushes WHERE attempt_id=? AND repo=? "
+                    "AND destination_ref=? AND expected_sha=? AND phase='completed' LIMIT 1",
+                    (row["attempt_id"], repo, candidate.branch, candidate.head_sha.lower()),
+                ).fetchone()
+                if push:
+                    has_push = True
+                    break
+            valid = (flow is not None and not flow["trusted"] and not flow["initial_confirmed"]
+                     and flow["repair_budget_known"] and flow["repair_count"] == len(dispatched)
+                     and flow["pr_number"] == candidate.pr_number and flow["branch"] == candidate.branch
+                     and bool(exhausted) and bool(initial) and has_push
+                     and all(row["launch_outcome"] == "confirmed" and row["execution_id"]
+                             for row in [*initial, *dispatched])
+                     and all(row["phase"] == "STOPPED_CANCELLED" for row in [*initial, *dispatched]))
+            if not valid:
+                connection.commit()
+                return False
+            connection.execute("UPDATE flows SET trusted=1,initial_confirmed=1 WHERE repo=? AND issue_number=?",
+                               (repo, candidate.issue_number))
+            connection.commit()
+            return True
         except Exception:
             connection.rollback()
             raise
@@ -1491,6 +1770,114 @@ class RuntimeCore:
         )
         return self._launch(launch_request, admission)
 
+    def authorize_repair_continuation(self, candidate: RepairCandidate, authorized_by: str):
+        """Explicitly reopen one exact exhausted cause; never launch from this command."""
+        if (not isinstance(authorized_by, str) or not authorized_by.strip()
+                or candidate.cause_type not in _REPAIR_CAUSES
+                or not _SHA_RE.fullmatch(candidate.head_sha or "")):
+            return {"status": "invalid_authorization"}
+        try:
+            snapshot = self.workflow.observe(candidate.repo, candidate.issue_number)
+        except Exception as error:
+            return {"status": "workflow_unavailable", "detail": str(error)}
+        existing = self.store.continuation_for_candidate(candidate)
+        target = "changes-requested" if candidate.cause_type == "reviewer_rejection" else "agent-working"
+        replay_evidence_current = (
+            snapshot.issue_open and snapshot.frozen_spec and not snapshot.canceled and snapshot.pr_open
+            and snapshot.canonical_relationship_valid and snapshot.canonical_link_count == 1
+            and snapshot.open_linked_pr_count == 1
+            and snapshot.pr_linked_issue == candidate.issue_number and snapshot.pr_number == candidate.pr_number
+            and snapshot.pr_branch == candidate.branch and snapshot.pr_head_sha
+            and snapshot.pr_head_sha.casefold() == candidate.head_sha.casefold()
+            and (snapshot.coordination_state in {target, "agent-working"}
+                 or (snapshot.terminal_labels == ("needs-human",)
+                     and snapshot.active_labels == (target,)))
+            and ((candidate.cause_type == "reviewer_rejection"
+                  and snapshot.formal_review_state == "CHANGES_REQUESTED"
+                  and snapshot.formal_review_id == candidate.cause_id
+                  and snapshot.formal_review_head_sha == snapshot.pr_head_sha)
+                 or (candidate.cause_type == "implementation_failure"
+                     and _ci_cause_is_current(candidate, snapshot)))
+        )
+        if existing and replay_evidence_current:
+            flow = self.store.flow(candidate.repo, candidate.issue_number)
+            if not flow or not flow.get("trusted") or not flow.get("initial_confirmed"):
+                if not self.store.restore_budget_stopped_flow(candidate):
+                    return {"status": "untrusted_provenance"}
+            if snapshot.terminal_labels:
+                restore = getattr(self.workflow, "restore_repair_coordination_state", None)
+                if not restore or not restore(candidate.repo, candidate.issue_number, target, snapshot.revision):
+                    return {"status": "authorization_pending_activation",
+                            "authorization_id": existing["authorization_id"]}
+            if not existing["activated"]:
+                self.store.activate_continuation(existing["authorization_id"])
+                return {"status": "authorized", "authorization_id": existing["authorization_id"],
+                        "recovered": True}
+            return {"status": "already_authorized", "authorization_id": existing["authorization_id"]}
+        valid = (
+            snapshot.issue_open and snapshot.coordination_state == "needs-human"
+            and snapshot.terminal_labels == ("needs-human",)
+            and snapshot.frozen_spec and not snapshot.canceled and snapshot.pr_open
+            and snapshot.canonical_relationship_valid and snapshot.canonical_link_count == 1
+            and snapshot.open_linked_pr_count == 1
+            and snapshot.pr_number == candidate.pr_number
+            and snapshot.pr_linked_issue == candidate.issue_number
+            and snapshot.pr_branch == candidate.branch
+            and snapshot.pr_head_sha and snapshot.pr_head_sha.casefold() == candidate.head_sha.casefold()
+            and isinstance(candidate.pr_number, int) and candidate.pr_number > 0
+            and isinstance(candidate.issue_number, int) and candidate.issue_number > 0
+            and self.store.exhaustion_for_candidate(candidate) is not None
+        )
+        if candidate.cause_type == "reviewer_rejection":
+            valid = valid and snapshot.formal_review_state == "CHANGES_REQUESTED" \
+                and snapshot.formal_review_id == candidate.cause_id \
+                and snapshot.formal_review_head_sha == snapshot.pr_head_sha
+        else:
+            valid = valid and _ci_cause_is_current(candidate, snapshot)
+        if not valid:
+            return {"status": "authorization_evidence_stale_or_invalid"}
+        result = self.store.authorize_continuation(candidate, authorized_by.strip())
+        if result["status"] == "already_authorized":
+            if result["activated"]:
+                return result
+            authorization_id = result["authorization_id"]
+        elif result["status"] == "authorized_pending_activation":
+            authorization_id = result["authorization_id"]
+        else:
+            return result
+        flow = self.store.flow(candidate.repo, candidate.issue_number)
+        if not flow or not flow.get("trusted") or not flow.get("initial_confirmed"):
+            if not self.store.restore_budget_stopped_flow(candidate):
+                return {"status": "untrusted_provenance", "authorization_id": authorization_id}
+        try:
+            fresh = self.workflow.observe(candidate.repo, candidate.issue_number)
+            evidence_still_current = (
+                fresh.revision == snapshot.revision and fresh.coordination_state == "needs-human"
+                and fresh.terminal_labels == ("needs-human",) and fresh.issue_open and fresh.frozen_spec
+                and fresh.canonical_relationship_valid and fresh.canonical_link_count == 1
+                and fresh.open_linked_pr_count == 1
+                and not fresh.canceled and fresh.pr_open and fresh.pr_linked_issue == candidate.issue_number
+                and fresh.pr_branch == candidate.branch and fresh.pr_number == candidate.pr_number
+                and fresh.pr_head_sha and fresh.pr_head_sha.casefold() == candidate.head_sha.casefold()
+                and ((candidate.cause_type == "reviewer_rejection"
+                     and fresh.formal_review_state == "CHANGES_REQUESTED"
+                     and fresh.formal_review_id == candidate.cause_id
+                     and fresh.formal_review_head_sha == fresh.pr_head_sha)
+                     or (candidate.cause_type == "implementation_failure"
+                         and _ci_cause_is_current(candidate, fresh)))
+            )
+            if not evidence_still_current:
+                return {"status": "authorization_evidence_stale_or_invalid", "authorization_id": authorization_id}
+            restore = getattr(self.workflow, "restore_repair_coordination_state", None)
+            transitioned = bool(restore and restore(candidate.repo, candidate.issue_number, target, fresh.revision))
+        except Exception:
+            transitioned = False
+        if not transitioned:
+            return {"status": "authorization_pending_activation", "authorization_id": authorization_id}
+        self.store.activate_continuation(authorization_id)
+        return {"status": "authorized", "authorization_id": authorization_id,
+                "capacity": REPAIRS_PER_CONTINUATION, "coordination_state": target}
+
     def _launch(self, request: LaunchRequest, extra: dict | None = None):
         try:
             result = self.implementer.launch(request)
@@ -1598,6 +1985,31 @@ class RuntimeCore:
                         self.store.local_terminal(latest["attempt_id"], "TERMINAL_UNRESOLVED", current_time)
                         output.append({"issue": issue, "status": "contradictory_claim_evidence"})
                 continue
+            activation_pending = [grant for grant in self.store.pending_continuations(repo_key)
+                                  if grant["issue_number"] == issue
+                                  and grant["pr_number"] == snapshot.pr_number
+                                  and grant["head_sha"] == (snapshot.pr_head_sha or "").lower()]
+            if activation_pending:
+                grant = activation_pending[-1]
+                cause_current = (
+                    grant["cause_type"] == "reviewer_rejection"
+                    and snapshot.coordination_state == "changes-requested"
+                    and snapshot.formal_review_state == "CHANGES_REQUESTED"
+                    and snapshot.formal_review_id == grant["cause_id"]
+                    and snapshot.formal_review_head_sha == snapshot.pr_head_sha
+                ) or (
+                    grant["cause_type"] == "implementation_failure"
+                    and snapshot.coordination_state == "agent-working"
+                    and _ci_cause_is_current(RepairCandidate(
+                        repo_key, issue, grant["pr_number"], grant["head_sha"],
+                        snapshot.pr_branch or "", grant["cause_type"], grant["cause_id"], owner_id), snapshot)
+                )
+                if (cause_current and snapshot.issue_open and snapshot.frozen_spec and not snapshot.canceled
+                        and snapshot.pr_open and snapshot.pr_linked_issue == issue
+                        and snapshot.pr_branch and snapshot.canonical_relationship_valid
+                        and snapshot.canonical_link_count == 1 and snapshot.open_linked_pr_count == 1):
+                    output.append({"issue": issue, "status": "continuation_activation_pending"})
+                    continue
             if latest and latest["owner_id"] != owner_id:
                 output.append({"issue": issue, "status": "owner_mismatch"})
                 continue
@@ -1615,8 +2027,46 @@ class RuntimeCore:
                     self.store.local_terminal(row["attempt_id"], "TERMINAL_UNRESOLVED", current_time)
                 output.append({"issue": issue, "status": "untrusted_repair_history"})
                 continue
+            pending_grants = [grant for grant in self.store.active_continuations(repo_key)
+                              if grant["issue_number"] == issue
+                              and grant["pr_number"] == snapshot.pr_number
+                              and grant["head_sha"] == (snapshot.pr_head_sha or "").lower()]
+            recovery_grants = [grant for grant in self.store.active_continuations(repo_key)
+                               if grant["issue_number"] == issue
+                               and grant["pr_number"] == snapshot.pr_number]
+            verified_continuation_flow = bool(
+                recovery_grants and flow and flow.get("trusted") and flow.get("initial_confirmed")
+                and flow.get("repair_budget_known") and flow.get("pr_number") == snapshot.pr_number
+                and flow.get("branch") == snapshot.pr_branch and snapshot.issue_open and snapshot.pr_open
+                and snapshot.canonical_relationship_valid and snapshot.canonical_link_count == 1
+                and snapshot.open_linked_pr_count == 1 and snapshot.pr_linked_issue == issue
+                and any(row["attempt_id"] == grant["exhausted_attempt_id"]
+                        and row["phase"] == "BUDGET_EXHAUSTED"
+                        for grant in recovery_grants for row in rows)
+            )
+            if pending_grants and not latest:
+                grant = pending_grants[-1]
+                candidate = RepairCandidate(repo_key, issue, grant["pr_number"], grant["head_sha"],
+                                            snapshot.pr_branch or "", grant["cause_type"],
+                                            grant["cause_id"], owner_id)
+                cause_current = (
+                    grant["cause_type"] == "reviewer_rejection"
+                    and snapshot.formal_review_state == "CHANGES_REQUESTED"
+                    and snapshot.formal_review_id == grant["cause_id"]
+                    and snapshot.formal_review_head_sha == snapshot.pr_head_sha
+                ) or (grant["cause_type"] == "implementation_failure"
+                      and _ci_cause_is_current(candidate, snapshot))
+                if (cause_current and flow and flow.get("trusted") and flow.get("initial_confirmed")
+                        and flow.get("repair_budget_known") and snapshot.pr_open
+                        and snapshot.canonical_relationship_valid and snapshot.canonical_link_count == 1
+                        and snapshot.open_linked_pr_count == 1):
+                    output.append({"issue": issue, "status": "authorized_repair_pending"})
+                    continue
             if not latest and rows:
                 phase = rows[-1]["phase"]
+                if verified_continuation_flow and phase in {"STOPPED_CANCELLED", "BUDGET_EXHAUSTED"}:
+                    output.append({"issue": issue, "status": "verified_recovered_flow_observed"})
+                    continue
                 if phase == "PR_BOUND":
                     bound_row = rows[-1]
                     output.append({"issue": issue, "status": "already_bound", "pr": bound_row["pr_number"]})

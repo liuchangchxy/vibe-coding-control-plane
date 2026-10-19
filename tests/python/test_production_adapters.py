@@ -336,6 +336,44 @@ class AdapterTests(unittest.TestCase):
         self.assertTrue(infra_adapter.transition_coordination_state("o/r", 1, "agent-working", "infra-blocked", "r1"))
         self.assertEqual(infra_adapter.observe("o/r", 1).terminal_labels, ("infra-blocked",))
 
+    def test_budget_authorization_is_the_only_transition_that_clears_needs_human(self):
+        api = linked_api()
+        api.issue["labels"] = [{"name": "needs-human"}, {"name": "frozen-spec"}]
+        writer = MutatingWriter(api)
+        adapter = GitHubWorkflowAdapter(api, writer, MANIFEST)
+        observed = adapter.observe("o/r", 1)
+        self.assertEqual(observed.coordination_state, "needs-human")
+        self.assertFalse(adapter.restore_repair_coordination_state("o/r", 1, "changes-requested", "stale"))
+        self.assertFalse(writer.calls)
+        self.assertTrue(adapter.restore_repair_coordination_state("o/r", 1, "changes-requested", "r1"))
+        self.assertEqual([call[2:] for call in writer.calls],
+                         [([], ["changes-requested"]), (["needs-human"], [])])
+        self.assertEqual(adapter.observe("o/r", 1).coordination_state, "changes-requested")
+
+    def test_budget_label_promotion_retries_after_target_added_but_terminal_removal_fails(self):
+        class FailSecondWrite(MutatingWriter):
+            def __init__(self, api):
+                super().__init__(api); self.writes = 0
+            def replace_labels(self, repo, issue, remove, add):
+                self.writes += 1
+                if self.writes == 2:
+                    self.calls.append((repo, issue, remove, add))
+                    return False
+                return super().replace_labels(repo, issue, remove, add)
+
+        api = linked_api()
+        api.issue["labels"] = [{"name": "needs-human"}, {"name": "frozen-spec"}]
+        writer = FailSecondWrite(api)
+        adapter = GitHubWorkflowAdapter(api, writer, MANIFEST)
+        self.assertFalse(adapter.restore_repair_coordination_state("o/r", 1, "changes-requested", "r1"))
+        partial = adapter.observe("o/r", 1)
+        self.assertEqual(partial.terminal_labels, ("needs-human",))
+        self.assertEqual(partial.active_labels, ("changes-requested",))
+        self.assertTrue(adapter.restore_repair_coordination_state(
+            "o/r", 1, "changes-requested", partial.revision))
+        complete = adapter.observe("o/r", 1)
+        self.assertEqual((complete.coordination_state, complete.terminal_labels), ("changes-requested", ()))
+
     def test_recovery_discovery_queries_only_active_states(self):
         api = FakeAPI()
         api.discovery["agent-working"] = [{"number": 8}, {"number": 9, "pull_request": {}}]

@@ -308,7 +308,7 @@ test("add-only coordination mutation on Issue close conflicts because late clean
   });
 });
 
-test("v2 manifest contract accepts only the shared frozen repair budget", () => {
+test("v2 manifest contract retains the compatible repair-budget field", () => {
   const manifest = createManifest(validInput());
   assert.deepEqual(validateManifest(manifest), []);
   const legacyField = structuredClone(manifest);
@@ -335,7 +335,7 @@ test("schema, generated manifest, onboarding guide, contract, and Reviewer promp
   assert.match(template, /max_automated_repairs: 3/);
   assert.match(onboarding, /`repository_upgrade_required` \(0\)/);
   assert.match(onboarding, /Python owns activation qualification and construction of the Generic Runtime, plus claim\/ownership, discovery, dispatch, repair admission/);
-  assert.match(contract, /shared by implementation-attributable CI repairs and Reviewer-caused repairs/);
+  assert.match(contract, /independent caps of three implementation-attributable CI repairs and three formal Reviewer repairs, plus a hard total of five/);
   assert.match(contract, /Dispatcher admits a candidate/);
   assert.match(contract, /repair:<repo>:pr:<pr_number>:head:<failed_or_rejected_head_sha>/);
   assert.match(contract, /same linked PR and implementation branch/);
@@ -599,7 +599,7 @@ test("rendered Reviewer prompt waits for same-run checks and enables Auto-merge 
     assert.match(prompt, /remains absent until this run's reasonable waiting deadline or the platform execution limit[\s\S]*report `missing\/timeout`[\s\S]*exit without formal approval/);
     assert.match(prompt, /After every wait and state re-read, verify the PR's current head SHA is still the captured SHA/);
     assert.match(prompt, /enable native Auto-merge[\s\S]*APPROVE/);
-    assert.match(prompt, /Dispatcher alone admits or rejects repairs under the shared `max_automated_repairs` budget/);
+    assert.match(prompt, /Dispatcher alone admits or rejects repairs under its independent CI and Reviewer caps and hard total budget/);
     assert.match(prompt, /If required CI is red, exit without a product `REQUEST_CHANGES`/);
     assert.match(prompt, /No first-finding early exit/);
     assert.match(prompt, /Root-cause-wide sibling audit/);

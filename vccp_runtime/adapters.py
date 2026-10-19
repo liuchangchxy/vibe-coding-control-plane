@@ -465,6 +465,46 @@ class GitHubWorkflowAdapter:
         )
         return after.issue_open and not after.canceled and target_verified
 
+    def restore_repair_coordination_state(self, repo, issue_number, new_state, expected_revision):
+        """Idempotently promote a grant; leave needs-human in place until target is verified."""
+        before = self._facts(repo, issue_number)
+        staged = (before.terminal_labels == ("needs-human",)
+                  and before.active_labels == (new_state,))
+        if (before.revision != str(expected_revision)
+                or before.terminal_labels != ("needs-human",) or before.canceled or not before.issue_open
+                or not before.frozen_spec
+                or new_state not in self.policy["active_coordination_labels"]):
+            return False
+        if new_state not in before.active_labels:
+            if before.active_labels:
+                return False
+            if not self.writer.replace_labels(repo, issue_number, [], [new_state]):
+                return False
+            staged_facts = self._facts(repo, issue_number)
+            same_evidence = (staged_facts.issue_open and staged_facts.frozen_spec
+                             and not staged_facts.canceled
+                             and staged_facts.pr_head_sha == before.pr_head_sha
+                             and staged_facts.pr_number == before.pr_number
+                             and staged_facts.pr_branch == before.pr_branch
+                             and staged_facts.formal_review_state == before.formal_review_state
+                             and staged_facts.formal_review_id == before.formal_review_id
+                             and staged_facts.formal_review_head_sha == before.formal_review_head_sha
+                             and staged_facts.check_runs == before.check_runs
+                             and staged_facts.terminal_labels == ("needs-human",)
+                             and staged_facts.active_labels == (new_state,))
+            if not same_evidence:
+                return False
+        elif not staged:
+            return False
+        # The terminal fence remains until this final, separately retryable operation.
+        if not self.writer.replace_labels(repo, issue_number, ["needs-human"], []):
+            return False
+        after = self._facts(repo, issue_number)
+        return (after.issue_open and after.frozen_spec and not after.canceled
+                and after.coordination_state == new_state and not after.terminal_labels
+                and after.pr_head_sha == before.pr_head_sha and after.pr_number == before.pr_number
+                and after.pr_branch == before.pr_branch)
+
     def clear_active_coordination_labels(self, repo, issue_number):
         """Remove active labels after a proven native merge; preserve terminal labels.
 

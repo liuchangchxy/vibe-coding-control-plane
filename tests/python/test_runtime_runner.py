@@ -2,6 +2,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 from contextlib import redirect_stderr, redirect_stdout
@@ -261,6 +262,47 @@ class RuntimeRunnerTests(unittest.TestCase):
                                   ("retry", "owner/repo", 7, 12, head, head), "release"])
         self.assertEqual(json.loads(output.getvalue())["execution_id"], "claude-session")
 
+    def test_repair_continuation_cli_binds_target_without_stopping_resident_runner(self):
+        head = "a" * 40
+        events = []
+        class Lock:
+            def __init__(self, repo, database): events.append(("identity", repo, database))
+            def __enter__(self): events.append("lock"); return self
+            def __exit__(self, *_): events.append("release")
+        class Store:
+            def attempts_for_repo(self, repo):
+                return [{"issue_number": 57, "pr_number": 58, "expected_head_sha": head,
+                         "phase": "BUDGET_EXHAUSTED", "cause_type": "reviewer_rejection",
+                         "cause_id": "review-123"}]
+        class Core:
+            store = Store()
+            def authorize_repair_continuation(self, candidate, authorized_by):
+                events.append(("authorize", candidate.repo, candidate.issue_number, candidate.pr_number,
+                               candidate.head_sha, candidate.cause_type, candidate.cause_id,
+                               candidate.branch, authorized_by))
+                return {"status": "authorized", "authorization_id": "auth-1"}
+        workflow = SimpleNamespace(observe=lambda repo, issue: SimpleNamespace(
+            pr_number=58, pr_branch="implement/57"))
+        runtime = SimpleNamespace(core=Core(), workflow=workflow)
+        local = {"database_path": "state.db", "owner_id": "owner", "workspace": ".",
+                 "target_repository": "owner/repo", "enrollment": {"authorized_repository": "owner/repo"}}
+        manifest = {"vccp": {"revision": _checkout_head()}}
+        output = StringIO()
+        with patch.object(runner, "_load", side_effect=[manifest, local]), \
+             patch.object(runner, "_runtime_source_revision", return_value=_checkout_head()), \
+             patch.object(runner, "_workspace_repository", return_value="owner/repo"), \
+             patch.object(runner, "RuntimeLock", Lock), \
+             patch.object(runner, "build_runtime", return_value=runtime), redirect_stdout(output):
+            result = runner.main(["--manifest", "manifest.yml", "--runtime-config", "runtime.json",
+                                  "--repo", "owner/repo", "--authorize-repair-continuation",
+                                  "--issue", "57", "--pr", "58", "--head-sha", head,
+                                  "--authorized-by", "maintainer"])
+        self.assertEqual(result, 0)
+        self.assertEqual(events, [("identity", "owner/repo", "state.db"),
+                                  ("authorize", "owner/repo", 57, 58, head,
+                                   "reviewer_rejection", "review-123", "implement/57", "maintainer")])
+        self.assertEqual(json.loads(output.getvalue())["status"], "authorized")
+
     def test_cli_rejects_target_or_enrollment_mismatch_before_runtime_construction(self):
         manifest = {"vccp": {"revision": _checkout_head()}}
         local = {"database_path": "state.db", "owner_id": "owner", "workspace": ".",
@@ -293,7 +335,7 @@ class RuntimeRunnerTests(unittest.TestCase):
         self.assertTrue(manifest["reviewer"]["exact_head_sha_required"])
         self.assertEqual(manifest["reviewer"]["required_checks"][0]["name"], "test")
         self.assertEqual(manifest["merge"]["method"], "squash")
-        self.assertEqual(RuntimeConfig.from_manifest(manifest).max_automated_repairs, 3)
+        self.assertEqual(RuntimeConfig.from_manifest(manifest).max_automated_repairs, 5)
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())

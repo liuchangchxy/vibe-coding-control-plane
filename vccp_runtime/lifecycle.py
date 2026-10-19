@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import time
 
-from .core import RepairCandidate
+from .core import RepairCandidate, _ci_cause_is_current
 
 
 _PHASES = {
@@ -102,6 +102,13 @@ class LifecycleDriver:
             return "ambiguous", evidence
         return next(iter(failures)), evidence
 
+    @staticmethod
+    def _ci_grant_is_current(grant, snapshot):
+        candidate = RepairCandidate(grant["repo"], grant["issue_number"], grant["pr_number"],
+                                    grant["head_sha"], snapshot.pr_branch or "",
+                                    grant["cause_type"], grant["cause_id"], "lifecycle")
+        return _ci_cause_is_current(candidate, snapshot)
+
     def _merged_bound_head(self, repo, issue, snapshot, bound):
         """Return ``(merged_head, recoverable_row)`` for a bound canonical PR, else ``(None, None)``.
 
@@ -166,6 +173,8 @@ class LifecycleDriver:
                          if row["pr_number"] and (row["phase"] in {
                              "PR_BOUND", "LAUNCH_CONFIRMED", "MERGED_SUCCESS"}
                              or self._merge_observation_after_fence(repo_key, row))})
+        issues = sorted(set(issues) | {row["issue_number"]
+                                      for row in self.core.store.active_continuations(repo_key)})
         active_repair_phases = {"CLAIM_INTENT", "CLAIMED", "LAUNCH_INTENT", "LAUNCH_UNKNOWN",
                                 "LAUNCH_CONFIRMED"}
         issues_with_active_repair = {row["issue_number"] for row in attempts
@@ -206,6 +215,8 @@ class LifecycleDriver:
             self.core.reconcile_once(repo_key, owner_id, current)
         attempts = self.core.store.attempts_for_repo(repo_key)
         issues = sorted({row["issue_number"] for row in attempts if row["phase"] == "PR_BOUND"})
+        issues = sorted(set(issues) | {row["issue_number"]
+                                      for row in self.core.store.active_continuations(repo_key)})
         results = list(merged_results)
         for issue in issues:
             rows = [row for row in attempts if row["issue_number"] == issue]
@@ -255,6 +266,40 @@ class LifecycleDriver:
                 self.core.reconcile_once(repo_key, owner_id, current)
                 results.append({"issue": issue, "status": "cancelled_or_terminal"})
                 continue
+            # A continuation is a durable, exact-head rediscovery token for a
+            # terminalized flow. Re-enter only the original PR and formal cause.
+            pending = [row for row in self.core.store.active_continuations(repo_key)
+                       if row["issue_number"] == issue and row["pr_number"] == snapshot.pr_number
+                       and row["head_sha"] == (snapshot.pr_head_sha or "").lower()]
+            if pending:
+                grant = pending[-1]
+                cause_current = (
+                    grant["cause_type"] == "reviewer_rejection"
+                    and snapshot.formal_review_state == "CHANGES_REQUESTED"
+                    and snapshot.formal_review_id == grant["cause_id"]
+                    and snapshot.formal_review_head_sha == snapshot.pr_head_sha
+                    and snapshot.coordination_state == "changes-requested"
+                ) or (
+                    grant["cause_type"] == "implementation_failure"
+                    and snapshot.coordination_state == "agent-working"
+                    and self._ci_grant_is_current(grant, snapshot)
+                )
+                flow = self.core.store.flow(repo_key, issue)
+                if (cause_current and snapshot.canonical_relationship_valid
+                        and snapshot.canonical_link_count == 1 and snapshot.open_linked_pr_count == 1
+                        and snapshot.pr_open and snapshot.pr_linked_issue == issue
+                        and snapshot.pr_branch and flow and flow.get("trusted")
+                        and flow.get("initial_confirmed") and flow.get("repair_budget_known")
+                        and flow.get("pr_number") == snapshot.pr_number
+                        and flow.get("branch") == snapshot.pr_branch):
+                    candidate = RepairCandidate(repo_key, issue, snapshot.pr_number,
+                                                snapshot.pr_head_sha.lower(), snapshot.pr_branch,
+                                                grant["cause_type"], grant["cause_id"], owner_id)
+                    results.append({"issue": issue, "trigger": "authorized_repair_continuation",
+                                    **self.core.dispatch_repair(candidate)})
+                    continue
+                # A grant is only an admission token. If its cause went stale,
+                # let the ordinary exact-head CI/review/merge lifecycle proceed.
             if state and state["phase"] in {"WAITING_REVIEW", "WAITING_MERGE"} \
                     and state["head_sha"].casefold() != head:
                 deadline = self._set_waiting(repo_key, issue, "WAITING_CI", head, current)
