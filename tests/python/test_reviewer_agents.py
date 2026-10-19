@@ -124,7 +124,7 @@ class ReviewerAgentTests(unittest.TestCase):
                                                str(source), str(root / "reviews"))
             environ = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:15721",
                        "ANTHROPIC_AUTH_TOKEN": "PROXY_MANAGED", "GH_TOKEN": "do-not-pass"}
-            with patch.dict(os.environ, environ, clear=True), \
+            with patch.dict(os.environ, environ), \
                     patch.dict(sys.modules, {"claude_agent_sdk": module}):
                 execution = provider.launch_review(REPO, 7, 12, head)
                 workspace = provider.workspace.path_for(REPO, 12, head)
