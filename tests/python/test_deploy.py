@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from vccp_runtime.deploy import deploy_host
@@ -22,10 +23,11 @@ class DeployHostTests(unittest.TestCase):
             events = []
             config = {"database_path": str(root / "state.sqlite"), "workspace": str(source), "owner_id": "owner",
                       "dispatcher": {"label": "com.vccp.test-dispatcher", "plist_path": str(root / "agent.plist")}}
-            result = deploy_host(repo="owner/repo", manifest={"vccp": {"revision": revision}},
-                local_config=config, manifest_path=str(root / "manifest.yml"), runtime_config_path=str(root / "runtime.json"),
-                source_root=str(source), runtimes_root=str(root / "runtimes"), platform="darwin",
-                readiness=lambda runtime: {"status": "ready"}, host_reconciler=lambda **kwargs: events.append(kwargs) or {"status": "running"})
+            with patch("vccp_runtime.deploy.os.getuid", return_value=501, create=True):
+                result = deploy_host(repo="owner/repo", manifest={"vccp": {"revision": revision}},
+                    local_config=config, manifest_path=str(root / "manifest.yml"), runtime_config_path=str(root / "runtime.json"),
+                    source_root=str(source), runtimes_root=str(root / "runtimes"), platform="darwin",
+                    readiness=lambda runtime: {"status": "ready"}, host_reconciler=lambda **kwargs: events.append(kwargs) or {"status": "running"})
             self.assertEqual(result["status"], "running")
             self.assertEqual(events[0]["runtime_root"], str((root / "runtimes" / revision).resolve()))
             self.assertEqual(result["revision"], revision)

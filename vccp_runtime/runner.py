@@ -14,6 +14,7 @@ import tempfile
 import time
 
 from .adapters import _workspace_repository, build_runtime
+from .core import RepairCandidate
 from .orchestrator import run_once
 
 
@@ -194,11 +195,14 @@ def main(argv=None):
     mode.add_argument("--continuous", action="store_true")
     mode.add_argument("--retry-reviewer", action="store_true",
                       help="one manually authorized retry of a failed exact-head Claude Reviewer")
-    parser.add_argument("--issue", type=int, help="Frozen Issue number for --retry-reviewer")
-    parser.add_argument("--pr", type=int, help="pull request number for --retry-reviewer")
-    parser.add_argument("--head-sha", help="exact full PR head SHA for --retry-reviewer")
+    mode.add_argument("--authorize-repair-continuation", action="store_true",
+                      help="authorize one exact-head repair after BUDGET_EXHAUSTED")
+    parser.add_argument("--issue", type=int, help="Frozen Issue number for the selected recovery action")
+    parser.add_argument("--pr", type=int, help="pull request number for the selected recovery action")
+    parser.add_argument("--head-sha", help="exact full PR head SHA for the selected recovery action")
     parser.add_argument("--authorize-reviewer-retry-for", metavar="SHA",
                         help="explicitly authorize retry for this exact full SHA")
+    parser.add_argument("--authorized-by", help="human maintainer identity recorded in the repair ledger")
     parser.add_argument("--poll-interval", type=float, default=30.0)
     args = parser.parse_args(argv)
     retry_values = (args.issue, args.pr, args.head_sha, args.authorize_reviewer_retry_for)
@@ -211,8 +215,19 @@ def main(argv=None):
             parser.error("reviewer retry authorization must repeat the exact full --head-sha")
         if args.issue < 1 or args.pr < 1:
             parser.error("--issue and --pr must be positive integers")
-    elif any(value is not None for value in retry_values):
+    elif any(value is not None for value in retry_values) and not args.authorize_repair_continuation:
         parser.error("reviewer retry arguments require --retry-reviewer")
+    if args.authorize_repair_continuation:
+        if (args.issue is None or args.pr is None or args.head_sha is None
+                or not args.authorized_by or not re.fullmatch(r"[0-9a-fA-F]{40}", args.head_sha)
+                or args.issue < 1 or args.pr < 1):
+            parser.error("--authorize-repair-continuation requires --issue, --pr, full --head-sha, and --authorized-by")
+        if args.retry_reviewer:
+            parser.error("repair continuation and reviewer retry are mutually exclusive")
+        if args.authorize_reviewer_retry_for is not None:
+            parser.error("--authorize-reviewer-retry-for requires --retry-reviewer")
+    elif args.authorized_by is not None:
+        parser.error("--authorized-by requires --authorize-repair-continuation")
     manifest, local = _load(args.manifest), _load(args.runtime_config)
     try:
         _validate_runtime_revision(manifest)
@@ -235,6 +250,22 @@ def main(argv=None):
     try:
         with lock:
             runtime = build_runtime(manifest, local)
+            if args.authorize_repair_continuation:
+                snapshot = runtime.workflow.observe(args.repo, args.issue)
+                matches = [row for row in runtime.core.store.attempts_for_repo(args.repo)
+                           if row["issue_number"] == args.issue and row["pr_number"] == args.pr
+                           and row["expected_head_sha"] == args.head_sha.lower()
+                           and row["phase"] == "BUDGET_EXHAUSTED"]
+                causes = {(row["cause_type"], row["cause_id"]) for row in matches}
+                if (len(causes) != 1 or snapshot.pr_number != args.pr or not snapshot.pr_branch):
+                    result = {"status": "authorization_evidence_stale_or_invalid"}
+                else:
+                    cause_type, cause_id = next(iter(causes))
+                    candidate = RepairCandidate(args.repo, args.issue, args.pr, args.head_sha.lower(),
+                                                snapshot.pr_branch, cause_type, cause_id, local["owner_id"])
+                    result = runtime.core.authorize_repair_continuation(candidate, args.authorized_by)
+                print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+                return 0 if result.get("status") in {"authorized", "already_authorized"} else 2
             if args.retry_reviewer:
                 if runtime.local_reviewer is None:
                     parser.error("configured runtime has no Local Reviewer")

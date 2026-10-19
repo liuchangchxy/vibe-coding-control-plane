@@ -22,7 +22,17 @@ GitHub is authoritative for the Frozen Issue specification, coordination labels,
 
 Canonical PR adoption restores PR identity trust only after current GitHub relationship, author, base, and authorization checks. Repair-budget provenance remains separate: a surviving durable count is preserved across adoption, while a missing count is marked unknown. An adopted PR with unknown repair history remains observable for CI, review, and merge, but any requested automated repair transitions to `needs-human` with `repair_history_or_budget_provenance_unknown`.
 
-One logical Issue/PR flow has `MAX_AUTOMATED_REPAIRS = 3`, shared by implementation-attributable CI repairs and Reviewer-caused repairs. Initial implementation is not a repair. Reviewer evaluates only the Frozen Spec and exact current head, submits `APPROVE` or `REQUEST_CHANGES`, and keeps the existing successful native Auto-merge path. Reviewer neither counts formal rejections nor decides whether another repair is permitted. A red CI result alone is not a product rejection.
+One logical Issue/PR flow has independent caps of three implementation-attributable CI repairs and three formal Reviewer repairs, plus a hard total of five automated repairs. Initial implementation is not a repair. Three per category allows the observed multi-round CI and Reviewer fixes; the lower total cap bounds cross-category execution. Same-head causes deduplicate, and exhausting either cap stops dispatch. A red CI result alone is not a product rejection. Reviewer evaluates only the Frozen Spec and exact current head, submits `APPROVE` or `REQUEST_CHANGES`, and keeps the existing successful native Auto-merge path. Reviewer neither counts formal rejections nor decides whether another repair is permitted.
+
+A maintainer may authorize at most three one-repair continuations per Issue after `BUDGET_EXHAUSTED`. Each grant is durable and bound to one exhausted attempt, repository, Issue, PR, exact head, cause type and cause ID. It raises the total limit by one only for that exact cause. The grant does not alter repair counts or delete attempts. A closed PR, changed head, changed/stale Formal Review or CI evidence, ambiguous cause, or non-`needs-human` stop rejects authorization. The lifetime bound is five automatic repairs plus at most three explicitly authorized repairs.
+
+The production runner exposes the explicit operator entry point:
+
+```powershell
+python -m vccp_runtime.runner --manifest <manifest> --runtime-config <runtime-config> --repo OWNER/REPO --authorize-repair-continuation --issue ISSUE --pr PR --head-sha FULL_40_CHAR_SHA --authorized-by MAINTAINER_ID
+```
+
+It records the authorization and restores the Issue's matching active coordination label. The normal Runner then dispatches the exact cause; the authorization command itself never launches an Implementer.
 
 Dispatcher admits a candidate only when the workflow is valid, its cause is recognized, the exact current SHA matches the cause, that logical head has not already consumed a repair, budget remains, and no terminal/cancellation blocker exists. Logical repair identity is `repair:<repo>:pr:<pr_number>:head:<failed_or_rejected_head_sha>`. Replayed observations for a head cannot create duplicate logical repairs. Repairs continue on the same linked PR and implementation branch. Stale CI failures and reviews cannot authorize work against a newer SHA. Exceeding the budget transitions to `needs-human`.
 
@@ -64,7 +74,7 @@ The implementer must update the same PR and linked Issue; opening a replacement 
 
 ## Manifest and runtime boundaries
 
-New desired manifests use `schema_version: 2` and `issue_contract.max_automated_repairs: 3`. The value is the maximum number of automated repair attempts admitted by Dispatcher across implementation-attributable CI failures and Reviewer `REQUEST_CHANGES`.
+New desired manifests continue using `schema_version: 2` and `issue_contract.max_automated_repairs: 3` for deployed-consumer compatibility. The runtime applies the classified limits above; the existing schema-v2 field is retained during this compatibility transition.
 
 Node tooling owns PLAN, APPLY, AUDIT, manifest generation/validation, and Reviewer contract installation. Python Generic Runtime owns machine-local activation qualification and runtime construction, claim/ownership, automatic ready discovery, active recovery discovery, a single-machine production runner, durable execution state, restart reconciliation, Implementer progress observation, watchdogs, and exact-head CI / Review / native-merge observation. The shared consumer manifest defines cross-machine policy; machine-local configuration supplies paths, SQLite location, owner identity, executable locations, protected GitHub App credential source, artifact roots, and local timeouts. Do not place those machine-specific values or credential values in the shared manifest or generated repository artifacts. Readiness verifies App installation and minimum permissions and performs a harmless repository read, but does not dispatch or mutate GitHub state. Node tooling must not grow a runtime state machine, and Python runtime must not duplicate repository onboarding.
 

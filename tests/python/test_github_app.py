@@ -1,5 +1,6 @@
 import base64
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -193,6 +194,7 @@ class POSIXFileCredentialSourceTests(unittest.TestCase):
             encryption_algorithm=serialization.NoEncryption(),
         )
 
+    @unittest.skipIf(os.name == "nt", "POSIX permission semantics are unavailable on Windows")
     def test_loads_pem_file_with_0600_permissions(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "key.pem"
@@ -202,6 +204,7 @@ class POSIXFileCredentialSourceTests(unittest.TestCase):
             loaded = source.load_private_key()
             self.assertIsNotNone(loaded)
 
+    @unittest.skipIf(os.name == "nt", "POSIX permission semantics are unavailable on Windows")
     def test_rejects_loose_permissions(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "key.pem"
@@ -211,6 +214,7 @@ class POSIXFileCredentialSourceTests(unittest.TestCase):
             with self.assertRaisesRegex(GitHubAppError, "0600 or stricter"):
                 source.load_private_key()
 
+    @unittest.skipIf(os.name == "nt", "POSIX permission semantics are unavailable on Windows")
     def test_rejects_missing_empty_and_non_pem_file(self):
         with tempfile.TemporaryDirectory() as directory:
             source = POSIXFileCredentialSource(Path(directory) / "nonexistent.pem")
@@ -242,6 +246,7 @@ class POSIXFileCredentialSourceTests(unittest.TestCase):
                 with self.assertRaisesRegex(GitHubAppError, "unavailable on Windows"):
                     POSIXFileCredentialSource.protect_pem_file(str(path), str(dest))
 
+    @unittest.skipIf(os.name == "nt", "POSIX permission semantics are unavailable on Windows")
     def test_protect_pem_file_creates_0600_destination(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "source.pem"
@@ -254,6 +259,7 @@ class POSIXFileCredentialSourceTests(unittest.TestCase):
             loaded = POSIXFileCredentialSource(dest).load_private_key()
             self.assertIsNotNone(loaded)
 
+    @unittest.skipIf(os.name == "nt", "POSIX permission semantics are unavailable on Windows")
     def test_protect_pem_file_creates_file_with_0600_before_writing(self):
         """Regression test: file must never be exposed with loose permissions before writing."""
         with tempfile.TemporaryDirectory() as directory:
@@ -284,6 +290,7 @@ class POSIXFileCredentialSourceTests(unittest.TestCase):
             for mode_bits in permissions_during_write:
                 self.assertEqual(mode_bits, 0, "file must have 0600 permissions at creation time before writing")
 
+    @unittest.skipIf(os.name == "nt", "POSIX permission semantics are unavailable on Windows")
     def test_protect_pem_file_rejects_existing_destination(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "source.pem"

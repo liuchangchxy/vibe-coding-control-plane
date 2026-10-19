@@ -465,6 +465,19 @@ class GitHubWorkflowAdapter:
         )
         return after.issue_open and not after.canceled and target_verified
 
+    def restore_repair_coordination_state(self, repo, issue_number, new_state, expected_revision):
+        """Clear only a reviewed needs-human stop under RuntimeCore's exact-head grant."""
+        before = self._facts(repo, issue_number)
+        if (before.revision != str(expected_revision) or before.coordination_state != "needs-human"
+                or before.terminal_labels != ("needs-human",) or before.canceled or not before.issue_open
+                or new_state not in self.policy["active_coordination_labels"]):
+            return False
+        if not self.writer.replace_labels(repo, issue_number, ["needs-human"], [new_state]):
+            return False
+        after = self._facts(repo, issue_number)
+        return (after.issue_open and not after.canceled and after.coordination_state == new_state
+                and not after.terminal_labels)
+
     def clear_active_coordination_labels(self, repo, issue_number):
         """Remove active labels after a proven native merge; preserve terminal labels.
 

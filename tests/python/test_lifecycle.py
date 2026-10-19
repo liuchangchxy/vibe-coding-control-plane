@@ -248,7 +248,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(result["items"][0]["status"], "launched")
         self.assertEqual(len(self.implementer.launches), 2)
 
-    def test_ci_and_reviewer_candidates_share_the_existing_three_repair_budget(self):
+    def test_ci_and_reviewer_candidates_use_classified_caps_and_global_boundary(self):
         driver = self.driver()
         self.update(check_runs=self.failure(SHA))
         self.assertEqual(driver.advance_once(self.repo, "owner", 100)["items"][0]["status"], "launched")
@@ -263,8 +263,8 @@ class LifecycleTests(unittest.TestCase):
         self.update(pr_head_sha=sha_d, check_runs=self.failure(sha_d), coordination_state="agent-working",
                     formal_review_state=None, formal_review_id=None, formal_review_head_sha=None)
         result = driver.advance_once(self.repo, "owner", 103)["items"][0]
-        self.assertEqual(result["status"], "budget_exhausted")
-        self.assertEqual(len(self.implementer.launches), 4)
+        self.assertEqual(result["status"], "launched")
+        self.assertEqual(len(self.implementer.launches), 5)
 
     def test_stale_review_does_not_authorize_repair_or_approval(self):
         self.update(check_runs=self.accepted(), coordination_state="changes-requested",

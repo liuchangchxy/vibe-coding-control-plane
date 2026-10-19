@@ -466,7 +466,7 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.core.store.attempts_for_repo("acme/alpha")[-1]["phase"], "PR_BOUND")
 
 
-    def test_deleted_repair_rows_do_not_reset_durable_repair_budget(self):
+    def test_deleted_repair_rows_do_not_reset_durable_repair_ordinal(self):
         self.start()
         for ordinal in range(1, 4):
             head = f"{ordinal:040x}"
@@ -483,9 +483,11 @@ class RecoveryTests(unittest.TestCase):
         self.add_pr(head=f"{3:040x}")
         candidate = RepairCandidate("acme/alpha", 7, 44, fourth_head, BRANCH,
                                     "implementation_failure", "check-4", "owner")
-        self.assertEqual(self.core.dispatch_repair(candidate)["status"], "budget_exhausted")
-        self.assertEqual(len(self.implementer.requests), 4)
-        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "needs-human")
+        result = self.core.dispatch_repair(candidate)
+        self.assertEqual((result["status"], result["ordinal"]), ("launched", 4))
+        self.assertEqual(self.core.store.flow("acme/alpha", 7)["repair_count"], 4)
+        self.assertEqual(len(self.implementer.requests), 5)
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "agent-working")
 
     def test_issue_closure_during_active_work_stops_locally(self):
         self.start(LaunchDisposition.UNKNOWN)

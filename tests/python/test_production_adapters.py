@@ -336,6 +336,19 @@ class AdapterTests(unittest.TestCase):
         self.assertTrue(infra_adapter.transition_coordination_state("o/r", 1, "agent-working", "infra-blocked", "r1"))
         self.assertEqual(infra_adapter.observe("o/r", 1).terminal_labels, ("infra-blocked",))
 
+    def test_budget_authorization_is_the_only_transition_that_clears_needs_human(self):
+        api = linked_api()
+        api.issue["labels"] = [{"name": "needs-human"}, {"name": "frozen-spec"}]
+        writer = MutatingWriter(api)
+        adapter = GitHubWorkflowAdapter(api, writer, MANIFEST)
+        observed = adapter.observe("o/r", 1)
+        self.assertEqual(observed.coordination_state, "needs-human")
+        self.assertFalse(adapter.restore_repair_coordination_state("o/r", 1, "changes-requested", "stale"))
+        self.assertFalse(writer.calls)
+        self.assertTrue(adapter.restore_repair_coordination_state("o/r", 1, "changes-requested", "r1"))
+        self.assertEqual(writer.calls[-1][2:], (["needs-human"], ["changes-requested"]))
+        self.assertEqual(adapter.observe("o/r", 1).coordination_state, "changes-requested")
+
     def test_recovery_discovery_queries_only_active_states(self):
         api = FakeAPI()
         api.discovery["agent-working"] = [{"number": 8}, {"number": 9, "pull_request": {}}]
