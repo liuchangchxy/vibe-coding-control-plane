@@ -340,11 +340,14 @@ class HostDeploymentTests(unittest.TestCase):
             config.write_text("{}", encoding="utf-8")
             sidecar = root / "sidecar.json"
 
+            def runner(args, **kwargs):
+                return SimpleNamespace(returncode=0, stdout='"ProcessId","Name","CommandLine"\n', stderr="")
+
             result = reconcile_windows_sidecar(
                 repo="owner/repo", runtime_root=str(runtime),
                 manifest_path=str(manifest), runtime_config_path=str(config),
                 database_path=str(root / "state.sqlite"), python_executable=r"C:\python\python.exe",
-                sidecar_path=str(sidecar), readiness=lambda: {"status": "ready"}, runner=subprocess.run
+                sidecar_path=str(sidecar), readiness=lambda: {"status": "ready"}, runner=runner
             )
             self.assertEqual(result["status"], "blocked")
             self.assertIn("does not match manifest pin", result["reason"])
@@ -362,12 +365,15 @@ class HostDeploymentTests(unittest.TestCase):
             old_definition = {"command": "old_python", "args": ["-m", "vccp_runtime.runner", "--repo", "owner/repo"]}
             sidecar.write_text(json.dumps(old_definition), encoding="utf-8")
 
+            def runner(args, **kwargs):
+                return SimpleNamespace(returncode=0, stdout='"ProcessId","Name","CommandLine"\n', stderr="")
+
             result = reconcile_windows_sidecar(
                 repo="owner/repo", runtime_root=str(runtime),
                 manifest_path=str(manifest), runtime_config_path=str(config),
                 database_path=str(root / "state.sqlite"), python_executable=r"C:\python\python.exe",
                 sidecar_path=str(sidecar), readiness=lambda: {"status": "blocked", "detail": "failed preflight"},
-                runner=subprocess.run
+                runner=runner
             )
             self.assertEqual(result["status"], "blocked")
             self.assertTrue(result["rolled_back"])
