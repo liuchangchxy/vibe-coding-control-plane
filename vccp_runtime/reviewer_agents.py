@@ -8,11 +8,19 @@ import re
 import subprocess
 import asyncio
 import threading
+import time
 from urllib.request import Request, urlopen
 
 from .runtime_checkout import _SHA
 
-MAX_REVIEWER_TURNS = 45
+# Each subprocess stays bounded; only confirmed max-turn terminal sessions resume.
+# Three calls maximum and the persisted 20-minute task deadline bound total work.
+MAX_REVIEWER_TURNS = 30
+MAX_REVIEWER_RESUMES = 2
+# The CLI reports turnCount=31 at a maxTurns=30 boundary. Budget two truncated
+# calls at 31 turns each, followed by one successful call of at most 30 turns.
+MAX_REVIEWER_TASK_TURNS = (MAX_REVIEWER_TURNS + 1) * MAX_REVIEWER_RESUMES + MAX_REVIEWER_TURNS
+_CHECKPOINT_PREFIX = "sdk_review_checkpoint:"
 
 
 def _run(command, cwd=None, env=None, timeout=30):
@@ -258,7 +266,7 @@ class ClaudeAgentSDKReviewer:
             parts.append(f"detail={detail[:384]}")
         return " ".join(parts)[:512] or None
 
-    def _options(self, path):
+    def _options(self, path, resume_session_id=None):
         options_type, allow_type, deny_type, *_ = self._sdk()
 
         async def permission(tool_name, tool_input, _context):
@@ -284,7 +292,7 @@ class ClaudeAgentSDKReviewer:
             tools=["Read", "Glob", "Grep"], disallowed_tools=["Bash", "Write", "Edit"],
             permission_mode="default", setting_sources=["user"], can_use_tool=permission,
             output_format={"type": "json_schema", "schema": self._SCHEMA},
-            max_turns=MAX_REVIEWER_TURNS, env=env,
+            max_turns=MAX_REVIEWER_TURNS, resume=resume_session_id, env=env,
         )
 
     @staticmethod
@@ -314,61 +322,183 @@ class ClaudeAgentSDKReviewer:
         event = "APPROVE" if value["decision"] == "APPROVE" else "REQUEST_CHANGES"
         return {"event": event, "body": body}
 
-    def launch_review(self, repo, issue, pr, head):
+    def launch_review(self, repo, issue, pr, head, *, on_checkpoint=None, started_at=None):
         path, prompt = self.task.build(repo, issue, pr, head, structured=True)
         prompt += ("\nReturn structured output only. APPROVE requires no blocking finding; "
                    "CHANGES_REQUESTED requires a specific blocking finding supported by exact-head code.")
-        options = self._options(path)
-        sdk_result = None
-        session_id = None
-        execution_started = False
+        return self._run_session(repo, issue, pr, head, path, prompt,
+                                 on_checkpoint=on_checkpoint, started_at=started_at)
+
+    def resume_review(self, repo, issue, pr, head, session_id, resume_count,
+                      total_turns, started_at, *, on_checkpoint=None):
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ReviewerTaskError("claude_agent_sdk_resume", exception_type="SessionIdMissing", terminal=True)
+        path, _ = self.task.build(repo, issue, pr, head, structured=True)
+        continuation = (
+            "Continue the same exact-head Reviewer task from the existing session context. "
+            "Do not repeat completed inspections. Finish remaining review work and return the "
+            "complete structured decision required by the original review contract. "
+            "Partial findings are not a decision."
+        )
+        return self._run_session(repo, issue, pr, head, path, continuation,
+                                 session_id=session_id, resume_count=resume_count,
+                                 total_turns=total_turns, started_at=started_at,
+                                 on_checkpoint=on_checkpoint)
+
+    @staticmethod
+    def _checkpoint(on_checkpoint, *, phase, session_id, resume_count, total_turns, result=None):
+        if on_checkpoint is None:
+            return
+        value = {"phase": phase, "session_id": session_id,
+                 "resume_count": resume_count, "total_turns": total_turns}
+        if result is not None:
+            value["result"] = result
+        on_checkpoint(value)
+
+    @staticmethod
+    def _is_turn_boundary(error):
+        return (getattr(error, "subtype", None) == "error_max_turns"
+                or getattr(error, "terminal_reason", None) == "max_turns")
+
+    def _assert_no_formal_review(self, repo, pr, head):
+        reviews = self.task._get("reviews", f"/repos/{repo}/pulls/{pr}/reviews?per_page=100")
+        if not isinstance(reviews, list) or len(reviews) >= 100:
+            raise ValueError("formal review history is incomplete before session resume")
+        if any(isinstance(item, dict)
+               and str(item.get("commit_id") or "").casefold() == head.casefold()
+               for item in reviews):
+            raise ValueError("formal review already exists for the exact head")
+
+    def _run_session(self, repo, issue, pr, head, path, prompt, *, session_id=None,
+                     resume_count=0, total_turns=0, started_at=None, on_checkpoint=None):
+        if (not isinstance(resume_count, int) or not isinstance(total_turns, int)
+                or resume_count < 0 or resume_count > MAX_REVIEWER_RESUMES
+                or total_turns < 0 or total_turns >= MAX_REVIEWER_TASK_TURNS):
+            raise ReviewerTaskError("claude_agent_sdk_resume_budget",
+                                    exception_type="ReviewerResumeBudgetExceeded",
+                                    execution_id=session_id, terminal=True,
+                                    execution_started=session_id is not None)
         sdk = self._sdk()
         query = self._query or sdk[-1]
+        task_started_at = time.time() if started_at is None else float(started_at)
+        execution_started = session_id is not None
+        while True:
+            remaining = self.timeout_seconds - (time.time() - task_started_at)
+            if remaining <= 0:
+                raise ReviewerTaskError("claude_agent_sdk_timeout", exception_type="TimeoutError",
+                                        execution_id=session_id, terminal=True,
+                                        execution_started=execution_started)
+            if session_id:
+                try:
+                    path, _ = self.task.build(repo, issue, pr, head, structured=True)
+                    self._assert_no_formal_review(repo, pr, head)
+                except Exception as error:
+                    raise ReviewerTaskError("claude_agent_sdk_resume_precondition",
+                                            exception_type=type(error).__name__,
+                                            execution_id=session_id, terminal=True,
+                                            execution_started=True) from None
+                self._checkpoint(on_checkpoint, phase="resume_starting", session_id=session_id,
+                                 resume_count=resume_count, total_turns=total_turns)
+            options = self._options(path, resume_session_id=session_id)
+            sdk_result = None
+            current_session_id = session_id
 
-        async def consume():
-            nonlocal sdk_result, session_id, execution_started
-            async for message in query(prompt=prompt, options=options):
-                execution_started = True
-                if isinstance(message, sdk[4]):
-                    session_id = message.data.get("session_id") or session_id
-                if isinstance(message, sdk[3]):
-                    sdk_result = message
-                    session_id = getattr(message, "session_id", None) or session_id
+            async def consume():
+                nonlocal sdk_result, current_session_id, execution_started
+                async for message in query(prompt=prompt, options=options):
+                    execution_started = True
+                    if isinstance(message, sdk[4]):
+                        current_session_id = message.data.get("session_id") or current_session_id
+                        if session_id and current_session_id != session_id:
+                            raise ReviewerTaskError("claude_agent_sdk_resume", exception_type="SessionIdChanged",
+                                                    execution_id=current_session_id, terminal=True,
+                                                    execution_started=True)
+                        if current_session_id:
+                            self._checkpoint(on_checkpoint, phase="active", session_id=current_session_id,
+                                             resume_count=resume_count, total_turns=total_turns)
+                    if isinstance(message, sdk[3]):
+                        sdk_result = message
+                        result_session_id = getattr(message, "session_id", None)
+                        if session_id and result_session_id and result_session_id != session_id:
+                            raise ReviewerTaskError("claude_agent_sdk_resume", exception_type="SessionIdChanged",
+                                                    execution_id=result_session_id, terminal=True,
+                                                    execution_started=True)
+                        current_session_id = result_session_id or current_session_id
 
-        try:
-            asyncio.run(asyncio.wait_for(consume(), timeout=self.timeout_seconds))
-        except asyncio.TimeoutError:
-            raise ReviewerTaskError("claude_agent_sdk_timeout", exception_type="TimeoutError",
-                                    execution_id=session_id, execution_started=execution_started) from None
-        except ReviewerTaskError:
-            raise
-        except Exception as error:
-            if isinstance(error, sdk[5]):
-                raise ReviewerTaskError(
-                    "claude_agent_sdk_execution", http_status=getattr(error, "api_error_status", None),
-                    exception_type=type(error).__name__, process_status=getattr(error, "exit_code", None),
-                    execution_id=getattr(error, "session_id", None) or session_id,
-                    terminal=True, execution_started=True,
-                    sdk_detail=self._result_error_detail(error)) from None
-            raise ReviewerTaskError("claude_agent_sdk_execution", exception_type=type(error).__name__,
-                                    execution_id=session_id, execution_started=execution_started) from None
-        if sdk_result is None or sdk_result.subtype != "success":
-            raise ReviewerTaskError("claude_agent_sdk_result", exception_type="ResultMessageInvalid",
-                                    execution_id=session_id, terminal=sdk_result is not None,
-                                    execution_started=execution_started)
-        if not session_id:
-            raise ReviewerTaskError("claude_agent_sdk_session", exception_type="SessionIdMissing",
-                                    terminal=True, execution_started=True)
-        decision = self._to_review(sdk_result.structured_output)
-        if decision is None:
-            raise ReviewerTaskError("claude_agent_sdk_result", exception_type="StructuredResultInvalid",
-                                    execution_id=session_id, terminal=True, execution_started=True)
+            try:
+                asyncio.run(asyncio.wait_for(consume(), timeout=remaining))
+            except asyncio.TimeoutError:
+                raise ReviewerTaskError("claude_agent_sdk_timeout", exception_type="TimeoutError",
+                                        execution_id=current_session_id,
+                                        execution_started=execution_started) from None
+            except ReviewerTaskError:
+                raise
+            except Exception as error:
+                if isinstance(error, sdk[5]) and self._is_turn_boundary(error):
+                    error_session_id = getattr(error, "session_id", None) or current_session_id
+                    if (not error_session_id or (current_session_id and error_session_id != current_session_id)):
+                        raise ReviewerTaskError("claude_agent_sdk_resume", exception_type="SessionIdUnavailable",
+                                                execution_id=error_session_id, terminal=True,
+                                                execution_started=True,
+                                                sdk_detail=self._result_error_detail(error)) from None
+                    error_data = getattr(error, "data", None)
+                    used_turns = error_data.get("num_turns") if isinstance(error_data, dict) else None
+                    used_turns = used_turns if isinstance(used_turns, int) and used_turns > 0 else MAX_REVIEWER_TURNS + 1
+                    total_turns += min(used_turns, MAX_REVIEWER_TURNS + 1)
+                    if (resume_count >= MAX_REVIEWER_RESUMES
+                            or total_turns >= MAX_REVIEWER_TASK_TURNS):
+                        raise ReviewerTaskError("claude_agent_sdk_resume_budget",
+                                                exception_type="ReviewerResumeBudgetExceeded",
+                                                process_status=getattr(error, "exit_code", None),
+                                                execution_id=error_session_id, terminal=True,
+                                                execution_started=True,
+                                                sdk_detail=self._result_error_detail(error)) from None
+                    resume_count += 1
+                    self._checkpoint(on_checkpoint, phase="resume_ready", session_id=error_session_id,
+                                     resume_count=resume_count, total_turns=total_turns)
+                    session_id = current_session_id = error_session_id
+                    execution_started = True
+                    prompt = (
+                        "Continue the same exact-head Reviewer task from the existing session context. "
+                        "Do not repeat completed inspections. Finish remaining work and return the "
+                        "complete structured decision required by the original review contract. "
+                        "Partial findings are not a decision."
+                    )
+                    continue
+                if isinstance(error, sdk[5]):
+                    raise ReviewerTaskError(
+                        "claude_agent_sdk_execution", http_status=getattr(error, "api_error_status", None),
+                        exception_type=type(error).__name__, process_status=getattr(error, "exit_code", None),
+                        execution_id=getattr(error, "session_id", None) or current_session_id,
+                        terminal=True, execution_started=True,
+                        sdk_detail=self._result_error_detail(error)) from None
+                raise ReviewerTaskError("claude_agent_sdk_execution", exception_type=type(error).__name__,
+                                        execution_id=current_session_id,
+                                        execution_started=execution_started) from None
+            session_id = current_session_id
+            if sdk_result is None or sdk_result.subtype != "success":
+                raise ReviewerTaskError("claude_agent_sdk_result", exception_type="ResultMessageInvalid",
+                                        execution_id=session_id, terminal=sdk_result is not None,
+                                        execution_started=execution_started)
+            if not session_id:
+                raise ReviewerTaskError("claude_agent_sdk_session", exception_type="SessionIdMissing",
+                                        terminal=True, execution_started=True)
+            decision = self._to_review(sdk_result.structured_output)
+            if decision is None:
+                raise ReviewerTaskError("claude_agent_sdk_result", exception_type="StructuredResultInvalid",
+                                        execution_id=session_id, terminal=True, execution_started=True)
+            used_turns = getattr(sdk_result, "num_turns", None)
+            if isinstance(used_turns, int) and used_turns > 0:
+                total_turns += min(used_turns, MAX_REVIEWER_TURNS)
+            break
         current = _run(["git", "rev-parse", "HEAD"], path)
         status = _run(["git", "status", "--porcelain=v1", "--untracked-files=all"], path)
         if (current.returncode or current.stdout.strip().casefold() != head.casefold()
                 or status.returncode or status.stdout.strip()):
             raise ReviewerTaskError("review_workspace_postflight", exception_type="WorkspaceChanged",
                                     execution_id=session_id, terminal=True, execution_started=True)
+        self._checkpoint(on_checkpoint, phase="completed", session_id=session_id,
+                         resume_count=resume_count, total_turns=total_turns, result=decision)
         return {"status": "completed", "execution_id": session_id, **decision}
 
     def retry_session_evidence(self, repo, issue, pr, head, failed_execution_id=None,

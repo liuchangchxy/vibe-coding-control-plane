@@ -1031,6 +1031,26 @@ class _Store:
             )
             return cursor.rowcount == 1
 
+    def claim_reviewer_resume(self, repo: str, pr_number: int, head_sha: str,
+                              execution_id: str, expected_outcome: str,
+                              next_outcome: str, now: float | None = None):
+        """Atomically consume a durable, terminal-session resume checkpoint."""
+        timestamp = time.time() if now is None else float(now)
+        with closing(self.transaction()) as connection:
+            try:
+                cursor = connection.execute(
+                    "UPDATE reviewer_executions SET outcome=?,updated_at=? "
+                    "WHERE repo=? AND pr_number=? AND head_sha=? AND provider='claude_agent_sdk' "
+                    "AND state='RUNNING' AND execution_id=? AND outcome=?",
+                    (next_outcome, timestamp, _repo_key(repo), pr_number, head_sha.casefold(),
+                     execution_id, expected_outcome),
+                )
+                connection.commit()
+                return cursor.rowcount == 1
+            except Exception:
+                connection.rollback()
+                raise
+
     def set_lifecycle(self, repo: str, issue: int, phase: str, head_sha: str, now: float,
                       timeout: float, outcome: str | None = None):
         connection = self.transaction()
