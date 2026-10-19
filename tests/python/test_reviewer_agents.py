@@ -55,7 +55,12 @@ class ResultError(Exception):
         super().__init__("Claude Code returned an error result")
         self.subtype = "success"
         self.errors = []
-        self.result = "API Error: overloaded (token=sk-ant-sensitive)"
+        self.result = ("API Error: overloaded (token=sk-ant-sensitive) "
+                       "ANTHROPIC_AUTH_TOKEN=secret_value "
+                       '{"ANTHROPIC_AUTH_TOKEN":"secret_value",'
+                       '"x-api-key":"another_secret",'
+                       '"authorization":"Basic dXNlcjpwYXNz",'
+                       '"set-cookie":"cookie_secret"}')
         self.api_error_status = 529
         self.terminal_reason = "api_error"
         self.session_id = "sdk-terminal-session"
@@ -221,6 +226,10 @@ class ReviewerAgentTests(unittest.TestCase):
         self.assertIn("terminal_reason=api_error", raised.exception.sdk_detail)
         self.assertIn("API Error: overloaded", raised.exception.sdk_detail)
         self.assertNotIn("sk-ant-sensitive", raised.exception.sdk_detail)
+        self.assertNotIn("secret_value", raised.exception.sdk_detail)
+        self.assertNotIn("another_secret", raised.exception.sdk_detail)
+        self.assertNotIn("dXNlcjpwYXNz", raised.exception.sdk_detail)
+        self.assertNotIn("cookie_secret", raised.exception.sdk_detail)
 
     def test_sdk_timeout_is_not_terminal_retry_evidence(self):
         with tempfile.TemporaryDirectory() as temp:
