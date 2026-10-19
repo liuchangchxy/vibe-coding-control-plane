@@ -16,7 +16,7 @@ Frozen Issue (frozen-spec + agent-ready)
 → GitHub native Auto-merge
 ```
 
-Formal `REQUEST_CHANGES` reopens work on the same PR. VCCP v2 gives the Dispatcher three CI repairs, three Reviewer repairs, and a hard total of five automatic repairs. A maintainer may explicitly authorize up to three additional one-repair continuations, each bound to the exhausted cause and exact PR head. `infra-blocked` remains terminal; a valid continuation can reopen only a matching `needs-human` budget stop.
+Formal `REQUEST_CHANGES` reopens work on the same PR. VCCP v2 gives the Dispatcher three CI repairs, three Reviewer repairs, and a hard total of five automatic repairs. An operator can record up to three additional one-repair continuations, each bound to the exhausted cause and exact PR head; each grant cumulatively extends both the total and matching cause-type ceilings. `infra-blocked` remains terminal; a valid continuation can reopen only a matching `needs-human` budget stop. The CLI records `--authorized-by` as supplied audit text and does not independently authenticate that identity.
 
 ## Use this repository
 

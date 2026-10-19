@@ -1,3 +1,4 @@
+import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
@@ -5,7 +6,8 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
-from vccp_runtime.core import (LaunchDisposition, LaunchResult, RuntimeCore, WorkflowSnapshot)
+from vccp_runtime.core import (LaunchDisposition, LaunchResult, RepairCandidate, RuntimeCore,
+                               WorkflowSnapshot, compute_repair_key)
 from vccp_runtime.lifecycle import LifecycleDriver
 from vccp_runtime.orchestrator import run_once
 
@@ -56,6 +58,9 @@ class FakeWorkflow:
         self.transitions.append((repo, issue, new_state))
         return True
 
+    def restore_repair_coordination_state(self, repo, issue, new_state, expected_revision):
+        return self.transition_coordination_state(repo, issue, "needs-human", new_state, expected_revision)
+
     def discover_active(self, repo):
         return sorted(issue for (key, issue), snapshot in self.snapshots.items()
                       if key == repo and snapshot.coordination_state in {"agent-working", "changes-requested"})
@@ -72,6 +77,7 @@ class FakeImplementer:
     def launch(self, request):
         self.launches.append(request)
         return LaunchResult(LaunchDisposition.CONFIRMED, f"exec-{len(self.launches)}", PROVIDER)
+    def latest_activity_for(self, provider, execution_id): return None
 
 
 class LifecycleTests(unittest.TestCase):
@@ -177,6 +183,118 @@ class LifecycleTests(unittest.TestCase):
         self.driver().advance_once(self.repo, "owner", 101)
         self.assertEqual(len(self.implementer.launches), 2)
 
+    def test_terminalized_budget_flow_recovers_through_run_once_and_restarts_once(self):
+        # Reproduce the production database facts: all dispatched work is terminal,
+        # trust was cleared, repair_count remains 3, and one exact budget marker exists.
+        initial = self.core.store.attempts_for_repo(self.repo)[0]
+        sequence = [("implementation_failure", "ci-1"),
+                    ("reviewer_rejection", "review-2"),
+                    ("implementation_failure", "ci-3")]
+        dispatched = [initial]
+        for index, (cause, cause_id) in enumerate(sequence, 1):
+            candidate = RepairCandidate(self.repo, self.issue, 44, f"{index:040x}",
+                                        "implement/7", cause, cause_id, "owner")
+            self.workflow.snapshots[(self.repo, self.issue)] = replace(
+                self.workflow.snapshots[(self.repo, self.issue)],
+                coordination_state="changes-requested" if cause == "reviewer_rejection" else "agent-working",
+                active_labels=("changes-requested" if cause == "reviewer_rejection" else "agent-working",),
+                pr_head_sha=candidate.head_sha, formal_review_state=("CHANGES_REQUESTED"
+                    if cause == "reviewer_rejection" else None), formal_review_id=(cause_id
+                    if cause == "reviewer_rejection" else None), formal_review_head_sha=(candidate.head_sha
+                    if cause == "reviewer_rejection" else None), revision=f"r{index + 2}")
+            result = self.core.dispatch_repair(candidate)
+            self.assertEqual(result["status"], "launched")
+            self.core.store.bind_pr(result["attempt_id"], 44, "implement/7", candidate.head_sha, 10 + index)
+            dispatched.append(self.core.store.attempt(result["attempt_id"]))
+
+        for row in dispatched:
+            self.core.store.local_terminal(row["attempt_id"], "STOPPED_CANCELLED", 100)
+        with closing(sqlite3.connect(self.db)) as connection:
+            connection.execute("UPDATE flows SET repair_count=3,repair_budget_known=1 WHERE repo=? AND issue_number=?",
+                               (self.repo, self.issue))
+            connection.execute("INSERT INTO controlled_pushes(attempt_id,repo,destination_ref,expected_sha,phase,created_at,completed_at) "
+                               "VALUES(?,?,?,?,'completed',1,2)",
+                               (initial["attempt_id"], self.repo, "implement/7", SHA))
+            connection.execute("INSERT INTO attempts(attempt_id,repo,issue_number,owner_id,lease_token,kind,cause_type,cause_id,"
+                               "repair_key,repair_ordinal,expected_head_sha,pr_number,branch,phase,created_at,updated_at) "
+                               "VALUES('legacy-budget',?,?,?,'','repair','reviewer_rejection',?,?,4,?,44,?,'BUDGET_EXHAUSTED',3,3)",
+                               (self.repo, self.issue, "owner", "review-57",
+                                compute_repair_key(self.repo, 44, SHA) + ":budget:legacy-budget", SHA, "implement/7"))
+            connection.commit()
+        flow = self.core.store.flow(self.repo, self.issue)
+        self.assertEqual((flow["trusted"], flow["initial_confirmed"], flow["repair_count"],
+                          flow["repair_budget_known"]), (0, 0, 3, 1))
+
+        candidate = RepairCandidate(self.repo, self.issue, 44, SHA, "implement/7",
+                                    "reviewer_rejection", "review-57", "owner")
+        self.assertFalse(self.core.store.restore_budget_stopped_flow(replace(candidate, head_sha="e" * 40)))
+        self.assertEqual(self.core.store.flow(self.repo, self.issue)["trusted"], 0)
+        with closing(sqlite3.connect(self.db)) as connection:
+            connection.execute("UPDATE attempts SET launch_outcome='unknown' WHERE attempt_id=?",
+                               (dispatched[1]["attempt_id"],))
+            connection.commit()
+        self.assertFalse(self.core.store.restore_budget_stopped_flow(candidate))
+        with closing(sqlite3.connect(self.db)) as connection:
+            connection.execute("UPDATE attempts SET launch_outcome='confirmed' WHERE attempt_id=?",
+                               (dispatched[1]["attempt_id"],))
+            connection.commit()
+        needs_human = replace(self.workflow.snapshots[(self.repo, self.issue)], revision="r9",
+                              coordination_state="needs-human", terminal_labels=("needs-human",),
+                              active_labels=(), pr_head_sha=SHA, formal_review_state="CHANGES_REQUESTED",
+                              formal_review_id="review-57", formal_review_head_sha=SHA)
+        self.workflow.snapshots[(self.repo, self.issue)] = needs_human
+        self.assertEqual(self.core.authorize_repair_continuation(candidate, "maintainer")["status"], "authorized")
+        restored = self.core.store.flow(self.repo, self.issue)
+        self.assertEqual((restored["trusted"], restored["initial_confirmed"], restored["repair_count"],
+                          restored["repair_budget_known"]), (1, 1, 3, 1))
+
+        runtime = SimpleNamespace(core=self.core, workflow=self.workflow, lifecycle=self.driver())
+        cycle = run_once(runtime, self.repo, "owner", now=200)
+        self.assertEqual(len(self.implementer.launches), 5, cycle)  # initial + 3 history + one resumed repair
+        created = [row for row in self.core.store.attempts_for_repo(self.repo)
+                   if row["kind"] == "repair" and row["phase"] == "LAUNCH_CONFIRMED"]
+        self.assertEqual(len(created), 1)
+        self.assertEqual((created[0]["issue_number"], created[0]["pr_number"], created[0]["branch"],
+                          created[0]["expected_head_sha"], created[0]["repair_ordinal"]),
+                         (self.issue, 44, "implement/7", SHA, 4))
+        self.assertEqual(len([row for row in self.core.store.attempts_for_repo(self.repo)
+                              if row["phase"] == "BUDGET_EXHAUSTED"]), 1)
+        self.assertEqual([item.get("trigger") for item in cycle["lifecycle"]["items"]],
+                         ["authorized_repair_continuation"])
+        restarted_core = RuntimeCore(self.db, self.manifest, self.workflow, self.implementer)
+        restarted = run_once(SimpleNamespace(core=restarted_core, workflow=self.workflow,
+                                             lifecycle=LifecycleDriver(restarted_core, self.manifest)),
+                             self.repo, "owner", now=201)
+        self.assertEqual(len(self.implementer.launches), 5)
+        self.assertEqual(len([row for row in self.core.store.attempts_for_repo(self.repo)
+                              if row["kind"] == "repair" and row["phase"] == "LAUNCH_CONFIRMED"]), 1)
+        next_head = "f" * 40
+        push_id = self.core.store.begin_controlled_push(created[0]["attempt_id"], self.repo,
+                                                        PROVIDER, "implement/7", next_head, 202)
+        self.assertIsNotNone(push_id)
+        self.assertTrue(self.core.store.complete_controlled_push(push_id, next_head, 203))
+        self.assertTrue(self.core.store.bind_pr(created[0]["attempt_id"], 44, "implement/7", next_head, 204))
+        self.workflow.snapshots[(self.repo, self.issue)] = replace(
+            self.workflow.snapshots[(self.repo, self.issue)], revision="r10",
+            coordination_state="agent-working", terminal_labels=(), active_labels=("agent-working",),
+            pr_head_sha=next_head, formal_review_state=None, formal_review_id=None,
+            formal_review_head_sha=None,
+            check_runs=({"name": "Unit", "id": 90, "head_sha": next_head,
+                         "status": "completed", "conclusion": "success"},))
+        ci = run_once(runtime, self.repo, "owner", now=205)
+        self.assertEqual(ci["lifecycle"]["items"][0]["status"], "WAITING_REVIEW")
+        self.workflow.snapshots[(self.repo, self.issue)] = replace(
+            self.workflow.snapshots[(self.repo, self.issue)], revision="r11",
+            formal_review_state="APPROVED", formal_review_id="review-approved",
+            formal_review_head_sha=next_head)
+        approved = run_once(runtime, self.repo, "owner", now=206)
+        self.assertEqual(approved["lifecycle"]["items"][0]["status"], "WAITING_MERGE")
+        self.workflow.snapshots[(self.repo, self.issue)] = replace(
+            self.workflow.snapshots[(self.repo, self.issue)], issue_open=False, pr_merged=True,
+            revision="r12")
+        merged = run_once(runtime, self.repo, "owner", now=207)
+        self.assertEqual(merged["lifecycle"]["items"][0]["status"], "merged_success")
+        self.assertEqual(self.core.store.lifecycle_state(self.repo, self.issue)["phase"], "MERGED_SUCCESS")
     def test_ci_repair_in_flight_suppresses_old_head_lifecycle_without_deadline_change(self):
         driver = self.driver()
         self.assertEqual(driver.advance_once(self.repo, "owner", 100)["items"][0]["status"], "WAITING_CI")

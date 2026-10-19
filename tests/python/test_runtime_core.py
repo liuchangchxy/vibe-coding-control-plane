@@ -15,6 +15,7 @@ from vccp_runtime import (
     WorkflowSnapshot,
     compute_repair_key,
 )
+from vccp_runtime.core import _ci_cause_is_current
 
 
 REVISION = "a" * 40
@@ -50,6 +51,9 @@ def repair_snapshot(candidate, state=None, revision=20):
         pr_linked_issue=candidate.issue_number,
         pr_head_sha=candidate.head_sha,
         pr_branch=candidate.branch,
+        canonical_relationship_valid=True,
+        canonical_link_count=1,
+        open_linked_pr_count=1,
         formal_review_state="CHANGES_REQUESTED" if candidate.cause_type == "reviewer_rejection" else None,
         formal_review_id=candidate.cause_id if candidate.cause_type == "reviewer_rejection" else None,
         formal_review_head_sha=candidate.head_sha if candidate.cause_type == "reviewer_rejection" else None,
@@ -510,6 +514,61 @@ class RuntimeCoreTests(unittest.TestCase):
         self.assertEqual(self.core.authorize_repair_continuation(candidate, "maintainer")["status"], "authorized")
         resumed = self.core.dispatch_repair(candidate)
         self.assertEqual((resumed["status"], resumed["ordinal"]), ("launched", 4))
+
+    def test_three_continuations_cumulate_and_fourth_cannot_admit_attempt(self):
+        self.establish_flow()
+        # Five automatic repairs establish the global stop, including CI noise.
+        for ordinal in range(1, 6):
+            cause = "implementation_failure" if ordinal in {1, 3, 5} else "reviewer_rejection"
+            candidate = self.candidate(sha=f"{ordinal:040x}", cause=cause,
+                                       cause_id=f"review-{ordinal}" if cause == "reviewer_rejection"
+                                       else f"ci-{ordinal}")
+            state = "changes-requested" if cause == "reviewer_rejection" else "agent-working"
+            self.workflow.set_snapshot(repair_snapshot(candidate, state=state, revision=20 + ordinal))
+            self.assertEqual(self.core.dispatch_repair(candidate)["status"], "launched")
+
+        for grant_number in range(1, 4):
+            head = f"{5 + grant_number:040x}"
+            candidate = self.candidate(sha=head, cause="reviewer_rejection",
+                                       cause_id=f"review-authorized-{grant_number}")
+            current = repair_snapshot(candidate, state="changes-requested", revision=30 + grant_number)
+            self.workflow.set_snapshot(current)
+            self.assertEqual(self.core.dispatch_repair(candidate)["status"], "budget_exhausted")
+            self.assertEqual(self.core.authorize_repair_continuation(
+                candidate, "maintainer")["status"], "authorized")
+            self.workflow.set_snapshot(repair_snapshot(candidate, state="changes-requested",
+                                                        revision=50 + grant_number))
+            result = self.core.dispatch_repair(candidate)
+            self.assertEqual((result["status"], result["ordinal"]), ("launched", 5 + grant_number))
+            if grant_number < 3:
+                self.assertEqual(self.core.store.flow("acme/alpha", 7)["repair_count"], 5 + grant_number)
+
+        self.assertEqual(len([row for row in self.core.store.repair_attempts("acme/alpha", 7)
+                              if row["phase"] != "BUDGET_EXHAUSTED"]), 8)
+        denied = self.candidate(sha="9" * 40, cause="reviewer_rejection", cause_id="review-ninth")
+        self.workflow.set_snapshot(repair_snapshot(denied, state="changes-requested", revision=70))
+        self.assertEqual(self.core.dispatch_repair(denied)["status"], "budget_exhausted")
+        self.assertEqual(self.core.authorize_repair_continuation(denied, "maintainer")["status"],
+                         "continuation_limit_exhausted")
+        self.assertEqual(len(self.implementer.requests), 9)  # initial plus eight repairs
+
+    def test_ci_cause_requires_latest_run_for_same_required_check_and_head(self):
+        candidate = self.candidate(sha="d" * 40, cause="implementation_failure",
+                                   cause_id=f"ci:{'d' * 40}:Unit:100:failure")
+        old_failure = {"name": "Unit", "id": 100, "status": "completed", "conclusion": "failure",
+                       "head_sha": candidate.head_sha, "started_at": "2026-10-19T10:00:00Z"}
+        new_success = {"name": "Unit", "id": 101, "status": "completed", "conclusion": "success",
+                       "head_sha": candidate.head_sha, "started_at": "2026-10-19T10:01:00Z"}
+        observed = replace(repair_snapshot(candidate, state="needs-human"),
+                           check_runs=(old_failure, new_success))
+        self.assertFalse(_ci_cause_is_current(candidate, observed))
+        latest_failure = {**new_success, "conclusion": "failure"}
+        current_candidate = replace(candidate, cause_id=f"ci:{'d' * 40}:Unit:101:failure")
+        self.assertTrue(_ci_cause_is_current(current_candidate,
+                                             replace(observed, check_runs=(old_failure, latest_failure))))
+        self.assertFalse(_ci_cause_is_current(current_candidate,
+                                              replace(observed, check_runs=(old_failure,
+                                                  {**new_success, "id": 101, "status": "queued"}))))
 
     def test_continuation_rejects_changed_head_or_stale_review(self):
         self.establish_flow()
