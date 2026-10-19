@@ -1,11 +1,12 @@
 import unittest
 import tempfile
+import json
 from pathlib import Path
 
 from vccp_runtime.core import WorkflowSnapshot, _Store
 from vccp_runtime.local_reviewer import (GitHubUserReviewerProvider, LocalReviewerDriver,
                                          LocalReviewerWriter)
-from vccp_runtime.reviewer_agents import ReviewerTaskError
+from vccp_runtime.reviewer_agents import ClaudeAgentSDKReviewer, ReviewerTaskError
 
 
 REPO = "owner/consumer"
@@ -130,6 +131,235 @@ class FakeHTTPResponse:
 
 
 class LocalReviewerWriterTests(unittest.TestCase):
+    def test_duplicate_sdk_checkpoints_are_deduplicated_before_sqlite_write(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = _Store(str(Path(root) / "runtime.sqlite"))
+            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_agent_sdk", now=100)
+            driver = LocalReviewerDriver(
+                store, FakeReviewAgent(),
+                LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO,
+                                    "liuchangchxy", MANIFEST), "claude_agent_sdk")
+            original_update = store.update_reviewer_execution
+            writes = []
+
+            def fail_if_duplicate(*args, **kwargs):
+                outcome = kwargs.get("outcome")
+                if outcome is None and len(args) > 5:
+                    outcome = args[5]
+                if outcome and outcome.startswith("sdk_review_checkpoint:"):
+                    if outcome in writes:
+                        raise AssertionError("duplicate checkpoint reached SQLite")
+                    writes.append(outcome)
+                return original_update(*args, **kwargs)
+
+            store.update_reviewer_execution = fail_if_duplicate
+            checkpoint = {"phase": "active", "session_id": "sdk-session",
+                          "resume_count": 0, "total_turns": 0}
+
+            driver._record_sdk_checkpoint(REPO, 12, HEAD, checkpoint)
+            driver._record_sdk_checkpoint(REPO, 12, HEAD, checkpoint)
+            record = store.reviewer_execution(REPO, 12, HEAD)
+
+        self.assertEqual(len(writes), 1)
+        self.assertTrue(record["outcome"].startswith("sdk_review_checkpoint:"))
+
+    def test_critical_sdk_checkpoint_write_failure_fails_closed(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = _Store(str(Path(root) / "runtime.sqlite"))
+            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_agent_sdk", now=100)
+            driver = LocalReviewerDriver(
+                store, FakeReviewAgent(),
+                LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO,
+                                    "liuchangchxy", MANIFEST), "claude_agent_sdk")
+            store.update_reviewer_execution = lambda *args, **kwargs: False
+
+            with self.assertRaisesRegex(RuntimeError, "checkpoint could not be persisted"):
+                driver._record_sdk_checkpoint(
+                    REPO, 12, HEAD, {"phase": "active", "session_id": "sdk-session",
+                                     "resume_count": 0, "total_turns": 0})
+
+    def test_checkpoint_session_mismatch_transitions_running_execution_to_failed(self):
+        class ResumableAgent(FakeReviewAgent):
+            def resume_review(self, *args, **kwargs):
+                raise AssertionError("mismatched session must not be resumed")
+
+        with tempfile.TemporaryDirectory() as root:
+            store = _Store(str(Path(root) / "runtime.sqlite"))
+            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_agent_sdk", now=100)
+            checkpoint = {"phase": "resume_ready", "session_id": "checkpoint-session",
+                          "resume_count": 1, "total_turns": 31}
+            store.update_reviewer_execution(
+                REPO, 12, HEAD, "RUNNING", "row-session",
+                "sdk_review_checkpoint:" + json.dumps(checkpoint, separators=(",", ":")), now=110)
+            driver = LocalReviewerDriver(
+                store, ResumableAgent(),
+                LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO,
+                                    "liuchangchxy", MANIFEST), "claude_agent_sdk")
+
+            result = driver.advance(REPO, 7, 12, HEAD)
+            record = store.reviewer_execution(REPO, 12, HEAD)
+
+        self.assertEqual(result["reason"], "checkpoint_session_mismatch")
+        self.assertEqual(record["state"], "FAILED")
+        self.assertEqual(record["outcome"], "sdk_terminal_failure:checkpoint_session_mismatch")
+
+    def test_invalid_completed_decisions_transition_to_failed(self):
+        class ResumableAgent(FakeReviewAgent):
+            def resume_review(self, *args, **kwargs):
+                raise AssertionError("invalid completed checkpoint must not resume")
+
+        scenarios = (
+            ("RUNNING", "sdk_review_checkpoint:" + json.dumps({
+                "phase": "completed", "session_id": "sdk-session", "resume_count": 1,
+                "total_turns": 42, "result": {"event": "BLOCKED", "body": "incomplete"}},
+                separators=(",", ":")), "reviewer_result_unavailable", "completed_checkpoint_invalid"),
+            ("COMPLETED", json.dumps({"event": "BLOCKED", "body": "incomplete"}),
+             "reviewer_invalid_decision", "invalid_reviewer_decision"),
+        )
+        for initial_state, outcome, expected_status, expected_outcome in scenarios:
+            with self.subTest(initial_state=initial_state), tempfile.TemporaryDirectory() as root:
+                store = _Store(str(Path(root) / "runtime.sqlite"))
+                store.claim_reviewer_execution(REPO, 12, HEAD, "claude_agent_sdk", now=100)
+                store.update_reviewer_execution(REPO, 12, HEAD, initial_state, "sdk-session",
+                                                outcome=outcome, now=110)
+                driver = LocalReviewerDriver(
+                    store, ResumableAgent(),
+                    LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO,
+                                        "liuchangchxy", MANIFEST), "claude_agent_sdk")
+
+                result = driver.advance(REPO, 7, 12, HEAD)
+                record = store.reviewer_execution(REPO, 12, HEAD)
+
+                self.assertEqual(result["status"], expected_status)
+                self.assertEqual(record["state"], "FAILED")
+                self.assertEqual(record["outcome"], expected_outcome)
+
+    def test_runner_restart_resumes_only_durable_turn_boundary_checkpoint(self):
+        class IdempotentProvider(FakeProvider):
+            def request(self, method, path, repo, payload=None):
+                response = super().request(method, path, repo, payload)
+                if method == "POST" and path.endswith("/pulls/12/reviews"):
+                    self.reviews.append({"state": "APPROVED", "commit_id": HEAD,
+                                         "user": {"login": "liuchangchxy"}})
+                return response
+
+        class ResumableAgent(FakeReviewAgent):
+            def __init__(self):
+                super().__init__()
+                self.resumes = []
+
+            def resume_review(self, repo, issue, pr, head, session_id, resume_count,
+                              total_turns, started_at, *, on_checkpoint=None):
+                self.resumes.append((session_id, resume_count, total_turns))
+                decision = {"event": "APPROVE", "body": "Completed after resume."}
+                on_checkpoint({"phase": "completed", "session_id": session_id,
+                               "resume_count": resume_count, "total_turns": total_turns,
+                               "result": decision})
+                return {"status": "completed", "execution_id": session_id, **decision}
+
+        with tempfile.TemporaryDirectory() as root:
+            database = str(Path(root) / "runtime.sqlite")
+            store = _Store(database)
+            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_agent_sdk", now=100)
+            checkpoint = {"phase": "resume_ready", "session_id": "sdk-session",
+                          "resume_count": 1, "total_turns": 30}
+            store.update_reviewer_execution(
+                REPO, 12, HEAD, "RUNNING", "sdk-session",
+                "sdk_review_checkpoint:" + json.dumps(checkpoint, separators=(",", ":")), now=110)
+            agent, provider = ResumableAgent(), IdempotentProvider()
+            writer = LocalReviewerWriter(provider, FakeWorkflow(), REPO, "liuchangchxy", MANIFEST)
+            restarted = LocalReviewerDriver(_Store(database), agent, writer, "claude_agent_sdk")
+
+            first = restarted.advance(REPO, 7, 12, HEAD)
+            second = restarted.advance(REPO, 7, 12, HEAD)
+            record = _Store(database).reviewer_execution(REPO, 12, HEAD)
+
+        self.assertEqual(first["status"], "review_decision_submitted")
+        self.assertEqual(second["status"], "formal_review_exists")
+        self.assertEqual(agent.resumes, [("sdk-session", 1, 30)])
+        self.assertEqual(sum(call[0] == "POST" and call[1].endswith("/pulls/12/reviews")
+                             for call in provider.calls), 1)
+        self.assertEqual(record["state"], "DECIDED")
+
+    def test_runner_restart_fails_closed_for_active_unknown_sdk_checkpoint(self):
+        class ResumableAgent(FakeReviewAgent):
+            def __init__(self): super().__init__(); self.resumes = []
+            def resume_review(self, *args, **kwargs): self.resumes.append(args); raise AssertionError("must not resume")
+
+        with tempfile.TemporaryDirectory() as root:
+            store = _Store(str(Path(root) / "runtime.sqlite"))
+            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_agent_sdk", now=100)
+            checkpoint = {"phase": "active", "session_id": "sdk-session",
+                          "resume_count": 0, "total_turns": 0}
+            store.update_reviewer_execution(
+                REPO, 12, HEAD, "RUNNING", "sdk-session",
+                "sdk_review_checkpoint:" + json.dumps(checkpoint, separators=(",", ":")), now=110)
+            agent = ResumableAgent()
+            writer = LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO, "liuchangchxy", MANIFEST)
+
+            result = LocalReviewerDriver(store, agent, writer, "claude_agent_sdk").advance(
+                REPO, 7, 12, HEAD)
+            record = store.reviewer_execution(REPO, 12, HEAD)
+
+        self.assertEqual(result["status"], "reviewer_execution_failed")
+        self.assertEqual(agent.resumes, [])
+        self.assertEqual(record["state"], "FAILED")
+
+    def test_runner_restart_rejects_resume_when_head_changed_or_formal_review_exists(self):
+        class ResumableAgent(FakeReviewAgent):
+            def __init__(self): super().__init__(); self.resumes = []
+            def resume_review(self, *args, **kwargs): self.resumes.append(args); raise AssertionError("must not resume")
+
+        scenarios = (
+            (FakeProvider(head="b" * 40), "reviewer_preconditions_changed", "FAILED"),
+            (FakeProvider(reviews=[{"state": "COMMENTED", "commit_id": HEAD,
+                                    "user": {"login": "someone-else"}}]),
+             "formal_review_exists", "DECIDED"),
+        )
+        for provider, expected_status, expected_state in scenarios:
+            with self.subTest(expected_status=expected_status), tempfile.TemporaryDirectory() as root:
+                store = _Store(str(Path(root) / "runtime.sqlite"))
+                store.claim_reviewer_execution(REPO, 12, HEAD, "claude_agent_sdk", now=100)
+                checkpoint = {"phase": "resume_ready", "session_id": "sdk-session",
+                              "resume_count": 1, "total_turns": 30}
+                store.update_reviewer_execution(
+                    REPO, 12, HEAD, "RUNNING", "sdk-session",
+                    "sdk_review_checkpoint:" + json.dumps(checkpoint, separators=(",", ":")), now=110)
+                agent = ResumableAgent()
+                writer = LocalReviewerWriter(provider, FakeWorkflow(), REPO, "liuchangchxy", MANIFEST)
+
+                result = LocalReviewerDriver(store, agent, writer, "claude_agent_sdk").advance(
+                    REPO, 7, 12, HEAD)
+                record = store.reviewer_execution(REPO, 12, HEAD)
+
+                self.assertEqual(result["status"], expected_status)
+                self.assertEqual(agent.resumes, [])
+                self.assertEqual(record["state"], expected_state)
+
+    def test_runner_restart_replays_completed_checkpoint_without_sdk_call(self):
+        class Agent(FakeReviewAgent):
+            def __init__(self): super().__init__(); self.resumes = []
+            def resume_review(self, *args, **kwargs): self.resumes.append(args); raise AssertionError("must not resume")
+
+        with tempfile.TemporaryDirectory() as root:
+            store = _Store(str(Path(root) / "runtime.sqlite"))
+            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_agent_sdk", now=100)
+            result_value = {"event": "REQUEST_CHANGES", "body": "A blocking issue."}
+            checkpoint = {"phase": "completed", "session_id": "sdk-session",
+                          "resume_count": 1, "total_turns": 42, "result": result_value}
+            store.update_reviewer_execution(
+                REPO, 12, HEAD, "RUNNING", "sdk-session",
+                "sdk_review_checkpoint:" + json.dumps(checkpoint, separators=(",", ":")), now=110)
+            agent, provider = Agent(), FakeProvider()
+            writer = LocalReviewerWriter(provider, FakeWorkflow(), REPO, "liuchangchxy", MANIFEST)
+
+            result = LocalReviewerDriver(store, agent, writer, "claude_agent_sdk").advance(
+                REPO, 7, 12, HEAD)
+
+        self.assertEqual(result["status"], "review_decision_submitted")
+        self.assertEqual(result["event"], "REQUEST_CHANGES")
+        self.assertEqual(agent.resumes, [])
+
     def test_user_credential_provider_is_identity_checked_and_operation_fenced(self):
         token = "gho_" + "x" * 32
         calls = []
@@ -427,6 +657,35 @@ class LocalReviewerWriterTests(unittest.TestCase):
         self.assertEqual(record["execution_id"], "review-session-1")
         self.assertEqual(history[-1]["previous_execution_id"], "failed-session-id")
         self.assertEqual(history[-1]["previous_outcome"], "sdk_terminal_failure:unsupported_result")
+
+    def test_persisted_result_error_execution_can_retry_without_state_edit(self):
+        class ResultErrorAgent(FakeReviewAgent):
+            retry_session_evidence = ClaudeAgentSDKReviewer.retry_session_evidence
+
+        with tempfile.TemporaryDirectory() as root:
+            store = _Store(str(Path(root) / "runtime.sqlite"))
+            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_agent_sdk", 10)
+            store.update_reviewer_execution(REPO, 12, HEAD, "RUNNING", "failed-session-id", now=11)
+            store.update_reviewer_execution(
+                REPO, 12, HEAD, "FAILED", outcome=(
+                    "sdk_execution_state_unknown:stage=claude_agent_sdk_execution "
+                    "endpoint=none http_status=none exception_type=ResultError process_status=none"), now=12)
+            agent = ResultErrorAgent()
+            writer = LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO,
+                                         "liuchangchxy", MANIFEST)
+
+            result = LocalReviewerDriver(store, agent, writer, "claude_agent_sdk").retry_failed(
+                REPO, 7, 12, HEAD, authorization_head=HEAD)
+
+            record = store.reviewer_execution(REPO, 12, HEAD)
+            history = store.reviewer_retry_history(REPO, 12, HEAD)
+
+        self.assertEqual(result["status"], "reviewer_running")
+        self.assertEqual(agent.launches, [(REPO, 7, 12, HEAD)])
+        self.assertEqual(record["state"], "RUNNING")
+        self.assertEqual(record["execution_id"], "review-session-1")
+        self.assertEqual(history[-1]["previous_execution_id"], "failed-session-id")
+        self.assertIn("exception_type=ResultError", history[-1]["previous_outcome"])
 
     def test_retry_requires_explicit_matching_authorization_sha(self):
         with tempfile.TemporaryDirectory() as root:

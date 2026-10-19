@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from vccp_runtime.github_app import GitHubHTTPError
-from vccp_runtime.reviewer_agents import ClaudeAgentSDKReviewer, _decision
+from vccp_runtime.reviewer_agents import ClaudeAgentSDKReviewer, ReviewerTaskError, _decision
 
 
 SHA = "a" * 40
@@ -19,11 +19,11 @@ APPROVAL = {"decision": "APPROVE", "summary": "All criteria pass.", "findings": 
 
 
 class FakeAPI:
-    def __init__(self, head=SHA): self.head = head
+    def __init__(self, head=SHA): self.head, self.reviews = head, []
     def get(self, path):
         if path.endswith("/issues/7"):
             return {"number": 7, "body": "Frozen spec criterion: preserve the API."}
-        if "/pulls/12/reviews?" in path: return []
+        if "/pulls/12/reviews?" in path: return self.reviews
         if "/pulls/12/files?" in path:
             return [{"filename": "code.py", "status": "modified", "additions": 1,
                      "deletions": 1, "patch": "-print('review me')\\n+print('changed')"}]
@@ -48,6 +48,38 @@ class FakeResultMessage:
         self.structured_output = data
         self.subtype = subtype
         self.session_id = session_id
+
+
+class ResultError(Exception):
+    def __init__(self):
+        super().__init__("Claude Code returned an error result")
+        self.subtype = "success"
+        self.errors = []
+        self.result = ("API Error: overloaded (token=sk-ant-sensitive) "
+                       "github_pat_11AA11A_" + "G" * 70 + " "
+                       "ghp_" + "A" * 36 + " " + "ghs_" + "B" * 36 + " "
+                       "ANTHROPIC_AUTH_TOKEN=secret_value "
+                       '{"ANTHROPIC_AUTH_TOKEN":"secret_value",'
+                       '"x-api-key":"another_secret",'
+                       '"authorization":"Basic dXNlcjpwYXNz",'
+                       '"set-cookie":"cookie_secret"}')
+        self.api_error_status = 529
+        self.terminal_reason = "api_error"
+        self.session_id = "sdk-terminal-session"
+        self.exit_code = 1
+
+
+class MaxTurnsResultError(ResultError):
+    def __init__(self, session_id="sdk-session"):
+        super().__init__()
+        self.subtype = "error_max_turns"
+        self.errors = ["max_turns reached"]
+        self.result = ""
+        self.api_error_status = None
+        self.terminal_reason = "max_turns"
+        self.session_id = session_id
+        self.data = {"subtype": self.subtype, "terminal_reason": self.terminal_reason,
+                     "session_id": session_id, "num_turns": 31}
 
 
 class FakePermissionAllow:
@@ -77,7 +109,7 @@ class ReviewerAgentTests(unittest.TestCase):
         return types.SimpleNamespace(
             ClaudeAgentOptions=FakeOptions, PermissionResultAllow=FakePermissionAllow,
             PermissionResultDeny=FakePermissionDeny, ResultMessage=FakeResultMessage,
-            SystemMessage=FakeSystemMessage, query=fake_query,
+            SystemMessage=FakeSystemMessage, ResultError=ResultError, query=fake_query,
         )
 
     def _repo(self, root):
@@ -107,7 +139,7 @@ class ReviewerAgentTests(unittest.TestCase):
                                                str(source), str(root / "reviews"))
             environ = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:15721",
                        "ANTHROPIC_AUTH_TOKEN": "PROXY_MANAGED", "GH_TOKEN": "do-not-pass"}
-            with patch.dict(os.environ, environ, clear=True), \
+            with patch.dict(os.environ, environ), \
                     patch.dict(sys.modules, {"claude_agent_sdk": module}):
                 execution = provider.launch_review(REPO, 7, 12, head)
                 workspace = provider.workspace.path_for(REPO, 12, head)
@@ -122,6 +154,7 @@ class ReviewerAgentTests(unittest.TestCase):
             self.assertEqual(options.tools, ["Read", "Glob", "Grep"])
             self.assertEqual(options.disallowed_tools, ["Bash", "Write", "Edit"])
             self.assertEqual(options.setting_sources, ["user"])
+            self.assertEqual(options.max_turns, 30)
             self.assertEqual(options.env["ANTHROPIC_BASE_URL"], environ["ANTHROPIC_BASE_URL"])
             self.assertEqual(options.env["ANTHROPIC_AUTH_TOKEN"], environ["ANTHROPIC_AUTH_TOKEN"])
             self.assertNotIn("GH_TOKEN", options.env)
@@ -131,6 +164,153 @@ class ReviewerAgentTests(unittest.TestCase):
             self.assertIsInstance(outside, FakePermissionDeny)
             self.assertFalse(hasattr(provider, "_workers"))
             self.assertFalse(hasattr(provider, "_results"))
+
+    def test_reviewer_resumes_same_session_after_per_call_turn_limit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, head = self._repo(root)
+            calls, checkpoints = [], []
+            async def segmented_query(*, prompt, options):
+                calls.append((prompt, options))
+                yield FakeSystemMessage("sdk-session")
+                if options.resume is None:
+                    raise MaxTurnsResultError()
+                yield FakeResultMessage()
+            module = self._sdk_module()
+            module.query = segmented_query
+            provider = ClaudeAgentSDKReviewer(None, FakeAPI(head), MANIFEST,
+                                               str(source), str(root / "reviews"))
+
+            with patch.dict(sys.modules, {"claude_agent_sdk": module}):
+                result = provider.launch_review(REPO, 7, 12, head, on_checkpoint=checkpoints.append)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["execution_id"], "sdk-session")
+        self.assertEqual(len(calls), 2)
+        self.assertIsNone(calls[0][1].resume)
+        self.assertEqual(calls[0][1].max_turns, 30)
+        self.assertEqual(calls[1][1].resume, "sdk-session")
+        self.assertEqual(calls[1][1].max_turns, 30)
+        self.assertTrue(any(item.get("phase") == "resume_ready" for item in checkpoints))
+        self.assertEqual(next(item["total_turns"] for item in checkpoints
+                              if item.get("phase") == "resume_ready"), 31)
+        self.assertEqual(checkpoints[-1]["phase"], "completed")
+
+    def test_reviewer_total_turn_budget_stops_after_two_resumes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, head = self._repo(root)
+            calls = []
+            async def segmented_query(*, prompt, options):
+                calls.append(options)
+                yield FakeSystemMessage("sdk-session")
+                raise MaxTurnsResultError()
+            module = self._sdk_module()
+            module.query = segmented_query
+            provider = ClaudeAgentSDKReviewer(None, FakeAPI(head), MANIFEST,
+                                               str(source), str(root / "reviews"))
+
+            with patch.dict(sys.modules, {"claude_agent_sdk": module}), \
+                    self.assertRaises(ReviewerTaskError) as raised:
+                provider.launch_review(REPO, 7, 12, head)
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual([options.resume for options in calls], [None, "sdk-session", "sdk-session"])
+        self.assertEqual(raised.exception.exception_type, "ReviewerResumeBudgetExceeded")
+        self.assertTrue(raised.exception.terminal)
+
+    def test_reviewer_cumulative_time_budget_applies_across_segments(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, head = self._repo(root)
+            calls = []
+            async def segmented_query(*, prompt, options):
+                calls.append(options)
+                yield FakeSystemMessage("sdk-session")
+                raise MaxTurnsResultError()
+            module = self._sdk_module()
+            module.query = segmented_query
+            provider = ClaudeAgentSDKReviewer(None, FakeAPI(head), MANIFEST,
+                                               str(source), str(root / "reviews"))
+            provider.timeout_seconds = 20
+
+            with patch.dict(sys.modules, {"claude_agent_sdk": module}), \
+                    patch("vccp_runtime.reviewer_agents.time.time", side_effect=[100.0, 121.0]), \
+                    self.assertRaises(ReviewerTaskError) as raised:
+                provider.launch_review(REPO, 7, 12, head, started_at=100.0)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(raised.exception.stage, "claude_agent_sdk_timeout")
+
+    def test_failed_session_resume_is_not_retried_again(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, head = self._repo(root)
+            calls = []
+            async def segmented_query(*, prompt, options):
+                calls.append(options)
+                yield FakeSystemMessage("sdk-session")
+                if options.resume is None:
+                    raise MaxTurnsResultError()
+                raise ResultError()
+            module = self._sdk_module()
+            module.query = segmented_query
+            provider = ClaudeAgentSDKReviewer(None, FakeAPI(head), MANIFEST,
+                                               str(source), str(root / "reviews"))
+
+            with patch.dict(sys.modules, {"claude_agent_sdk": module}), \
+                    self.assertRaises(ReviewerTaskError) as raised:
+                provider.launch_review(REPO, 7, 12, head)
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(raised.exception.exception_type, "ResultError")
+        self.assertTrue(raised.exception.terminal)
+
+    def test_formal_review_appearing_at_turn_boundary_stops_session_resume(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, head = self._repo(root)
+            api = FakeAPI(head)
+            calls = []
+            async def segmented_query(*, prompt, options):
+                calls.append(options)
+                yield FakeSystemMessage("sdk-session")
+                api.reviews = [{"state": "APPROVED", "commit_id": head}]
+                raise MaxTurnsResultError()
+            module = self._sdk_module()
+            module.query = segmented_query
+            provider = ClaudeAgentSDKReviewer(None, api, MANIFEST,
+                                               str(source), str(root / "reviews"))
+
+            with patch.dict(sys.modules, {"claude_agent_sdk": module}), \
+                    self.assertRaises(ReviewerTaskError) as raised:
+                provider.launch_review(REPO, 7, 12, head)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(raised.exception.stage, "claude_agent_sdk_resume_precondition")
+
+    def test_reviewer_does_not_resume_unknown_sdk_error_or_changed_head(self):
+        for scenario in ("unknown_error", "changed_head"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                source, head = self._repo(root)
+                api = FakeAPI(head)
+                calls = []
+                async def segmented_query(*, prompt, options):
+                    calls.append(options)
+                    yield FakeSystemMessage("sdk-session")
+                    if scenario == "unknown_error":
+                        raise RuntimeError("transport failed")
+                    api.head = "b" * 40
+                    raise MaxTurnsResultError()
+                module = self._sdk_module()
+                module.query = segmented_query
+                provider = ClaudeAgentSDKReviewer(None, api, MANIFEST,
+                                                   str(source), str(root / "reviews"))
+                with patch.dict(sys.modules, {"claude_agent_sdk": module}), \
+                        self.assertRaises(ReviewerTaskError):
+                    provider.launch_review(REPO, 7, 12, head)
+                self.assertEqual(len(calls), 1)
 
     def test_structured_changes_requested_requires_blocking_finding(self):
         result = {"decision": "CHANGES_REQUESTED", "summary": "Fix this.", "findings": [
@@ -166,6 +346,56 @@ class ReviewerAgentTests(unittest.TestCase):
                     provider.launch_review(REPO, 7, 12, head)
             self.assertEqual(raised.exception.execution_id, "sdk-session")
             self.assertFalse(raised.exception.terminal)
+
+    def test_retry_session_evidence_recognizes_persisted_sdk_result_error_as_terminal(self):
+        provider = ClaudeAgentSDKReviewer(None, FakeAPI(), MANIFEST, ".", ".")
+        outcome = ("sdk_execution_state_unknown:stage=claude_agent_sdk_execution "
+                   "endpoint=none http_status=none exception_type=ResultError process_status=none")
+
+        evidence = provider.retry_session_evidence(
+            REPO, 7, 12, SHA, failed_execution_id="sdk-session", failed_outcome=outcome)
+
+        self.assertEqual(evidence, {"status": "terminal_failed", "execution_id": "sdk-session",
+                                    "state": "failed"})
+
+    def test_retry_session_evidence_keeps_other_unknown_sdk_errors_blocked(self):
+        provider = ClaudeAgentSDKReviewer(None, FakeAPI(), MANIFEST, ".", ".")
+        outcome = ("sdk_execution_state_unknown:stage=claude_agent_sdk_execution "
+                   "endpoint=none http_status=none exception_type=RuntimeError process_status=none")
+
+        evidence = provider.retry_session_evidence(
+            REPO, 7, 12, SHA, failed_execution_id="sdk-session", failed_outcome=outcome)
+
+        self.assertEqual(evidence["status"], "unobservable")
+
+    def test_sdk_result_error_is_terminal_and_preserves_sanitized_cause(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, head = self._repo(root)
+            provider = ClaudeAgentSDKReviewer(None, FakeAPI(head), MANIFEST,
+                                               str(source), str(root / "reviews"))
+            module = self._sdk_module(error=ResultError())
+            with patch.dict(sys.modules, {"claude_agent_sdk": module}):
+                with self.assertRaises(Exception) as raised:
+                    provider.launch_review(REPO, 7, 12, head)
+
+        self.assertEqual(raised.exception.stage, "claude_agent_sdk_execution")
+        self.assertEqual(raised.exception.exception_type, "ResultError")
+        self.assertEqual(raised.exception.execution_id, "sdk-terminal-session")
+        self.assertTrue(raised.exception.terminal)
+        self.assertTrue(raised.exception.execution_started)
+        self.assertEqual(raised.exception.http_status, 529)
+        self.assertEqual(raised.exception.process_status, 1)
+        self.assertIn("terminal_reason=api_error", raised.exception.sdk_detail)
+        self.assertIn("API Error: overloaded", raised.exception.sdk_detail)
+        self.assertNotIn("sk-ant-sensitive", raised.exception.sdk_detail)
+        self.assertNotIn("github_pat_11AA11A_" + "G" * 70, raised.exception.sdk_detail)
+        self.assertNotIn("ghp_" + "A" * 36, raised.exception.sdk_detail)
+        self.assertNotIn("ghs_" + "B" * 36, raised.exception.sdk_detail)
+        self.assertNotIn("secret_value", raised.exception.sdk_detail)
+        self.assertNotIn("another_secret", raised.exception.sdk_detail)
+        self.assertNotIn("dXNlcjpwYXNz", raised.exception.sdk_detail)
+        self.assertNotIn("cookie_secret", raised.exception.sdk_detail)
 
     def test_sdk_timeout_is_not_terminal_retry_evidence(self):
         with tempfile.TemporaryDirectory() as temp:

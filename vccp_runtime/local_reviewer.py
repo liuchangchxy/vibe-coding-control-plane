@@ -7,8 +7,11 @@ import os
 import subprocess
 from urllib.request import Request, urlopen
 
+from .reviewer_agents import MAX_REVIEWER_RESUMES, MAX_REVIEWER_TASK_TURNS
+
 
 _SHA = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+_SDK_CHECKPOINT_PREFIX = "sdk_review_checkpoint:"
 _ENABLE_AUTO_MERGE = """
 mutation EnableVCCPNativeAutoMerge($pullRequestId: ID!, $mergeMethod: PullRequestMergeMethod!) {
   enablePullRequestAutoMerge(input: {pullRequestId: $pullRequestId, mergeMethod: $mergeMethod}) {
@@ -228,6 +231,7 @@ class LocalReviewerDriver:
             raise ValueError("an explicit Local Reviewer provider binding is required")
         self.store, self.provider, self.writer = store, provider, writer
         self.provider_key = provider_key
+        self._sdk_checkpoint_cache = {}
 
     def retry_failed(self, repo: str, issue: int, pr: int, head: str,
                      authorization_head: str):
@@ -295,11 +299,130 @@ class LocalReviewerDriver:
                 and evidence.get("state") == "failed"
                 and evidence.get("execution_id") == failed_execution_id)
 
+    @staticmethod
+    def _decode_sdk_checkpoint(outcome):
+        if not isinstance(outcome, str) or not outcome.startswith(_SDK_CHECKPOINT_PREFIX):
+            return None
+        try:
+            value = json.loads(outcome[len(_SDK_CHECKPOINT_PREFIX):])
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(value, dict):
+            return None
+        if (value.get("phase") not in {"active", "resume_starting", "resume_ready", "completed"}
+                or not isinstance(value.get("session_id"), str)
+                or not isinstance(value.get("resume_count"), int)
+                or not isinstance(value.get("total_turns"), int)):
+            return None
+        return value
+
+    def _record_sdk_checkpoint(self, repo, pr, head, checkpoint):
+        key = (repo.casefold(), pr, head.casefold())
+        previous = self._sdk_checkpoint_cache.get(key)
+        identity = (checkpoint.get("phase"), checkpoint.get("session_id"),
+                    checkpoint.get("resume_count"), checkpoint.get("total_turns"))
+        if previous is not None:
+            previous_identity = (previous.get("phase"), previous.get("session_id"),
+                                 previous.get("resume_count"), previous.get("total_turns"))
+            if identity == previous_identity:
+                if (checkpoint.get("phase") == "completed"
+                        and checkpoint.get("result") != previous.get("result")):
+                    raise RuntimeError("conflicting completed Reviewer checkpoint")
+                return
+        outcome = _SDK_CHECKPOINT_PREFIX + json.dumps(
+            checkpoint, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        if not self.store.update_reviewer_execution(repo, pr, head, "RUNNING",
+                                                    checkpoint.get("session_id"), outcome):
+            raise RuntimeError("Reviewer execution checkpoint could not be persisted")
+        self._sdk_checkpoint_cache[key] = dict(checkpoint)
+
+    def _continue_sdk_checkpoint(self, repo, issue, pr, head, record, checkpoint):
+        session_id = checkpoint["session_id"]
+        if session_id != record.get("execution_id"):
+            self.store.update_reviewer_execution(
+                repo, pr, head, "FAILED", outcome="sdk_terminal_failure:checkpoint_session_mismatch")
+            return {"status": "reviewer_execution_failed", "reason": "checkpoint_session_mismatch",
+                    "head_sha": head}
+        if checkpoint["phase"] == "completed":
+            result = checkpoint.get("result")
+            if (not isinstance(result, dict) or result.get("event") not in {"APPROVE", "REQUEST_CHANGES"}
+                    or not isinstance(result.get("body"), str) or not result["body"].strip()):
+                self.store.update_reviewer_execution(repo, pr, head, "FAILED",
+                                                     outcome="completed_checkpoint_invalid")
+                return {"status": "reviewer_result_unavailable", "head_sha": head}
+            self.store.update_reviewer_execution(
+                repo, pr, head, "COMPLETED", session_id,
+                json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+            return self._submit_decision(repo, issue, pr, head, result)
+        if checkpoint["phase"] != "resume_ready":
+            self.store.update_reviewer_execution(
+                repo, pr, head, "FAILED",
+                outcome="sdk_execution_state_unknown:stage=runner_restart "
+                        "exception_type=ActiveSDKSessionCannotBeReattached")
+            return {"status": "reviewer_execution_failed", "reason": "active_session_state_unknown",
+                    "head_sha": head}
+        if (checkpoint["resume_count"] < 1
+                or checkpoint["resume_count"] > MAX_REVIEWER_RESUMES
+                or checkpoint["total_turns"] < 1
+                or checkpoint["total_turns"] >= MAX_REVIEWER_TASK_TURNS):
+            self.store.update_reviewer_execution(repo, pr, head, "FAILED",
+                                                 outcome="sdk_terminal_failure:resume_budget_checkpoint_invalid")
+            return {"status": "reviewer_execution_failed", "reason": "resume_budget_invalid",
+                    "head_sha": head}
+        try:
+            self.writer._snapshot(repo, issue, pr, head)
+            self.writer._pull_request(repo, pr, head)
+            if self.writer._formal_review_exists_for_head(repo, pr, head):
+                self.store.update_reviewer_execution(repo, pr, head, "DECIDED",
+                                                     outcome="formal_review_exists")
+                return {"status": "formal_review_exists", "head_sha": head}
+        except Exception as error:
+            self.store.update_reviewer_execution(
+                repo, pr, head, "FAILED",
+                outcome=f"sdk_terminal_failure:resume_precondition:{type(error).__name__}")
+            return {"status": "reviewer_preconditions_changed", "head_sha": head}
+        next_checkpoint = dict(checkpoint, phase="resume_starting")
+        expected = _SDK_CHECKPOINT_PREFIX + json.dumps(
+            checkpoint, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        desired = _SDK_CHECKPOINT_PREFIX + json.dumps(
+            next_checkpoint, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        if not self.store.claim_reviewer_resume(repo, pr, head, session_id, expected, desired):
+            return {"status": "reviewer_retry_claim_lost", "head_sha": head}
+        self._sdk_checkpoint_cache[(repo.casefold(), pr, head.casefold())] = next_checkpoint
+        try:
+            execution = self.provider.resume_review(
+                repo, issue, pr, head, session_id, checkpoint["resume_count"],
+                checkpoint["total_turns"], record["started_at"],
+                on_checkpoint=lambda value: self._record_sdk_checkpoint(repo, pr, head, value))
+        except Exception as error:
+            diagnostic = self._launch_diagnostic(error)
+            outcome = ("sdk_terminal_failure:" if getattr(error, "terminal", False)
+                       else "sdk_execution_state_unknown:") + diagnostic
+            self.store.update_reviewer_execution(repo, pr, head, "FAILED",
+                                                 execution_id=session_id, outcome=outcome)
+            return {"status": "reviewer_execution_failed", "detail": diagnostic, "head_sha": head}
+        if (not isinstance(execution, dict) or execution.get("status") != "completed"
+                or execution.get("execution_id") != session_id):
+            self.store.update_reviewer_execution(repo, pr, head, "FAILED", execution_id=session_id,
+                                                 outcome="sdk_terminal_failure:resume_result_invalid")
+            return {"status": "reviewer_result_unavailable", "head_sha": head}
+        result = {"event": execution.get("event"), "body": execution.get("body")}
+        self.store.update_reviewer_execution(
+            repo, pr, head, "COMPLETED", session_id,
+            json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+        return self._submit_decision(repo, issue, pr, head, result)
+
     def advance(self, repo: str, issue: int, pr: int, head: str):
         try:
             self.writer._snapshot(repo, issue, pr, head)
             self.writer._pull_request(repo, pr, head)
         except ValueError:
+            record = self.store.reviewer_execution(repo, pr, head)
+            if (record and record.get("state") == "RUNNING"
+                    and self._decode_sdk_checkpoint(record.get("outcome")) is not None):
+                self.store.update_reviewer_execution(
+                    repo, pr, head, "FAILED",
+                    outcome="sdk_terminal_failure:reviewer_preconditions_changed")
             return {"status": "reviewer_preconditions_changed", "head_sha": head}
         existing = self.writer._existing_decision(repo, pr, head)
         if existing:
@@ -337,7 +460,7 @@ class LocalReviewerDriver:
             else:
                 return self._continue_existing(repo, issue, pr, head, record)
         if claimed:
-            return self._launch(repo, issue, pr, head)
+            return self._launch(repo, issue, pr, head, started_at=record.get("started_at"))
         return {"status": "reviewer_not_relaunched", "state": record["state"],
                 "outcome": record.get("outcome"), "head_sha": head}
 
@@ -359,6 +482,11 @@ class LocalReviewerDriver:
             self.store.update_reviewer_execution(repo, pr, head, "FAILED",
                                                  outcome="completed_result_unavailable")
             return {"status": "reviewer_result_unavailable", "head_sha": head}
+        if (record["state"] == "RUNNING" and self.provider_key == "claude_agent_sdk"
+                and callable(getattr(self.provider, "resume_review", None))):
+            checkpoint = self._decode_sdk_checkpoint(record.get("outcome"))
+            if checkpoint is not None:
+                return self._continue_sdk_checkpoint(repo, issue, pr, head, record, checkpoint)
         if not record.get("execution_id") and record["state"] not in {"STARTING"}:
             return {"status": "reviewer_not_relaunched", "state": record["state"],
                     "outcome": record.get("outcome"), "head_sha": head}
@@ -403,9 +531,15 @@ class LocalReviewerDriver:
         return {"status": "reviewer_not_relaunched", "state": record["state"],
                 "outcome": record.get("outcome"), "head_sha": head}
 
-    def _launch(self, repo: str, issue: int, pr: int, head: str):
+    def _launch(self, repo: str, issue: int, pr: int, head: str, started_at=None):
         try:
-            execution = self.provider.launch_review(repo, issue, pr, head)
+            if (self.provider_key == "claude_agent_sdk"
+                    and callable(getattr(self.provider, "resume_review", None))):
+                execution = self.provider.launch_review(
+                    repo, issue, pr, head, started_at=started_at,
+                    on_checkpoint=lambda value: self._record_sdk_checkpoint(repo, pr, head, value))
+            else:
+                execution = self.provider.launch_review(repo, issue, pr, head)
         except Exception as error:
             diagnostic = self._launch_diagnostic(error)
             execution_id = getattr(error, "execution_id", None)
@@ -447,15 +581,18 @@ class LocalReviewerDriver:
         exception_type = str(getattr(error, "exception_type", None) or type(error).__name__)[:80]
         process_status = getattr(error, "process_status", None)
         process_status = process_status if isinstance(process_status, int) else "none"
-        return (f"stage={stage} endpoint={endpoint} http_status={status} "
-                f"exception_type={exception_type} process_status={process_status}")
+        diagnostic = (f"stage={stage} endpoint={endpoint} http_status={status} "
+                      f"exception_type={exception_type} process_status={process_status}")
+        sdk_detail = getattr(error, "sdk_detail", None)
+        if isinstance(sdk_detail, str) and sdk_detail:
+            diagnostic += " sdk_detail=" + sdk_detail
+        return diagnostic
 
     def _submit_decision(self, repo, issue, pr, head, result):
         event, body = result.get("event"), result.get("body")
         if event not in {"APPROVE", "REQUEST_CHANGES"} or not isinstance(body, str) or not body.strip():
-            if self.provider_key != "claude_agent_sdk":
-                self.store.update_reviewer_execution(repo, pr, head, "FAILED",
-                                                     outcome="invalid_reviewer_decision")
+            self.store.update_reviewer_execution(repo, pr, head, "FAILED",
+                                                 outcome="invalid_reviewer_decision")
             return {"status": "reviewer_invalid_decision", "head_sha": head}
         try:
             decision = self.writer.submit(issue, pr, head, event, body)
