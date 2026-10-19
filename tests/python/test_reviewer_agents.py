@@ -50,6 +50,18 @@ class FakeResultMessage:
         self.session_id = session_id
 
 
+class ResultError(Exception):
+    def __init__(self):
+        super().__init__("Claude Code returned an error result")
+        self.subtype = "success"
+        self.errors = []
+        self.result = "API Error: overloaded (token=sk-ant-sensitive)"
+        self.api_error_status = 529
+        self.terminal_reason = "api_error"
+        self.session_id = "sdk-terminal-session"
+        self.exit_code = 1
+
+
 class FakePermissionAllow:
     pass
 
@@ -77,7 +89,7 @@ class ReviewerAgentTests(unittest.TestCase):
         return types.SimpleNamespace(
             ClaudeAgentOptions=FakeOptions, PermissionResultAllow=FakePermissionAllow,
             PermissionResultDeny=FakePermissionDeny, ResultMessage=FakeResultMessage,
-            SystemMessage=FakeSystemMessage, query=fake_query,
+            SystemMessage=FakeSystemMessage, ResultError=ResultError, query=fake_query,
         )
 
     def _repo(self, root):
@@ -166,6 +178,49 @@ class ReviewerAgentTests(unittest.TestCase):
                     provider.launch_review(REPO, 7, 12, head)
             self.assertEqual(raised.exception.execution_id, "sdk-session")
             self.assertFalse(raised.exception.terminal)
+
+    def test_retry_session_evidence_recognizes_persisted_sdk_result_error_as_terminal(self):
+        provider = ClaudeAgentSDKReviewer(None, FakeAPI(), MANIFEST, ".", ".")
+        outcome = ("sdk_execution_state_unknown:stage=claude_agent_sdk_execution "
+                   "endpoint=none http_status=none exception_type=ResultError process_status=none")
+
+        evidence = provider.retry_session_evidence(
+            REPO, 7, 12, SHA, failed_execution_id="sdk-session", failed_outcome=outcome)
+
+        self.assertEqual(evidence, {"status": "terminal_failed", "execution_id": "sdk-session",
+                                    "state": "failed"})
+
+    def test_retry_session_evidence_keeps_other_unknown_sdk_errors_blocked(self):
+        provider = ClaudeAgentSDKReviewer(None, FakeAPI(), MANIFEST, ".", ".")
+        outcome = ("sdk_execution_state_unknown:stage=claude_agent_sdk_execution "
+                   "endpoint=none http_status=none exception_type=RuntimeError process_status=none")
+
+        evidence = provider.retry_session_evidence(
+            REPO, 7, 12, SHA, failed_execution_id="sdk-session", failed_outcome=outcome)
+
+        self.assertEqual(evidence["status"], "unobservable")
+
+    def test_sdk_result_error_is_terminal_and_preserves_sanitized_cause(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, head = self._repo(root)
+            provider = ClaudeAgentSDKReviewer(None, FakeAPI(head), MANIFEST,
+                                               str(source), str(root / "reviews"))
+            module = self._sdk_module(error=ResultError())
+            with patch.dict(sys.modules, {"claude_agent_sdk": module}):
+                with self.assertRaises(Exception) as raised:
+                    provider.launch_review(REPO, 7, 12, head)
+
+        self.assertEqual(raised.exception.stage, "claude_agent_sdk_execution")
+        self.assertEqual(raised.exception.exception_type, "ResultError")
+        self.assertEqual(raised.exception.execution_id, "sdk-terminal-session")
+        self.assertTrue(raised.exception.terminal)
+        self.assertTrue(raised.exception.execution_started)
+        self.assertEqual(raised.exception.http_status, 529)
+        self.assertEqual(raised.exception.process_status, 1)
+        self.assertIn("terminal_reason=api_error", raised.exception.sdk_detail)
+        self.assertIn("API Error: overloaded", raised.exception.sdk_detail)
+        self.assertNotIn("sk-ant-sensitive", raised.exception.sdk_detail)
 
     def test_sdk_timeout_is_not_terminal_retry_evidence(self):
         with tempfile.TemporaryDirectory() as temp:

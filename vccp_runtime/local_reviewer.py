@@ -447,8 +447,12 @@ class LocalReviewerDriver:
         exception_type = str(getattr(error, "exception_type", None) or type(error).__name__)[:80]
         process_status = getattr(error, "process_status", None)
         process_status = process_status if isinstance(process_status, int) else "none"
-        return (f"stage={stage} endpoint={endpoint} http_status={status} "
-                f"exception_type={exception_type} process_status={process_status}")
+        diagnostic = (f"stage={stage} endpoint={endpoint} http_status={status} "
+                      f"exception_type={exception_type} process_status={process_status}")
+        sdk_detail = getattr(error, "sdk_detail", None)
+        if isinstance(sdk_detail, str) and sdk_detail:
+            diagnostic += " sdk_detail=" + sdk_detail
+        return diagnostic
 
     def _submit_decision(self, repo, issue, pr, head, result):
         event, body = result.get("event"), result.get("body")

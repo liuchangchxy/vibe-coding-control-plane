@@ -33,12 +33,12 @@ def _decision(text: str) -> dict | None:
 
 
 class ReviewerTaskError(RuntimeError):
-    """Bounded Reviewer failure context with no response body or credential data."""
+    """Bounded Reviewer failure context with redacted provider diagnostics."""
 
     def __init__(self, stage: str, endpoint: str | None = None, http_status: int | None = None,
                  exception_type: str = "RuntimeError", process_status: int | None = None,
                  *, execution_id: str | None = None, terminal: bool = False,
-                 execution_started: bool = False):
+                 execution_started: bool = False, sdk_detail: str | None = None):
         self.stage = stage
         self.endpoint = endpoint
         self.http_status = http_status
@@ -47,6 +47,7 @@ class ReviewerTaskError(RuntimeError):
         self.execution_id = execution_id
         self.terminal = terminal
         self.execution_started = execution_started
+        self.sdk_detail = sdk_detail
         fields = [f"stage={stage}", f"endpoint={endpoint or 'none'}",
                   f"http_status={http_status if http_status is not None else 'none'}",
                   f"exception_type={exception_type}"]
@@ -210,11 +211,41 @@ class ClaudeAgentSDKReviewer:
     def _sdk():
         try:
             from claude_agent_sdk import (ClaudeAgentOptions, PermissionResultAllow,
-                                          PermissionResultDeny, ResultMessage, SystemMessage, query)
+                                          PermissionResultDeny, ResultError, ResultMessage,
+                                          SystemMessage, query)
         except ImportError as error:
             raise ReviewerTaskError("claude_agent_sdk_import", exception_type=type(error).__name__) from None
         return (ClaudeAgentOptions, PermissionResultAllow, PermissionResultDeny,
-                ResultMessage, SystemMessage, query)
+                ResultMessage, SystemMessage, ResultError, query)
+
+    @staticmethod
+    def _result_error_detail(error):
+        parts = []
+        for key in ("subtype", "terminal_reason"):
+            value = getattr(error, key, None)
+            if isinstance(value, str) and value:
+                parts.append(f"{key}={value[:80]}")
+        status = getattr(error, "api_error_status", None)
+        if isinstance(status, int):
+            parts.append(f"api_error_status={status}")
+        errors = getattr(error, "errors", None)
+        if isinstance(errors, list):
+            detail = "; ".join(str(item) for item in errors if isinstance(item, str) and item.strip())
+        else:
+            detail = ""
+        if not detail:
+            result = getattr(error, "result", None)
+            detail = result if isinstance(result, str) else ""
+        if detail:
+            detail = re.sub(r"-----BEGIN [^-]+-----.*?-----END [^-]+-----",
+                            "[redacted private key]", detail, flags=re.DOTALL)
+            detail = re.sub(r"\s+", " ", detail).strip()
+            detail = re.sub(r"(?i)\bBearer\s+\S+", "Bearer [redacted]", detail)
+            detail = re.sub(r"(?i)\b(?:sk-ant-|gh[pousr]_)[A-Za-z0-9_-]{8,}", "[redacted]", detail)
+            detail = re.sub(r"(?i)\b(token|api[_-]?key|authorization)\s*[:=]\s*[^,;\s]+",
+                            r"\1=[redacted]", detail)
+            parts.append(f"detail={detail[:384]}")
+        return " ".join(parts)[:512] or None
 
     def _options(self, path):
         options_type, allow_type, deny_type, *_ = self._sdk()
@@ -279,15 +310,16 @@ class ClaudeAgentSDKReviewer:
         sdk_result = None
         session_id = None
         execution_started = False
-        query = self._query or self._sdk()[-1]
+        sdk = self._sdk()
+        query = self._query or sdk[-1]
 
         async def consume():
             nonlocal sdk_result, session_id, execution_started
             async for message in query(prompt=prompt, options=options):
                 execution_started = True
-                if isinstance(message, self._sdk()[4]):
+                if isinstance(message, sdk[4]):
                     session_id = message.data.get("session_id") or session_id
-                if isinstance(message, self._sdk()[3]):
+                if isinstance(message, sdk[3]):
                     sdk_result = message
                     session_id = getattr(message, "session_id", None) or session_id
 
@@ -299,6 +331,13 @@ class ClaudeAgentSDKReviewer:
         except ReviewerTaskError:
             raise
         except Exception as error:
+            if isinstance(error, sdk[5]):
+                raise ReviewerTaskError(
+                    "claude_agent_sdk_execution", http_status=getattr(error, "api_error_status", None),
+                    exception_type=type(error).__name__, process_status=getattr(error, "exit_code", None),
+                    execution_id=getattr(error, "session_id", None) or session_id,
+                    terminal=True, execution_started=True,
+                    sdk_detail=self._result_error_detail(error)) from None
             raise ReviewerTaskError("claude_agent_sdk_execution", exception_type=type(error).__name__,
                                     execution_id=session_id, execution_started=execution_started) from None
         if sdk_result is None or sdk_result.subtype != "success":
@@ -326,6 +365,12 @@ class ClaudeAgentSDKReviewer:
         if not isinstance(failed_outcome, str):
             return {"status": "unobservable", "exception_type": "ExecutionEvidenceUnavailable"}
         if failed_outcome.startswith("sdk_terminal_failure:"):
+            return {"status": "terminal_failed", "execution_id": failed_execution_id,
+                    "state": "failed"}
+        if (failed_outcome.startswith("sdk_execution_state_unknown:")
+                and re.search(r"(?:^|\s)exception_type=ResultError(?:\s|$)", failed_outcome)):
+            # Older VCCP revisions flattened ResultError into a generic exception,
+            # but the SDK only raises ResultError after a terminal error result.
             return {"status": "terminal_failed", "execution_id": failed_execution_id,
                     "state": "failed"}
         if failed_outcome.startswith("sdk_not_started:") and failed_execution_id is None:

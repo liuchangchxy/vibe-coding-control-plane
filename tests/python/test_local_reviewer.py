@@ -5,7 +5,7 @@ from pathlib import Path
 from vccp_runtime.core import WorkflowSnapshot, _Store
 from vccp_runtime.local_reviewer import (GitHubUserReviewerProvider, LocalReviewerDriver,
                                          LocalReviewerWriter)
-from vccp_runtime.reviewer_agents import ReviewerTaskError
+from vccp_runtime.reviewer_agents import ClaudeAgentSDKReviewer, ReviewerTaskError
 
 
 REPO = "owner/consumer"
@@ -427,6 +427,35 @@ class LocalReviewerWriterTests(unittest.TestCase):
         self.assertEqual(record["execution_id"], "review-session-1")
         self.assertEqual(history[-1]["previous_execution_id"], "failed-session-id")
         self.assertEqual(history[-1]["previous_outcome"], "sdk_terminal_failure:unsupported_result")
+
+    def test_persisted_result_error_execution_can_retry_without_state_edit(self):
+        class ResultErrorAgent(FakeReviewAgent):
+            retry_session_evidence = ClaudeAgentSDKReviewer.retry_session_evidence
+
+        with tempfile.TemporaryDirectory() as root:
+            store = _Store(str(Path(root) / "runtime.sqlite"))
+            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_agent_sdk", 10)
+            store.update_reviewer_execution(REPO, 12, HEAD, "RUNNING", "failed-session-id", now=11)
+            store.update_reviewer_execution(
+                REPO, 12, HEAD, "FAILED", outcome=(
+                    "sdk_execution_state_unknown:stage=claude_agent_sdk_execution "
+                    "endpoint=none http_status=none exception_type=ResultError process_status=none"), now=12)
+            agent = ResultErrorAgent()
+            writer = LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO,
+                                         "liuchangchxy", MANIFEST)
+
+            result = LocalReviewerDriver(store, agent, writer, "claude_agent_sdk").retry_failed(
+                REPO, 7, 12, HEAD, authorization_head=HEAD)
+
+            record = store.reviewer_execution(REPO, 12, HEAD)
+            history = store.reviewer_retry_history(REPO, 12, HEAD)
+
+        self.assertEqual(result["status"], "reviewer_running")
+        self.assertEqual(agent.launches, [(REPO, 7, 12, HEAD)])
+        self.assertEqual(record["state"], "RUNNING")
+        self.assertEqual(record["execution_id"], "review-session-1")
+        self.assertEqual(history[-1]["previous_execution_id"], "failed-session-id")
+        self.assertIn("exception_type=ResultError", history[-1]["previous_outcome"])
 
     def test_retry_requires_explicit_matching_authorization_sha(self):
         with tempfile.TemporaryDirectory() as root:
