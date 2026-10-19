@@ -243,7 +243,15 @@ class LifecycleTests(unittest.TestCase):
                               active_labels=(), pr_head_sha=SHA, formal_review_state="CHANGES_REQUESTED",
                               formal_review_id="review-57", formal_review_head_sha=SHA)
         self.workflow.snapshots[(self.repo, self.issue)] = needs_human
-        self.assertEqual(self.core.authorize_repair_continuation(candidate, "maintainer")["status"], "authorized")
+        pending = self.core.store.authorize_continuation(candidate, "maintainer")
+        self.assertEqual(pending["status"], "authorized_pending_activation")
+        self.assertTrue(self.workflow.restore_repair_coordination_state(
+            self.repo, self.issue, "changes-requested", needs_human.revision))
+        race = self.core.reconcile_once(self.repo, "owner", now=199)
+        self.assertEqual(race["items"][-1]["status"], "continuation_activation_pending")
+        self.assertEqual(self.core.store.attempt("legacy-budget")["phase"], "BUDGET_EXHAUSTED")
+        self.assertEqual(self.core.authorize_repair_continuation(candidate, "maintainer")["status"],
+                         "authorized")
         restored = self.core.store.flow(self.repo, self.issue)
         self.assertEqual((restored["trusted"], restored["initial_confirmed"], restored["repair_count"],
                           restored["repair_budget_known"]), (1, 1, 3, 1))

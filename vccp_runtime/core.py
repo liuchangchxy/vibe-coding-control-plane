@@ -905,6 +905,14 @@ class _Store:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def pending_continuations(self, repo: str):
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT * FROM repair_continuations WHERE repo=? AND activated=0 AND consumed_at IS NULL",
+                (_repo_key(repo),),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
     def restore_budget_stopped_flow(self, candidate: RepairCandidate):
         """Restore trust only from a terminalized, budget-known flow with durable push proof."""
         repo = _repo_key(candidate.repo)
@@ -1936,6 +1944,31 @@ class RuntimeCore:
                         self.store.local_terminal(latest["attempt_id"], "TERMINAL_UNRESOLVED", current_time)
                         output.append({"issue": issue, "status": "contradictory_claim_evidence"})
                 continue
+            activation_pending = [grant for grant in self.store.pending_continuations(repo_key)
+                                  if grant["issue_number"] == issue
+                                  and grant["pr_number"] == snapshot.pr_number
+                                  and grant["head_sha"] == (snapshot.pr_head_sha or "").lower()]
+            if activation_pending:
+                grant = activation_pending[-1]
+                cause_current = (
+                    grant["cause_type"] == "reviewer_rejection"
+                    and snapshot.coordination_state == "changes-requested"
+                    and snapshot.formal_review_state == "CHANGES_REQUESTED"
+                    and snapshot.formal_review_id == grant["cause_id"]
+                    and snapshot.formal_review_head_sha == snapshot.pr_head_sha
+                ) or (
+                    grant["cause_type"] == "implementation_failure"
+                    and snapshot.coordination_state == "agent-working"
+                    and _ci_cause_is_current(RepairCandidate(
+                        repo_key, issue, grant["pr_number"], grant["head_sha"],
+                        snapshot.pr_branch or "", grant["cause_type"], grant["cause_id"], owner_id), snapshot)
+                )
+                if (cause_current and snapshot.issue_open and snapshot.frozen_spec and not snapshot.canceled
+                        and snapshot.pr_open and snapshot.pr_linked_issue == issue
+                        and snapshot.pr_branch and snapshot.canonical_relationship_valid
+                        and snapshot.canonical_link_count == 1 and snapshot.open_linked_pr_count == 1):
+                    output.append({"issue": issue, "status": "continuation_activation_pending"})
+                    continue
             if latest and latest["owner_id"] != owner_id:
                 output.append({"issue": issue, "status": "owner_mismatch"})
                 continue
