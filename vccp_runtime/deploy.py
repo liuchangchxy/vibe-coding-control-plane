@@ -13,6 +13,23 @@ from .host_deployment import (reconcile_macos_launch_agent, remove_macos_launch_
 from .runtime_checkout import ensure_runtime_checkout
 
 
+def _resolve_windows_sidecar_path(repo: str, local_config: dict) -> str:
+    dispatcher = local_config.get("dispatcher") or {}
+    if dispatcher.get("sidecar_path"):
+        return str(dispatcher["sidecar_path"])
+    slug = repo.split("/")[-1].lower()
+    hyphen_slug = slug.replace("_", "-")
+    compact_slug = hyphen_slug.replace("-", "")
+    candidates = [
+        Path.home() / ".gemini" / "config" / "sidecars" / f"{hyphen_slug}-vccp" / "sidecar.json",
+        Path.home() / ".gemini" / "config" / "sidecars" / f"{compact_slug}-vccp" / "sidecar.json",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return str(candidates[0])
+
+
 def deploy_host(*, repo: str, manifest: dict, local_config: dict,
                 manifest_path: str, runtime_config_path: str, source_root: str,
                 runtimes_root: str | None = None, platform: str | None = None,
@@ -48,10 +65,7 @@ def deploy_host(*, repo: str, manifest: dict, local_config: dict,
         return {**result, "revision": revision, "runtime_root": str(runtime_root),
                 "readiness": readiness_result.get("value")}
     if selected_platform == "win32":
-        dispatcher = local_config.get("dispatcher") or {}
-        slug = repo.split("/")[-1].lower().replace("_", "-")
-        sidecar_path = dispatcher.get("sidecar_path") or str(
-            Path.home() / ".gemini" / "config" / "sidecars" / f"{slug}-vccp" / "sidecar.json")
+        sidecar_path = _resolve_windows_sidecar_path(repo, local_config)
         readiness_result = {}
         def readiness_after_stop():
             qualified = full_readiness(runtime_root)
@@ -83,10 +97,7 @@ def remove_host(*, repo: str, local_config: dict, runtime_config_path: str,
         except KeyError:
             return {"status": "blocked", "reason": "runtime config lacks the Consumer database identity required to verify RuntimeLock"}
     if selected_platform == "win32":
-        dispatcher = local_config.get("dispatcher") or {}
-        slug = repo.split("/")[-1].lower().replace("_", "-")
-        sidecar_path = dispatcher.get("sidecar_path") or str(
-            Path.home() / ".gemini" / "config" / "sidecars" / f"{slug}-vccp" / "sidecar.json")
+        sidecar_path = _resolve_windows_sidecar_path(repo, local_config)
         try:
             return remove_windows_sidecar(repo=repo, database_path=local_config["database_path"],
                 runtime_config_path=runtime_config_path,

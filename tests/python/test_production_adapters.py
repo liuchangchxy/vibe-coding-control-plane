@@ -1040,8 +1040,8 @@ class TestWindowsWrapperRuntimeIsolation(unittest.TestCase):
                 "repo": "owner/repo",
                 "workspace": str(temp_path),
             }
-            with patch("vccp_runtime.adapters.os.name", "nt"):
-                guard_res = guard.install(str(temp_path), "att-123", provider="antigravity", launch_context=launch_context)
+            guard_res = guard.install(str(temp_path), "att-123", provider="antigravity",
+                                      launch_context=launch_context, is_windows=True)
             wrapper_cmd = Path(guard_res.git_push_command)
             self.assertTrue(wrapper_cmd.is_file())
             content = wrapper_cmd.read_text(encoding="utf-8")

@@ -250,6 +250,40 @@ class HostDeploymentTests(unittest.TestCase):
             self.assertEqual(result["status"], "blocked")
             self.assertNotIn("bootstrap", [call[1] for call in calls if call[0] == "launchctl"])
 
+    def test_find_windows_runner_processes_filters_query_and_identifies_runner(self):
+        from vccp_runtime.host_deployment import _find_windows_runner_processes
+        # CSV with:
+        # 1. Powershell query process running Get-CimInstance (must be filtered out)
+        # 2. Matching runner for owner/repo
+        # 3. Runner for a different repo (must be filtered out)
+        # 4. Duplicate runner for owner/repo
+        # 5. Non-python process
+        csv_header = '"ProcessId","Name","CommandLine"\n'
+        query_proc = '"100","powershell.exe","powershell -NoProfile -NonInteractive -Command Get-CimInstance Win32_Process | ..."\n'
+        valid_runner_1 = '"200","python.exe","C:/python/python.exe -m vccp_runtime.runner --manifest C:/m.json --runtime-config C:/r.json --repo owner/repo --continuous"\n'
+        other_repo_runner = '"300","python.exe","C:/python/python.exe -m vccp_runtime.runner --manifest C:/m.json --runtime-config C:/r.json --repo other/repo --continuous"\n'
+        valid_runner_2 = '"400","python.exe","C:/python/python.exe -m vccp_runtime.runner --manifest C:/m.json --runtime-config C:/r.json --repo owner/repo --continuous"\n'
+        other_proc = '"500","notepad.exe","notepad.exe foo.txt"\n'
+
+        # Test with 0 processes
+        def runner_zero(args, **kwargs):
+            return SimpleNamespace(returncode=0, stdout=csv_header + query_proc + other_repo_runner + other_proc)
+        self.assertEqual(_find_windows_runner_processes("owner/repo", runner=runner_zero), [])
+
+        # Test with 1 matching process
+        def runner_one(args, **kwargs):
+            return SimpleNamespace(returncode=0, stdout=csv_header + query_proc + valid_runner_1 + other_repo_runner)
+        self.assertEqual(_find_windows_runner_processes("owner/repo", runner=runner_one), [200])
+
+        # Test with duplicate matching processes
+        def runner_duplicate(args, **kwargs):
+            return SimpleNamespace(returncode=0, stdout=csv_header + query_proc + valid_runner_1 + valid_runner_2)
+        self.assertEqual(_find_windows_runner_processes("owner/repo", runner=runner_duplicate), [200, 400])
+
+        # Test with runtime_config matching
+        self.assertEqual(_find_windows_runner_processes("owner/repo", runtime_config_path="C:/r.json", runner=runner_one), [200])
+        self.assertEqual(_find_windows_runner_processes("owner/repo", runtime_config_path="C:/different.json", runner=runner_one), [])
+
     def test_reconcile_windows_sidecar_creates_definition(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
@@ -261,9 +295,23 @@ class HostDeploymentTests(unittest.TestCase):
             config.write_text("{}", encoding="utf-8")
             sidecar = root / "sidecar.json"
             calls = []
+            
+            # Initial check: no process running
+            # Final check (after sidecar written and readiness passed): 1 process running
+            csv_empty = '"ProcessId","Name","CommandLine"\n'
+            csv_running = (
+                '"ProcessId","Name","CommandLine"\n'
+                f'"501","python.exe","C:/python/python.exe -m vccp_runtime.runner --manifest {manifest.resolve().as_posix()} --runtime-config {config.resolve().as_posix()} --repo owner/repo --continuous --poll-interval 15"\n'
+            )
+            observations = iter([csv_empty, csv_running])
             def runner(args, **kwargs):
                 calls.append(args)
-                return SimpleNamespace(returncode=1, stdout="", stderr="")
+                if args[:4] == ["powershell", "-NoProfile", "-NonInteractive", "-Command"]:
+                    try:
+                        return SimpleNamespace(returncode=0, stdout=next(observations), stderr="")
+                    except StopIteration:
+                        return SimpleNamespace(returncode=0, stdout=csv_running, stderr="")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
 
             result = reconcile_windows_sidecar(
                 repo="owner/repo", runtime_root=str(runtime),
@@ -272,12 +320,35 @@ class HostDeploymentTests(unittest.TestCase):
                 sidecar_path=str(sidecar), readiness=lambda: {"status": "ready"}, runner=runner
             )
             self.assertEqual(result["status"], "running")
+            self.assertEqual(result["pid"], 501)
             self.assertEqual(result["mechanism"], "windows_sidecar")
             self.assertTrue(sidecar.is_file())
             content = json.loads(sidecar.read_text(encoding="utf-8"))
             self.assertEqual(content["command"], "C:/python/python.exe")
             self.assertIn("--repo", content["args"])
             self.assertEqual(content["env"]["PYTHONPATH"], runtime.resolve().as_posix())
+
+    def test_reconcile_windows_sidecar_blocks_if_runner_process_not_running(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            manifest = root / "manifest.json"
+            manifest.write_text("{}", encoding="utf-8")
+            config = root / "runtime.json"
+            config.write_text("{}", encoding="utf-8")
+            sidecar = root / "sidecar.json"
+            def runner(args, **kwargs):
+                return SimpleNamespace(returncode=0, stdout='"ProcessId","Name","CommandLine"\n', stderr="")
+
+            result = reconcile_windows_sidecar(
+                repo="owner/repo", runtime_root=str(runtime),
+                manifest_path=str(manifest), runtime_config_path=str(config),
+                database_path=str(root / "state.sqlite"), python_executable=r"C:\python\python.exe",
+                sidecar_path=str(sidecar), readiness=lambda: {"status": "ready"}, runner=runner
+            )
+            self.assertEqual(result["status"], "blocked")
+            self.assertIn("not running", result["reason"])
 
     def test_remove_windows_sidecar_removes_proven_sidecar(self):
         with tempfile.TemporaryDirectory() as root:

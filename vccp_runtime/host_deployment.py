@@ -15,6 +15,13 @@ import time
 from .runner import RuntimeLock, RuntimeAlreadyRunning
 
 
+def _normalize_path_str(p: str | Path) -> str:
+    s = str(p).strip().replace("\\", "/")
+    if re.match(r"^[A-Za-z]:/", s):
+        return s
+    return Path(p).expanduser().resolve().as_posix()
+
+
 def _run(command, runner, **kwargs):
     return runner(command, text=True, capture_output=True, check=False, timeout=20, **kwargs)
 
@@ -265,51 +272,56 @@ def _valid_existing_sidecar(sidecar_path: Path, repo: str) -> bool:
             and "--repo" in args and args[args.index("--repo") + 1:args.index("--repo") + 2] == [repo])
 
 
-def _find_windows_runner_processes(repo: str, runner=subprocess.run) -> list[int]:
-    # Query running processes matching vccp_runtime.runner and repo
-    result = _run(["tasklist", "/FO", "CSV", "/V"], runner)
-    pids = []
-    if result.returncode == 0 and result.stdout:
-        import csv
-        import io
-        try:
-            reader = csv.reader(io.StringIO(result.stdout))
-            headers = next(reader, None)
-            for row in reader:
-                if len(row) >= 2:
-                    image_name = row[0].casefold()
-                    pid_str = row[1]
-                    window_title = row[-1] if len(row) > 8 else ""
-                    if "python" in image_name:
-                        try:
-                            pid = int(pid_str)
-                            # Verify full commandline with wmic or powershell if needed
-                            pids.append(pid)
-                        except ValueError:
-                            pass
-        except Exception:
-            pass
-    # Refine pids using powershell or wmic to match exact repo and module
+def _find_windows_runner_processes(repo: str, runtime_config_path: str | None = None, runner=subprocess.run) -> list[int]:
+    """Query running processes matching vccp_runtime.runner, repo, and optionally runtime config."""
+    import csv
+    import io
+    import shlex
+
+    # Query running processes using powershell Get-CimInstance formatted as CSV
+    ps_cmd = [
+        "powershell", "-NoProfile", "-NonInteractive", "-Command",
+        "Get-CimInstance Win32_Process | Select-Object ProcessId, Name, CommandLine | ConvertTo-Csv -NoTypeInformation"
+    ]
+    ps_res = _run(ps_cmd, runner)
+    if ps_res.returncode != 0 or not ps_res.stdout:
+        return []
+
+    norm_config = _normalize_path_str(runtime_config_path) if runtime_config_path else None
     matching_pids = []
-    if pids:
-        # Use powershell Get-CimInstance to check commandline
-        ps_cmd = [
-            "powershell", "-NoProfile", "-NonInteractive", "-Command",
-            f"Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*vccp_runtime.runner*' -and $_.CommandLine -like '*{repo}*' }} | Select-Object -ExpandProperty ProcessId"
-        ]
-        ps_res = _run(ps_cmd, runner)
-        if ps_res.returncode == 0 and ps_res.stdout:
-            for line in ps_res.stdout.strip().splitlines():
-                line = line.strip()
-                if line.isdigit():
-                    matching_pids.append(int(line))
-        else:
-            # Fallback if powershell CimInstance was not used
-            for pid in pids:
-                chk = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                            f"(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').CommandLine"], runner)
-                if chk.returncode == 0 and "vccp_runtime.runner" in (chk.stdout or "") and repo in (chk.stdout or ""):
-                    matching_pids.append(pid)
+    try:
+        reader = csv.reader(io.StringIO(ps_res.stdout.strip()))
+        header = next(reader, None)
+        for row in reader:
+            if len(row) < 3:
+                continue
+            pid_str, name, cmd = row[0], row[1], row[2]
+            if not ("python" in (name or "").lower() or "py" in (name or "").lower()):
+                continue
+            if not cmd or "Get-CimInstance" in cmd or "-Command" in cmd:
+                continue
+            try:
+                tokens = shlex.split(cmd, posix=False)
+            except ValueError:
+                continue
+            if "-c" in tokens:
+                continue
+            if "-m" not in tokens or tokens[tokens.index("-m") + 1:tokens.index("-m") + 2] != ["vccp_runtime.runner"]:
+                continue
+            if "--repo" not in tokens or tokens[tokens.index("--repo") + 1:tokens.index("--repo") + 2] != [repo]:
+                continue
+            if norm_config:
+                if "--runtime-config" not in tokens:
+                    continue
+                cfg = tokens[tokens.index("--runtime-config") + 1:tokens.index("--runtime-config") + 2]
+                if not cfg or _normalize_path_str(cfg[0].strip("\"'")).casefold() != norm_config.casefold():
+                    continue
+            try:
+                matching_pids.append(int(pid_str))
+            except ValueError:
+                pass
+    except Exception:
+        pass
     return matching_pids
 
 
@@ -323,26 +335,26 @@ def reconcile_windows_sidecar(*, repo: str, runtime_root: str, manifest_path: st
     if not re.fullmatch(r"[^/]+/[^/]+", repo) or not runtime.is_dir():
         return {"status": "blocked", "reason": "Consumer identity or exact runtime checkout is unavailable"}
 
-    manifest_file = Path(manifest_path).expanduser().resolve()
-    config_file = Path(runtime_config_path).expanduser().resolve()
-    norm_py = Path(python_executable).resolve().as_posix()
-    norm_manifest = manifest_file.as_posix()
-    norm_config = config_file.as_posix()
-    norm_runtime = runtime.as_posix()
+    manifest_file = _normalize_path_str(manifest_path)
+    config_file = _normalize_path_str(runtime_config_path)
+    norm_py = _normalize_path_str(python_executable)
+    norm_manifest = manifest_file
+    norm_config = config_file
+    norm_runtime = _normalize_path_str(runtime)
 
     expected_args = ["-m", "vccp_runtime.runner", "--manifest", norm_manifest,
                      "--runtime-config", norm_config, "--repo", repo,
                      "--continuous", "--poll-interval", "15"]
     expected_env = {"PYTHONPATH": norm_runtime, "PYTHONUTF8": "1"}
 
-    existing_pids = _find_windows_runner_processes(repo, runner)
+    existing_pids = _find_windows_runner_processes(repo, runtime_config_path, runner)
 
     if destination.is_file():
         if not _valid_existing_sidecar(destination, repo):
             return {"status": "blocked", "reason": "existing sidecar file belongs to another job"}
         try:
             current = json.loads(destination.read_text(encoding="utf-8"))
-            current_cmd = Path(current.get("command", "")).as_posix()
+            current_cmd = _normalize_path_str(current.get("command", ""))
             current_args = current.get("args")
             current_env = current.get("env") or {}
             if (current_cmd.casefold() == norm_py.casefold()
@@ -365,7 +377,7 @@ def reconcile_windows_sidecar(*, repo: str, runtime_root: str, manifest_path: st
         # Wait up to 5s for lock to be released
         time.sleep(0.5)
         for _ in range(20):
-            if not _find_windows_runner_processes(repo, runner):
+            if not _find_windows_runner_processes(repo, runtime_config_path, runner):
                 break
             time.sleep(0.2)
         else:
@@ -402,8 +414,19 @@ def reconcile_windows_sidecar(*, repo: str, runtime_root: str, manifest_path: st
     except RuntimeAlreadyRunning:
         return {"status": "blocked", "reason": "Consumer RuntimeLock is still held after stopping prior Runner"}
 
+    # Verify that the Runner process is observed running under the reconciled config
+    observed_pids = []
+    for _ in range(20):
+        observed_pids = _find_windows_runner_processes(repo, runtime_config_path, runner)
+        if len(observed_pids) == 1:
+            break
+        time.sleep(0.2)
+
+    if len(observed_pids) != 1:
+        return {"status": "blocked", "reason": "reconciled Consumer Runner process is not running"}
+
     return {"status": "running", "mechanism": "windows_sidecar", "sidecar_path": str(destination),
-            "revision": runtime.name, "runtime_root": str(runtime)}
+            "pid": observed_pids[0], "revision": runtime.name, "runtime_root": str(runtime)}
 
 
 def remove_windows_sidecar(*, repo: str, database_path: str, runtime_config_path: str,
@@ -426,12 +449,12 @@ def remove_windows_sidecar(*, repo: str, database_path: str, runtime_config_path
             current = json.loads(destination.read_text(encoding="utf-8"))
             args = current.get("args", [])
             configured_runtime = args[args.index("--runtime-config") + 1]
-            if Path(configured_runtime).resolve() != Path(runtime_config_path).expanduser().resolve():
+            if _normalize_path_str(configured_runtime).casefold() != _normalize_path_str(runtime_config_path).casefold():
                 return {"status": "blocked", "reason": "Sidecar runtime config does not match the requested Consumer config"}
         except (OSError, ValueError, IndexError, TypeError, json.JSONDecodeError):
             return {"status": "blocked", "reason": "Sidecar runtime config ownership cannot be proven"}
 
-    existing_pids = _find_windows_runner_processes(repo, runner)
+    existing_pids = _find_windows_runner_processes(repo, runtime_config_path, runner)
     if existing_pids:
         for pid in existing_pids:
             stopped = _run(["taskkill", "/PID", str(pid), "/T", "/F"], runner)
@@ -439,7 +462,7 @@ def remove_windows_sidecar(*, repo: str, database_path: str, runtime_config_path
                 return {"status": "blocked", "reason": f"Consumer Runner process {pid} could not be stopped"}
         time.sleep(0.5)
         for _ in range(20):
-            if not _find_windows_runner_processes(repo, runner):
+            if not _find_windows_runner_processes(repo, runtime_config_path, runner):
                 break
             time.sleep(0.2)
         else:

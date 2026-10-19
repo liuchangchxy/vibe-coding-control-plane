@@ -989,23 +989,34 @@ class _Store:
                     break
             if not has_push:
                 # Historical compatibility fallback: if controlled_pushes has 0 rows for this repo,
-                # verify that the resulting head SHA matches the candidate and is anchored by an authorized,
-                # confirmed attempt in this exact flow.
+                # require:
+                # 1. An existing pending grant in repair_continuations (authorizing this continuation retry).
+                # 2. A matching BUDGET_EXHAUSTED attempt with ordinal > 0.
+                # 3. All prior attempts in history have launch_outcome == "confirmed" and valid execution_id.
+                # 4. The attempt preceding BUDGET_EXHAUSTED has resulting_head_sha == candidate.head_sha.
+                pending_grant = connection.execute(
+                    "SELECT 1 FROM repair_continuations WHERE repo=? AND issue_number=? AND pr_number=? "
+                    "AND head_sha=? AND cause_type=? AND cause_id=? AND activated=0 AND consumed_at IS NULL",
+                    (repo, candidate.issue_number, candidate.pr_number, candidate.head_sha.lower(),
+                     candidate.cause_type, candidate.cause_id),
+                ).fetchone()
                 repo_push_count = connection.execute(
                     "SELECT COUNT(*) AS count FROM controlled_pushes WHERE repo=?", (repo,)
                 ).fetchone()["count"]
-                if repo_push_count == 0:
-                    matching_attempt = any(
-                        row["pr_number"] == candidate.pr_number
-                        and row["branch"] == candidate.branch
-                        and (row["resulting_head_sha"] or "").lower() == candidate.head_sha.lower()
-                        and row["launch_outcome"] == "confirmed"
-                        and row["execution_id"]
-                        for row in [*initial, *dispatched]
-                        if "resulting_head_sha" in row.keys()
-                    )
-                    if matching_attempt:
-                        has_push = True
+                if pending_grant and repo_push_count == 0:
+                    exhausted_attempt = connection.execute(
+                        "SELECT repair_ordinal FROM attempts WHERE attempt_id=?", (exhausted["attempt_id"],)
+                    ).fetchone()
+                    ordinal = exhausted_attempt["repair_ordinal"] if exhausted_attempt else None
+                    if ordinal and ordinal > 0 and len(dispatched) >= 1:
+                        preceding = dispatched[-1]
+                        preceding_head = (preceding["resulting_head_sha"] or "").lower() if "resulting_head_sha" in preceding.keys() else ""
+                        if (preceding["pr_number"] == candidate.pr_number
+                                and preceding["branch"] == candidate.branch
+                                and preceding_head == candidate.head_sha.lower()
+                                and preceding["launch_outcome"] == "confirmed"
+                                and preceding["execution_id"]):
+                            has_push = True
             valid = (flow is not None and not flow["trusted"] and not flow["initial_confirmed"]
                      and flow["repair_budget_known"] and flow["repair_count"] == len(dispatched)
                      and flow["pr_number"] == candidate.pr_number and flow["branch"] == candidate.branch
