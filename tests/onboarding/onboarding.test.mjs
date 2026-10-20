@@ -1106,6 +1106,37 @@ test("an upgrade rerun keeps its merged target when canonical main has advanced 
   });
 });
 
+test("deploy resumes host reconciliation when an upgrade declaration is already satisfied", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const initial = await createOnboardingPlan({ repo: REPO, root, input: validInput(REV_A), github });
+    await applyOnboardingPlan({ plan: initial, root, github });
+    const upgrade = await createOnboardingPlan({ repo: REPO, root, github, revisionProposal: REV_B });
+    await applyOnboardingPlan({ plan: upgrade, root, github });
+    const configPath = path.join(root, "runtime.json");
+    await writeFile(configPath, JSON.stringify({ ...localEnrollment(root), providers: [
+      { key: "antigravity", type: "antigravity", executable: "/bin/true" },
+      { key: "claude_code", type: "claude_code", executable: "/bin/true" },
+    ], implementer_provider: "antigravity", reviewer_provider: "claude_code",
+      reviewer_github_identity: "reviewer-user", upgrade_target: { repository: REPO,
+        revision: REV_B, from_revision: REV_A } }));
+    let deployed;
+    let output = "";
+    const code = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root,
+      "--runtime-config", configPath], {
+      stdout: { write: (text) => { output += text; } },
+      stderr: { write: (text) => assert.fail(text) }, githubFactory: () => github,
+      runtimeRevision: REV_B,
+      maintenancePublisher: async () => assert.fail("satisfied upgrade must not publish another maintenance PR"),
+      hostDeployer: async (request) => { deployed = request; return { status: "running", revision: REV_B }; },
+    });
+    assert.equal(code, 0, output);
+    assert.equal(JSON.parse(output).overall_status, "RUNNING");
+    assert.equal(deployed.manifest.vccp.revision, REV_B);
+    assert.equal(JSON.parse(await readFile(configPath, "utf8")).upgrade_target, undefined);
+  });
+});
+
 test("deploy allows an explicit provider rebind when no Consumer execution is active", async () => {
   await withRepo(async (root) => {
     const github = new FakeGitHub();
