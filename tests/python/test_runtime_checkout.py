@@ -43,13 +43,23 @@ class RuntimeCheckoutTests(unittest.TestCase):
         self.assertEqual(ensure_runtime_checkout(self.source, self.root / "runtimes", self.first),
                          first_path)
 
-    def test_existing_runtime_drift_fails_closed_without_repairing_it(self):
+    def test_dirty_managed_runtime_is_recreated_at_the_pinned_revision(self):
         runtime = ensure_runtime_checkout(self.source, self.root / "runtimes", self.first)
         (runtime / "runtime.txt").write_text("local edit\n")
 
-        with self.assertRaisesRegex(ValueError, "existing revision checkout is dirty"):
-            ensure_runtime_checkout(self.source, self.root / "runtimes", self.first)
-        self.assertEqual((runtime / "runtime.txt").read_text(), "local edit\n")
+        repaired = ensure_runtime_checkout(self.source, self.root / "runtimes", self.first)
+        self.assertEqual(repaired, runtime)
+        self.assertEqual(git(repaired, "rev-parse", "HEAD"), self.first)
+        self.assertEqual(git(repaired, "status", "--porcelain"), "")
+        self.assertEqual((repaired / "runtime.txt").read_text(), "first\n")
+
+    def test_stale_managed_runtime_is_recreated_at_the_pinned_revision(self):
+        runtime = ensure_runtime_checkout(self.source, self.root / "runtimes", self.first)
+        git(runtime, "checkout", self.second)
+        repaired = ensure_runtime_checkout(self.source, self.root / "runtimes", self.first)
+        self.assertEqual(git(repaired, "rev-parse", "HEAD"), self.first)
+        self.assertEqual(git(repaired, "rev-parse", "--abbrev-ref", "HEAD"), "HEAD")
+        self.assertEqual(git(repaired, "status", "--porcelain"), "")
 
     def test_rejects_non_full_or_unavailable_revision(self):
         with self.assertRaisesRegex(ValueError, "full 40-character"):

@@ -45,7 +45,9 @@ class FakeAPI:
             if "agent-working" in path: return self.discovery["agent-working"]
             if "changes-requested" in path: return self.discovery["changes-requested"]
             return []
-        if path.endswith("/reviews?per_page=100"): return self.reviews
+        if "/reviews?per_page=100&page=" in path:
+            page = int(path.rsplit("page=", 1)[1])
+            return self.reviews[(page - 1) * 100:page * 100]
         if "/check-runs?per_page=100" in path:
             return {"total_count": len(self.check_runs), "check_runs": self.check_runs}
         if "/pulls/" in path: return self.pr
@@ -155,6 +157,19 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual((latest.formal_review_state, latest.formal_review_id), ("APPROVED", "5"))
         api.canonical_events = []
         self.assertIsNone(GitHubWorkflowAdapter(api, FakeWriter(), MANIFEST).observe("o/r", 1).pr_number)
+
+    def test_formal_reviews_are_read_until_the_last_page(self):
+        api = linked_api()
+        api.reviews = [{"id": index, "state": "COMMENTED", "commit_id": "b" * 40,
+                        "submitted_at": str(index)} for index in range(100)]
+        api.reviews.append({"id": 101, "state": "APPROVED", "commit_id": SHA,
+                            "submitted_at": "101"})
+        snapshot = GitHubWorkflowAdapter(api, FakeWriter(), MANIFEST).observe("o/r", 1)
+        self.assertEqual(snapshot.formal_review_id, "101")
+        self.assertEqual([path for path in api.reads if "/reviews?" in path], [
+            "/repos/o/r/pulls/12/reviews?per_page=100&page=1",
+            "/repos/o/r/pulls/12/reviews?per_page=100&page=2",
+        ])
 
     def test_snapshot_exposes_only_exact_head_checks_and_native_merged_fact(self):
         api = linked_api(review=False)

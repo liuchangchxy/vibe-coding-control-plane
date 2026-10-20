@@ -59,6 +59,11 @@ class FakeWorkflow:
         return True
 
     def restore_repair_coordination_state(self, repo, issue, new_state, expected_revision):
+        snapshot = self.observe(repo, issue)
+        if (snapshot.coordination_state == new_state and snapshot.active_labels == (new_state,)
+                and not snapshot.terminal_labels and snapshot.issue_open and snapshot.frozen_spec
+                and not snapshot.canceled):
+            return True
         return self.transition_coordination_state(repo, issue, "needs-human", new_state, expected_revision)
 
     def discover_active(self, repo):
@@ -247,11 +252,15 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(pending["status"], "authorized_pending_activation")
         self.assertTrue(self.workflow.restore_repair_coordination_state(
             self.repo, self.issue, "changes-requested", needs_human.revision))
-        race = self.core.reconcile_once(self.repo, "owner", now=199)
-        self.assertEqual(race["items"][-1]["status"], "continuation_activation_pending")
+        # Simulate process exit after GitHub promotion but before SQLite activation.
+        promoted = replace(needs_human, revision="r9+", coordination_state="changes-requested",
+                          terminal_labels=(), active_labels=("changes-requested",))
+        self.workflow.snapshots[(self.repo, self.issue)] = promoted
+        race = self.core.authorize_repair_continuation(candidate, "maintainer")
+        self.assertEqual(race["status"], "authorized")
         self.assertEqual(self.core.store.attempt("legacy-budget")["phase"], "BUDGET_EXHAUSTED")
         self.assertEqual(self.core.authorize_repair_continuation(candidate, "maintainer")["status"],
-                         "authorized")
+                         "already_authorized")
         restored = self.core.store.flow(self.repo, self.issue)
         self.assertEqual((restored["trusted"], restored["initial_confirmed"], restored["repair_count"],
                           restored["repair_budget_known"]), (1, 1, 3, 1))
@@ -423,10 +432,16 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(driver.advance_once(self.repo, "owner", 102)["items"][0]["status"],
                          "WAITING_REVIEW")
 
-    def test_infrastructure_and_ambiguous_ci_failures_fail_closed(self):
+    def test_infrastructure_ci_failure_reobserves_twice_before_terminal(self):
         self.update(check_runs=self.failure(conclusion="timed_out"))
-        result = self.driver().advance_once(self.repo, "owner", 100)
-        self.assertEqual(result["items"][0]["status"], "infra-blocked")
+        driver = self.driver()
+        first = driver.advance_once(self.repo, "owner", 100)
+        self.assertEqual(first["items"][0]["status"], "WAITING_CI")
+        self.assertEqual(first["items"][0]["infrastructure_retry"], 1)
+        second = driver.advance_once(self.repo, "owner", 101)
+        self.assertEqual(second["items"][0]["infrastructure_retry"], 2)
+        third = driver.advance_once(self.repo, "owner", 102)
+        self.assertEqual(third["items"][0]["status"], "infra-blocked")
         self.assertEqual(len(self.implementer.launches), 1)
 
         self.tearDown(); self.setUp()
@@ -845,6 +860,37 @@ class LifecycleTests(unittest.TestCase):
         connection.commit(); connection.close()
         self.update(check_runs=self.failure())
         result = self.driver().advance_once(self.repo, "owner", 100)
+        self.assertEqual(result["items"][0]["status"], "needs-human")
+        self.assertEqual(len(self.implementer.launches), 1)
+
+    def test_legacy_flow_is_reconstructed_from_exact_current_pr_and_complete_attempt_history(self):
+        connection = self.core.store._connect()
+        connection.execute("UPDATE flows SET trusted=0,initial_confirmed=0,repair_budget_known=0 "
+                           "WHERE repo=? AND issue_number=?", (self.repo, self.issue))
+        connection.commit()
+        connection.close()
+        self.update(check_runs=self.failure())
+
+        result = self.driver().advance_once(self.repo, "owner", 100)
+
+        flow = self.core.store.flow(self.repo, self.issue)
+        self.assertTrue(flow["trusted"])
+        self.assertTrue(flow["initial_confirmed"])
+        self.assertTrue(flow["repair_budget_known"])
+        self.assertEqual(result["items"][0]["trigger"], "ci_repair")
+        self.assertEqual(result["items"][0]["status"], "launched")
+
+    def test_legacy_flow_is_not_reconstructed_when_public_head_moved_past_local_history(self):
+        connection = self.core.store._connect()
+        connection.execute("UPDATE flows SET trusted=0,initial_confirmed=0 WHERE repo=? AND issue_number=?",
+                           (self.repo, self.issue))
+        connection.commit()
+        connection.close()
+        self.update(pr_head_sha=SHA_B, check_runs=self.failure(SHA_B))
+
+        result = self.driver().advance_once(self.repo, "owner", 100)
+
+        self.assertFalse(self.core.store.flow(self.repo, self.issue)["trusted"])
         self.assertEqual(result["items"][0]["status"], "needs-human")
         self.assertEqual(len(self.implementer.launches), 1)
 

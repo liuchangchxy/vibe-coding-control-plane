@@ -104,6 +104,10 @@ class FakeWorkflow:
             return True
 
     def restore_repair_coordination_state(self, repo, issue_number, new_state, expected_revision):
+        if (self.current.coordination_state in {new_state, "agent-working", "changes-requested"} and not self.current.terminal_labels
+                and new_state in {self.current.coordination_state, "changes-requested"}
+                and self.current.issue_open and self.current.frozen_spec):
+            return True
         return self.transition_coordination_state(repo, issue_number, "needs-human", new_state, expected_revision)
 
 
@@ -515,7 +519,7 @@ class RuntimeCoreTests(unittest.TestCase):
         resumed = self.core.dispatch_repair(candidate)
         self.assertEqual((resumed["status"], resumed["ordinal"]), ("launched", 4))
 
-    def test_three_continuations_cumulate_and_fourth_cannot_admit_attempt(self):
+    def test_explicit_continuations_have_no_arbitrary_lifetime_cap(self):
         self.establish_flow()
         # Five automatic repairs establish the global stop, including CI noise.
         for ordinal in range(1, 6):
@@ -549,8 +553,11 @@ class RuntimeCoreTests(unittest.TestCase):
         self.workflow.set_snapshot(repair_snapshot(denied, state="changes-requested", revision=70))
         self.assertEqual(self.core.dispatch_repair(denied)["status"], "budget_exhausted")
         self.assertEqual(self.core.authorize_repair_continuation(denied, "maintainer")["status"],
-                         "continuation_limit_exhausted")
-        self.assertEqual(len(self.implementer.requests), 9)  # initial plus eight repairs
+                         "authorized")
+        self.workflow.set_snapshot(repair_snapshot(denied, state="changes-requested", revision=71))
+        result = self.core.dispatch_repair(denied)
+        self.assertEqual((result["status"], result["ordinal"]), ("launched", 9))
+        self.assertEqual(len(self.implementer.requests), 10)  # initial plus nine repairs
 
     def test_grant_for_one_head_and_cause_does_not_expand_automatic_budget(self):
         self.establish_flow()

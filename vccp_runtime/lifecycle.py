@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+import re
 
 from .core import RepairCandidate, _ci_cause_is_current
 
@@ -266,6 +267,13 @@ class LifecycleDriver:
                 self.core.reconcile_once(repo_key, owner_id, current)
                 results.append({"issue": issue, "status": "cancelled_or_terminal"})
                 continue
+            if (snapshot.canonical_relationship_valid and snapshot.canonical_link_count == 1
+                    and snapshot.open_linked_pr_count == 1 and snapshot.pr_open
+                    and snapshot.pr_linked_issue == issue and snapshot.pr_branch and snapshot.pr_head_sha):
+                flow = self.core.store.flow(repo_key, issue)
+                if flow and not (flow.get("trusted") and flow.get("initial_confirmed")):
+                    self.core.store.normalize_legacy_flow(repo_key, issue, snapshot.pr_number,
+                        snapshot.pr_branch, snapshot.pr_head_sha.lower())
             # A continuation is a durable, exact-head rediscovery token for a
             # terminalized flow. Re-enter only the original PR and formal cause.
             pending = [row for row in self.core.store.active_continuations(repo_key)
@@ -327,8 +335,20 @@ class LifecycleDriver:
                 results.append({"issue": issue, "trigger": "ci_repair", **self.core.dispatch_repair(candidate)})
                 continue
             if check_state == "infrastructure":
-                results.append(self._terminal(repo_key, issue, snapshot, "infra-blocked", current,
-                                              "explicit_infrastructure_failure"))
+                prior = self.core.store.lifecycle_state(repo_key, issue)
+                match = re.fullmatch(r"infrastructure-retry:(\d+)",
+                    (prior or {}).get("outcome") or "")
+                retries = int(match.group(1)) if match else 0
+                if retries >= 2:
+                    results.append(self._terminal(repo_key, issue, snapshot, "infra-blocked", current,
+                                                  "explicit_infrastructure_failure"))
+                else:
+                    deadline = self._set_waiting(repo_key, issue, "WAITING_CI", head, current)
+                    self.core.store.set_lifecycle(repo_key, issue, "WAITING_CI", head, current,
+                                                  self.timeouts["waiting_ci"],
+                                                  outcome=f"infrastructure-retry:{retries + 1}")
+                    results.append({"issue": issue, "status": "WAITING_CI", "head": head,
+                                    "deadline_at": deadline, "infrastructure_retry": retries + 1})
                 continue
             if check_state == "ambiguous":
                 results.append(self._terminal(repo_key, issue, snapshot, "needs-human", current,

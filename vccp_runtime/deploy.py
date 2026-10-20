@@ -3,13 +3,23 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
+import re
 from pathlib import Path
 import subprocess
 import sys
 
 from .activation import qualify_activation
-from .host_deployment import reconcile_macos_launch_agent, remove_macos_launch_agent
+from .host_deployment import (inspect_windows_task, reconcile_macos_launch_agent,
+                              reconcile_windows_task, remove_macos_launch_agent,
+                              remove_windows_task)
 from .runtime_checkout import ensure_runtime_checkout
+
+
+def _macos_dispatcher_label(repo: str) -> str:
+    slug = "-".join(re.sub(r"[^a-z0-9-]", "-", part.casefold()).strip("-") for part in repo.split("/"))
+    suffix = hashlib.sha256(repo.casefold().encode()).hexdigest()[:10]
+    return f"com.vccp.{slug[:48]}-{suffix}-dispatcher"
 
 
 def deploy_host(*, repo: str, manifest: dict, local_config: dict,
@@ -20,6 +30,28 @@ def deploy_host(*, repo: str, manifest: dict, local_config: dict,
     revision = manifest.get("vccp", {}).get("revision")
     runtime_root = ensure_runtime_checkout(source_root,
         runtimes_root or str(Path.home() / ".vccp" / "runtimes"), revision)
+    current = subprocess.run(["git", "-C", str(Path(source_root).expanduser()), "rev-parse", "--verify", "HEAD"],
+                              capture_output=True, text=True, timeout=15)
+    if current.returncode != 0:
+        return {"status": "blocked", "revision": revision, "runtime_root": str(runtime_root),
+                "reason": "Controller source revision could not be verified"}
+    if current.stdout.strip().lower() != str(revision).lower():
+        request = {"repo": repo, "manifest": manifest, "local_config": local_config,
+                   "manifest_path": manifest_path, "runtime_config_path": runtime_config_path,
+                   "source_root": str(runtime_root), "runtimes_root": runtimes_root,
+                   "platform": platform, "host": host}
+        selected_python = str(runtime_root / (".venv/Scripts/python.exe" if os.name == "nt" else ".venv/bin/python"))
+        if not Path(selected_python).is_file():
+            selected_python = sys.executable
+        exact = runner([selected_python, "-m", "vccp_runtime.deploy"], cwd=str(runtime_root),
+                       input=json.dumps(request), capture_output=True, text=True, timeout=120)
+        try:
+            result = json.loads(exact.stdout)
+        except (TypeError, json.JSONDecodeError):
+            return {"status": "blocked", "revision": revision, "runtime_root": str(runtime_root),
+                    "reason": f"pinned Runtime deployment failed ({exact.returncode})"}
+        return {**result, "controller_revision": current.stdout.strip().lower(),
+                "revision": revision, "runtime_root": str(runtime_root)}
     preflight = (readiness(runtime_root) if readiness else
                  qualify_activation(manifest, local_config, repo, host=host, check_runtime_lock=False))
     if not isinstance(preflight, dict) or preflight.get("status") != "ready":
@@ -31,8 +63,7 @@ def deploy_host(*, repo: str, manifest: dict, local_config: dict,
     selected_platform = platform or sys.platform
     if selected_platform == "darwin":
         dispatcher = local_config.get("dispatcher") or {}
-        slug = repo.split("/")[-1].lower().replace("_", "-")
-        label = dispatcher.get("label", f"com.vccp.{slug}-dispatcher")
+        label = dispatcher.get("label", _macos_dispatcher_label(repo))
         plist_path = dispatcher.get("plist_path", str(Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"))
         readiness_result = {}
         def readiness_after_stop():
@@ -47,8 +78,11 @@ def deploy_host(*, repo: str, manifest: dict, local_config: dict,
         return {**result, "revision": revision, "runtime_root": str(runtime_root),
                 "readiness": readiness_result.get("value")}
     if selected_platform == "win32":
-        return {"status": "blocked", "revision": revision, "runtime_root": str(runtime_root),
-                "reason": "no verified Windows resident host reconciler is configured"}
+        result = (host_reconciler or reconcile_windows_task)(repo=repo, runtime_root=str(runtime_root),
+            manifest_path=manifest_path, runtime_config_path=runtime_config_path,
+            python_executable=sys.executable, readiness=full_readiness, runner=runner)
+        return {**result, "revision": revision, "runtime_root": str(runtime_root),
+                "readiness": result.get("readiness")}
     return {"status": "blocked", "revision": revision, "runtime_root": str(runtime_root),
             "reason": f"unsupported resident host platform: {selected_platform}"}
 
@@ -58,8 +92,7 @@ def remove_host(*, repo: str, local_config: dict, runtime_config_path: str,
     selected_platform = platform or sys.platform
     if selected_platform == "darwin":
         dispatcher = local_config.get("dispatcher") or {}
-        slug = repo.split("/")[-1].lower().replace("_", "-")
-        label = dispatcher.get("label", f"com.vccp.{slug}-dispatcher")
+        label = dispatcher.get("label", _macos_dispatcher_label(repo))
         plist_path = dispatcher.get("plist_path", str(Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"))
         try:
             return remove_macos_launch_agent(repo=repo, database_path=local_config["database_path"],
@@ -68,7 +101,11 @@ def remove_host(*, repo: str, local_config: dict, runtime_config_path: str,
         except KeyError:
             return {"status": "blocked", "reason": "runtime config lacks the Consumer database identity required to verify RuntimeLock"}
     if selected_platform == "win32":
-        return {"status": "blocked", "reason": "no verified Windows resident host remover is configured"}
+        try:
+            return remove_windows_task(repo=repo, database_path=local_config["database_path"],
+                runtime_config_path=runtime_config_path, runner=runner)
+        except KeyError:
+            return {"status": "blocked", "reason": "runtime config lacks the Consumer database identity required to verify RuntimeLock"}
     return {"status": "blocked", "reason": f"unsupported resident host platform: {selected_platform}"}
 
 
@@ -76,11 +113,21 @@ def main() -> int:
     try:
         payload = json.load(sys.stdin)
         operation = payload.pop("operation", "deploy")
-        result = remove_host(**payload) if operation == "remove" else deploy_host(**payload)
+        if operation == "remove":
+            result = remove_host(**payload)
+        elif operation == "status":
+            local_config = payload["local_config"]
+            result = inspect_windows_task(repo=payload["repo"],
+                manifest_path=payload["manifest_path"], runtime_config_path=payload["runtime_config_path"])
+        elif operation == "provider-rebind-check":
+            problem = _active_work(payload["repo"], payload["local_config"]["database_path"])
+            result = {"status": "blocked" if problem else "ready", "reason": problem}
+        else:
+            result = deploy_host(**payload)
     except (KeyError, TypeError, ValueError, OSError) as error:
         result = {"status": "blocked", "reason": str(error)}
     print(json.dumps(result, ensure_ascii=False))
-    return 0 if result.get("status") == "running" else 2
+    return 0 if result.get("status") in {"running", "stopped", "already_removed", "removed"} else 2
 
 
 if __name__ == "__main__":

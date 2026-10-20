@@ -7,12 +7,13 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { createOnboardingPlan } from "../../lib/onboarding/plan.mjs";
 import { applyOnboardingPlan, auditConsumer } from "../../lib/onboarding/apply.mjs";
-import { runOnboardingCli } from "../../lib/onboarding/cli.mjs";
+import { fastForwardMergedConsumer, runOnboardingCli } from "../../lib/onboarding/cli.mjs";
 import { createManifest, parseManifest, stringifyManifest, validateManifest } from "../../lib/onboarding/manifest.mjs";
 
 const SOURCE = "liuchangchxy/vibe-coding-control-plane";
 const REV_A = "a".repeat(40);
 const REV_B = "b".repeat(40);
+const REV_C = "c".repeat(40);
 const REPO = "example/consumer";
 
 function validInput(revision = REV_A) {
@@ -47,7 +48,8 @@ class FakeGitHub {
   async getRepository() { return this.repository; }
   async getBranch(repo, name) {
     if (repo === SOURCE && name === "main") return { name, commit: { sha: REV_B } };
-    return repo === REPO && name === "main" ? { name, commit: { sha: "c".repeat(40) } } : null;
+    return repo === REPO && this.repository.branches.includes(name)
+      ? { name, commit: { sha: "c".repeat(40) } } : null;
   }
   async getCommit(source, sha) { return source === SOURCE && this.reachableRevisions.has(sha); }
   async listLabels() { return structuredClone(this.labels); }
@@ -98,6 +100,7 @@ async function readinessReport(root, github, localConfig = localEnrollment(root)
     githubFactory: () => github,
     runtimeQualifier: async () => ({ runtime_activation: { status: "ready", blockers: [] } }),
     runtimeRevision: REV_A,
+    hostInspector: () => ({ status: "not_installed" }),
   });
   return { code, report: JSON.parse(output) };
 }
@@ -123,6 +126,38 @@ test("fresh input creates a read-only plan pinned to a reachable canonical revis
     assert.equal(github.labelCreates.length, 0);
     await assert.rejects(readFile(path.join(root, ".github/control-plane.yml")));
   });
+});
+
+test("deploy checkout convergence fast-forwards only a clean base branch", async () => {
+  const parent = await mkdtemp(path.join(tmpdir(), "vccp-fast-forward-"));
+  try {
+    const remote = path.join(parent, "remote.git");
+    const consumer = path.join(parent, "consumer");
+    const updater = path.join(parent, "updater");
+    execFileSync("git", ["init", "--bare", "-q", remote]);
+    execFileSync("git", ["init", "-q", "-b", "main", consumer]);
+    execFileSync("git", ["-C", consumer, "config", "user.email", "test@example.com"]);
+    execFileSync("git", ["-C", consumer, "config", "user.name", "Test"]);
+    await writeFile(path.join(consumer, "README.md"), "base\n");
+    execFileSync("git", ["-C", consumer, "add", "."]);
+    execFileSync("git", ["-C", consumer, "commit", "-qm", "base"]);
+    execFileSync("git", ["-C", consumer, "remote", "add", "origin", remote]);
+    execFileSync("git", ["-C", consumer, "push", "-qu", "origin", "main"]);
+    execFileSync("git", ["clone", "-q", "--branch", "main", remote, updater]);
+    execFileSync("git", ["-C", updater, "config", "user.email", "test@example.com"]);
+    execFileSync("git", ["-C", updater, "config", "user.name", "Test"]);
+    await writeFile(path.join(updater, "README.md"), "merged\n");
+    execFileSync("git", ["-C", updater, "commit", "-qam", "merged maintenance PR"]);
+    execFileSync("git", ["-C", updater, "push", "-q", "origin", "HEAD:main"]);
+    assert.equal(fastForwardMergedConsumer(consumer, "main"), true);
+    assert.equal((await readFile(path.join(consumer, "README.md"), "utf8")).replace(/\r\n/g, "\n"), "merged\n");
+    await writeFile(path.join(consumer, "README.md"), "local edits\n");
+    await writeFile(path.join(updater, "README.md"), "next merge\n");
+    execFileSync("git", ["-C", updater, "commit", "-qam", "next merge"]);
+    execFileSync("git", ["-C", updater, "push", "-q", "origin", "HEAD:main"]);
+    assert.equal(fastForwardMergedConsumer(consumer, "main"), false);
+    assert.equal(await readFile(path.join(consumer, "README.md"), "utf8"), "local edits\n");
+  } finally { await rm(parent, { recursive: true, force: true }); }
 });
 
 test("clean consumer plans VCCP cleanup creation and an exact managed cleanup is idempotent", async () => {
@@ -153,7 +188,7 @@ test("consumer-owned equivalent cleanup satisfies the capability without a VCCP 
   });
 });
 
-test("EasyExam-shaped terminal-preserving issues.closed cleanup blocks plan, apply, and audit", async () => {
+test("VCCP cleanup does not block or modify an existing issues.closed workflow", async () => {
   await withRepo(async (root) => {
     const github = new FakeGitHub();
     const workflowDir = path.join(root, ".github/workflows");
@@ -183,28 +218,24 @@ test("EasyExam-shaped terminal-preserving issues.closed cleanup blocks plan, app
     assert.equal(github.labelCreates.length, 0);
 
     const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
-    assert.equal(plan.overall_status, "repository_blocked");
+    assert.equal(plan.overall_status, "repository_changes_planned");
     const conflict = plan.items.find((entry) => entry.id === "capability:coordination-label-cleanup");
-    assert.equal(conflict.status, "conflict");
-    assert.equal(conflict.event, "issues.closed");
-    assert.match(conflict.reason, /preserves active coordination labels/);
-    assert.match(conflict.reason, /VCCP requires active labels to be removed after every Issue close/);
+    assert.equal(conflict.status, "satisfied");
+    assert.equal(conflict.provider, "consumer");
 
     const applied = await applyOnboardingPlan({ plan, root, github });
-    assert.equal(applied.overall_status, "repository_blocked");
-    assert.deepEqual(applied.applied, []);
-    assert.equal(github.labelCreates.length, 0);
-    await assert.rejects(readFile(path.join(root, ".github/control-plane.yml")));
+    assert.equal(applied.overall_status, "repository_ready");
+    assert.deepEqual(await readFile(path.join(workflowDir, "coordination-label-cleanup.yml"), "utf8"), cleanupWorkflow);
 
     await mkdir(path.join(root, ".github"), { recursive: true });
     await writeFile(path.join(root, ".github/control-plane.yml"), stringifyManifest(createManifest(validInput())));
     const audit = await auditConsumer({ repo: REPO, root, github });
-    assert.equal(audit.overall_status, "repository_blocked");
-    assert.ok(audit.items.some((entry) => entry.id === "capability:coordination-label-cleanup" && entry.status === "conflict"));
+    assert.equal(audit.overall_status, "repository_ready");
+    assert.ok(audit.items.some((entry) => entry.id === "capability:coordination-label-cleanup" && entry.status === "satisfied"));
   });
 });
 
-test("direct-only repository-relative cleanup reference blocks an incompatible issues.closed handler", async () => {
+test("issues.closed cleanup with repository-relative script is preserved and accepted", async () => {
   await withRepo(async (root) => {
     const github = new FakeGitHub();
     const workflowDir = path.join(root, ".github/workflows");
@@ -215,12 +246,12 @@ test("direct-only repository-relative cleanup reference blocks an incompatible i
     await writeFile(path.join(scriptDir, "cleanup-coordination-labels.js"), `const ACTIVE_LABELS = ["agent-ready", "agent-working", "changes-requested"];\nconst TERMINAL_LABELS = ["infra-blocked", "needs-human"];\nasync function cleanup(issue, removeLabel) {\n  const labels = new Set(issue.labels.map(({ name }) => name));\n  if (TERMINAL_LABELS.some((name) => labels.has(name))) return { preservedTerminalState: true, removed: [] };\n  for (const name of ACTIVE_LABELS) if (labels.has(name)) await removeLabel(name);\n}\n`);
 
     const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
-    assert.equal(plan.overall_status, "repository_blocked");
-    assert.equal(plan.items.find((entry) => entry.id === "capability:coordination-label-cleanup").path, ".github/workflows/coordination-label-cleanup.yml");
+    assert.equal(plan.overall_status, "repository_changes_planned");
+    assert.equal(plan.items.find((entry) => entry.id === "capability:coordination-label-cleanup").status, "satisfied");
   });
 });
 
-test("unresolved coordination cleanup behavior fails closed for an issues.closed handler", async () => {
+test("unresolved third-party cleanup script does not block installation", async () => {
   await withRepo(async (root) => {
     const github = new FakeGitHub();
     const workflowDir = path.join(root, ".github/workflows");
@@ -228,16 +259,13 @@ test("unresolved coordination cleanup behavior fails closed for an issues.closed
     await writeFile(path.join(workflowDir, "coordination-label-cleanup.yml"), `name: Coordination Label Cleanup\non:\n  issues:\n    types: [closed]\njobs:\n  cleanup:\n    steps:\n      - run: node .github/scripts/cleanup-coordination-labels\n`);
 
     const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
-    assert.equal(plan.overall_status, "repository_blocked");
+    assert.equal(plan.overall_status, "repository_changes_planned");
     const conflict = plan.items.find((entry) => entry.id === "capability:coordination-label-cleanup");
-    assert.equal(conflict.status, "conflict");
-    assert.equal(conflict.event, "issues.closed");
-    assert.match(conflict.reason, /behavior source that cannot be resolved/);
-    assert.equal(conflict.path, ".github/workflows/coordination-label-cleanup.yml");
+    assert.equal(conflict.status, "satisfied");
   });
 });
 
-test("literal extensionless cleanup script takes priority over the .js fallback", async () => {
+test("third-party extensionless cleanup script is accepted without semantic analysis", async () => {
   await withRepo(async (root) => {
     const github = new FakeGitHub();
     const workflowDir = path.join(root, ".github/workflows");
@@ -253,12 +281,11 @@ for (const name of ACTIVE_LABELS) await removeLabel(name);
     await writeFile(path.join(scriptDir, "cleanup-coordination-labels.js"), "module.exports = () => {};\n");
 
     const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
-    assert.equal(plan.overall_status, "repository_blocked");
-    assert.match(plan.items.find((entry) => entry.id === "capability:coordination-label-cleanup").reason, /preserves active coordination labels/);
+    assert.equal(plan.overall_status, "repository_changes_planned");
   });
 });
 
-test("an overlapping cleanup with unproven behavior blocks instead of assuming compatibility", async () => {
+test("an overlapping cleanup with unproven behavior does not block installation", async () => {
   await withRepo(async (root) => {
     const github = new FakeGitHub();
     const workflowDir = path.join(root, ".github/workflows");
@@ -269,42 +296,40 @@ test("an overlapping cleanup with unproven behavior blocks instead of assuming c
     await writeFile(path.join(scriptDir, "cleanup.js"), `const ACTIVE_LABELS = ["agent-ready"];\nawait github.rest.issues.removeLabel({ name: ACTIVE_LABELS[0] });\n`);
 
     const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
-    assert.equal(plan.overall_status, "repository_blocked");
-    assert.match(plan.items.find((entry) => entry.id === "capability:coordination-label-cleanup").reason, /cannot be proven compatible/);
+    assert.equal(plan.overall_status, "repository_changes_planned");
   });
 });
 
-test("cleanup aggregation returns conflict when a later-sorting workflow conflicts", async () => {
+test("multiple Issue-close workflows are retained without semantic conflict guesses", async () => {
   await withRepo(async (root) => {
     const compatible = "const ACTIVE_LABELS = ['agent-ready', 'agent-working', 'changes-requested'];\nconst TERMINAL_LABELS = ['infra-blocked', 'needs-human'];\nfor (const label of ACTIVE_LABELS) await removeLabel(label);\n";
     const conflict = "const ACTIVE_LABELS = ['agent-ready', 'agent-working', 'changes-requested'];\nconst TERMINAL_LABELS = ['infra-blocked', 'needs-human'];\nif (TERMINAL_LABELS.some((label) => labels.has(label))) return { removed: [] };\nfor (const label of ACTIVE_LABELS) await removeLabel(label);\n";
     await writeCleanupWorkflow(root, "z-conflict.yml", "conflict.js", conflict);
     await writeCleanupWorkflow(root, "a-compatible.yml", "compatible.js", compatible);
     const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github: new FakeGitHub() });
-    assert.equal(plan.capabilities["coordination-label-cleanup"].status, "conflict");
+    assert.equal(plan.capabilities["coordination-label-cleanup"].status, "satisfied");
   });
 });
 
-test("cleanup aggregation returns conflict when a first-sorting workflow conflicts", async () => {
+test("Issue-close workflow sorting does not change cleanup ownership", async () => {
   await withRepo(async (root) => {
     const compatible = "const ACTIVE_LABELS = ['agent-ready', 'agent-working', 'changes-requested'];\nconst TERMINAL_LABELS = ['infra-blocked', 'needs-human'];\nfor (const label of ACTIVE_LABELS) await removeLabel(label);\n";
     const conflict = "const ACTIVE_LABELS = ['agent-ready', 'agent-working', 'changes-requested'];\nconst TERMINAL_LABELS = ['infra-blocked', 'needs-human'];\nif (TERMINAL_LABELS.some((label) => labels.has(label))) return { removed: [] };\nfor (const label of ACTIVE_LABELS) await removeLabel(label);\n";
     await writeCleanupWorkflow(root, "z-compatible.yml", "compatible.js", compatible);
     await writeCleanupWorkflow(root, "a-conflict.yml", "conflict.js", conflict);
     const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github: new FakeGitHub() });
-    assert.equal(plan.capabilities["coordination-label-cleanup"].status, "conflict");
+    assert.equal(plan.capabilities["coordination-label-cleanup"].status, "satisfied");
   });
 });
 
-test("add-only coordination mutation on Issue close conflicts because late cleanup can reactivate work", async () => {
+test("third-party Issue-close label scripts are not statically analyzed", async () => {
   await withRepo(async (root) => {
     await writeCleanupWorkflow(root, "close-reopen.yml", "reopen.js",
       'await addLabel("agent-working");\n');
     const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github: new FakeGitHub() });
     const capability = plan.capabilities["coordination-label-cleanup"];
-    assert.equal(capability.status, "conflict");
+    assert.equal(capability.status, "satisfied");
     assert.equal(capability.provider, "consumer");
-    assert.match(capability.reason, /late cleanup must never reactivate work/);
   });
 });
 
@@ -341,6 +366,11 @@ test("schema, generated manifest, onboarding guide, contract, and Reviewer promp
   assert.match(contract, /same linked PR and implementation branch/);
   assert.match(contract, /schema v1 is unsupported/);
   assert.match(reviewer, /Dispatcher alone admits or rejects repairs/);
+  assert.match(reviewer, /VCCP deploy revision-upgrade PR/);
+  assert.match(reviewer, /full 64-hex PLAN id/);
+  assert.match(reviewer, /reviewer-task-prompt\.md/);
+  assert.match(reviewer, /A verified VCCP maintenance PR has no Issue/);
+  assert.match(reviewer, /Do not use it for remove PRs, onboarding PRs/);
   for (const text of [template, onboarding, contract, reviewer]) {
     assert.doesNotMatch(text, /three formal `?REQUEST_CHANGES`? repair rounds/i);
   }
@@ -363,6 +393,13 @@ test("schema v1 parses as legacy, preserves stale-plan protection, and never rew
     const applied = await applyOnboardingPlan({ plan, root, github });
     assert.equal(applied.overall_status, "repository_upgrade_required");
     assert.deepEqual(applied.applied, []);
+
+    const deployPlan = await createOnboardingPlan({ repo: REPO, root, github, upgradeLegacy: true });
+    assert.equal(deployPlan.overall_status, "repository_changes_planned",
+      JSON.stringify(deployPlan.items.filter(({ status }) => ["blocked", "conflict"].includes(status))));
+    assert.equal(deployPlan.desired_manifest.schema_version, 2);
+    assert.ok(deployPlan.items.some(({ id, path: file, status }) => id === "manifest" && file && status === "update"));
+    assert.ok(deployPlan.items.some(({ id, status }) => id !== "manifest" && ["create", "update"].includes(status)));
 
     let auditOutput = "";
     let auditErrors = "";
@@ -407,6 +444,39 @@ test("schema v1 parses as legacy, preserves stale-plan protection, and never rew
     assert.equal(audit.overall_status, "repository_upgrade_required");
     assert.equal((await readFile(target, "utf8")), changedSource);
     assert.equal(github.labelCreates.length, 0);
+  });
+});
+
+test("deploy turns a valid schema v1 Consumer into a deterministic v2 maintenance upgrade", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    github.repository.branches.push("release");
+    const source = `schema_version: 1\nvccp:\n  source: ${SOURCE}\n  revision: ${REV_A}\nrepository:\n  base_branch: release\n  implementer_authors:\n    - custom-builder[bot]\nissue_contract:\n  frozen_spec_label: frozen-spec\n  active_coordination_labels: [agent-ready, agent-working, changes-requested]\n  terminal_coordination_labels: [infra-blocked, needs-human]\n  max_request_changes_rounds: 3\nreviewer:\n  transport: chatgpt-work-github-webhook-task\n  events: [pull_request.opened, pull_request.ready_for_review, pull_request.synchronize]\n  exact_head_sha_required: true\n  required_checks_completion: same_run_wait_until_terminal\n  required_checks:\n    - name: Custom CI\n      accepted_conclusions: [success]\nmerge:\n  native_auto_merge: true\n  enable_native_auto_merge_by: reviewer\n  method: rebase\n  direct_merge_forbidden: true\n  admin_bypass_forbidden_in_normal_flow: true\nreporting:\n  pull_request_template: true\n`;
+    await mkdir(path.join(root, ".github"), { recursive: true });
+    await writeFile(path.join(root, ".github/control-plane.yml"), source);
+    const configPath = path.join(root, "runtime.json");
+    await writeFile(configPath, JSON.stringify(localEnrollment(root)));
+    let published;
+    let output = "";
+    const code = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root, "--runtime-config", configPath], {
+      stdout: { write: (text) => { output += text; } }, stderr: { write: (text) => assert.fail(text) },
+      githubFactory: () => github,
+      maintenancePublisher: async ({ plan }) => { published = plan; return { status: "open", number: 17 }; },
+    });
+    const report = JSON.parse(output);
+    assert.equal(code, 2);
+    assert.equal(report.overall_status, "MAINTENANCE_PR_OPEN",
+      JSON.stringify(report.items?.filter(({ status }) => ["blocked", "conflict"].includes(status)) ?? report.errors));
+    assert.equal(published.overall_status, "repository_changes_planned");
+    assert.equal(published.desired_manifest.schema_version, 2);
+    assert.equal(published.desired_manifest.repository.base_branch, "release");
+    assert.deepEqual(published.desired_manifest.repository.implementer_authors, ["custom-builder[bot]"]);
+    assert.deepEqual(published.desired_manifest.reviewer.required_checks, [{ name: "Custom CI", accepted_conclusions: ["success"] }]);
+    assert.equal(published.desired_manifest.merge.method, "rebase");
+    assert.equal(published.desired_manifest.reporting.pull_request_template, true);
+    assert.equal(published.items.find(({ id }) => id === "manifest").status, "update");
+    assert.match(published.items.find(({ id }) => id === "manifest").content, /schema_version: 2/);
+    assert.equal(await readFile(path.join(root, ".github/control-plane.yml"), "utf8"), source);
   });
 });
 
@@ -680,7 +750,7 @@ test("readiness CLI blocks an unavailable App credential without exposing secret
   });
 });
 
-test("readiness keeps repository cleanup conflicts blocking when machine wiring is ready", async () => {
+test("readiness does not block on guessed third-party cleanup semantics", async () => {
   await withRepo(async (root) => {
     const controlPlane = path.join(root, ".github");
     await mkdir(controlPlane, { recursive: true });
@@ -690,8 +760,8 @@ test("readiness keeps repository cleanup conflicts blocking when machine wiring 
     const github = new FakeGitHub();
     const { code, report } = await readinessReport(root, github);
     assert.equal(code, 2);
-    assert.equal(report.repository_status, "blocked");
-    assert.equal(report.repository_audit.capabilities["coordination-label-cleanup"].status, "conflict");
+    assert.equal(report.repository_status, "changes_planned");
+    assert.equal(report.repository_audit.capabilities["coordination-label-cleanup"].status, "satisfied");
     assert.equal(report.machine_authorization.status, "authorized");
     assert.equal(report.machine_activation.status, "ready");
     assert.equal(report.overall_status, "machine_activation_blocked");
@@ -742,6 +812,7 @@ test("status reports NEEDS_ACTION until the qualified Runner is actually running
       githubFactory: () => github,
       runtimeQualifier: async () => ({ runtime_activation: { status: "ready", blockers: [] } }),
       runtimeRevision: REV_A,
+      hostInspector: () => ({ mechanism: "windows_task_scheduler", status: "stopped" }),
     });
     const report = JSON.parse(output);
     assert.equal(code, 2);
@@ -752,7 +823,7 @@ test("status reports NEEDS_ACTION until the qualified Runner is actually running
     assert.equal(report.desired_revision, REV_A);
     assert.equal(report.installation_lock.status, "satisfied");
     assert.equal(report.machine_runtime.implementer_provider, null);
-    assert.ok(["launchd", "unsupported", "windows_sidecar"].includes(report.host_runner.mechanism));
+    assert.ok(["launchd", "unsupported", "windows_task_scheduler"].includes(report.host_runner.mechanism));
   });
 });
 
@@ -924,6 +995,200 @@ test("deploy binds explicitly selected providers once then delegates the ready r
     assert.equal(written.reviewer_provider, "claude_code");
     assert.equal(written.reviewer_github_identity, "reviewer-user");
     assert.equal(deployed.manifest.vccp.revision, REV_A);
+  });
+});
+
+test("deploy keeps an installed manifest pin unless a revision is explicitly proposed", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(REV_A), github });
+    await applyOnboardingPlan({ plan, root, github });
+    const configPath = path.join(root, "runtime.json");
+    await writeFile(configPath, JSON.stringify({ ...localEnrollment(root), providers: [
+      { key: "antigravity", type: "antigravity", executable: "/bin/true" },
+      { key: "claude_code", type: "claude_code", executable: "/bin/true" },
+    ], implementer_provider: "antigravity", reviewer_provider: "claude_code",
+      reviewer_github_identity: "reviewer-user" }));
+    let deployed;
+    let output = "";
+    const code = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root,
+      "--runtime-config", configPath], {
+      stdout: { write: (text) => { output += text; } },
+      stderr: { write: (text) => assert.fail(text) }, githubFactory: () => github,
+      runtimeRevision: REV_A,
+      hostDeployer: async (request) => { deployed = request; return { status: "running", revision: REV_A }; },
+    });
+    assert.equal(code, 0);
+    assert.equal(JSON.parse(output).desired_revision, REV_A);
+    assert.equal(deployed.manifest.vccp.revision, REV_A);
+  });
+});
+
+test("deploy persists an open upgrade target, resumes it after merge, and clears it after runtime convergence", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const initial = await createOnboardingPlan({ repo: REPO, root, input: validInput(REV_A), github });
+    await applyOnboardingPlan({ plan: initial, root, github });
+    const configPath = path.join(root, "runtime.json");
+    await writeFile(configPath, JSON.stringify({ ...localEnrollment(root), providers: [
+      { key: "antigravity", type: "antigravity", executable: "/bin/true" },
+      { key: "claude_code", type: "claude_code", executable: "/bin/true" },
+    ], implementer_provider: "antigravity", reviewer_provider: "claude_code", reviewer_github_identity: "reviewer-user" }));
+
+    let output = "";
+    const firstCode = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root,
+      "--runtime-config", configPath, "--propose-revision", REV_B], {
+      stdout: { write: (text) => { output += text; } }, stderr: { write: (text) => assert.fail(text) },
+      githubFactory: () => github, maintenancePublisher: async ({ plan }) => ({ status: "open", plan_id: plan.plan_id }),
+    });
+    assert.equal(firstCode, 2);
+    assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")).upgrade_target,
+      { repository: REPO, revision: REV_B, from_revision: REV_A });
+
+    output = "";
+    const rerunCode = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root, "--runtime-config", configPath], {
+      stdout: { write: (text) => { output += text; } }, stderr: { write: (text) => assert.fail(text) },
+      githubFactory: () => github, maintenancePublisher: async ({ plan }) => {
+        assert.equal(plan.desired_manifest.vccp.revision, REV_B);
+        return { status: "open", plan_id: plan.plan_id };
+      },
+    });
+    assert.equal(rerunCode, 2);
+
+    const mergedUpgrade = await createOnboardingPlan({ repo: REPO, root, github, revisionProposal: REV_B });
+    await applyOnboardingPlan({ plan: mergedUpgrade, root, github });
+    github.reachableRevisions.add(REV_C);
+    const getBranch = github.getBranch.bind(github);
+    github.getBranch = async (repo, name) => repo === SOURCE && name === "main"
+      ? { name, commit: { sha: REV_C } } : getBranch(repo, name);
+    let deployed;
+    output = "";
+    const resumeCode = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root, "--runtime-config", configPath], {
+      stdout: { write: (text) => { output += text; } }, stderr: { write: (text) => assert.fail(text) },
+      githubFactory: () => github, runtimeRevision: REV_B,
+      hostDeployer: async (request) => { deployed = request; return { status: "running", revision: REV_B }; },
+    });
+    assert.equal(resumeCode, 0, output);
+    assert.equal(deployed.manifest.vccp.revision, REV_B);
+    assert.equal(JSON.parse(await readFile(configPath, "utf8")).upgrade_target, undefined);
+  });
+});
+
+test("an upgrade rerun keeps its merged target when canonical main has advanced again", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    github.reachableRevisions.add(REV_C);
+    const initial = await createOnboardingPlan({ repo: REPO, root, input: validInput(REV_A), github });
+    await applyOnboardingPlan({ plan: initial, root, github });
+    const upgrade = await createOnboardingPlan({ repo: REPO, root, github, revisionProposal: REV_B });
+    await applyOnboardingPlan({ plan: upgrade, root, github });
+    const originalGetBranch = github.getBranch.bind(github);
+    github.getBranch = async (repo, name) => repo === SOURCE && name === "main"
+      ? { name, commit: { sha: REV_C } } : originalGetBranch(repo, name);
+    const configPath = path.join(root, "runtime.json");
+    await writeFile(configPath, JSON.stringify({ ...localEnrollment(root), providers: [
+      { key: "antigravity", type: "antigravity", executable: "/bin/true" },
+      { key: "claude_code", type: "claude_code", executable: "/bin/true" },
+    ], implementer_provider: "antigravity", reviewer_provider: "claude_code",
+      reviewer_github_identity: "reviewer-user" }));
+    let deployed;
+    let output = "";
+    const code = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root,
+      "--runtime-config", configPath], {
+      stdout: { write: (text) => { output += text; } },
+      stderr: { write: (text) => assert.fail(text) }, githubFactory: () => github,
+      runtimeRevision: REV_B,
+      hostDeployer: async (request) => { deployed = request; return { status: "running", revision: REV_B }; },
+    });
+    assert.equal(code, 0, output);
+    assert.equal(JSON.parse(output).desired_revision, REV_B);
+    assert.equal(deployed.manifest.vccp.revision, REV_B);
+  });
+});
+
+test("deploy resumes host reconciliation when an upgrade declaration is already satisfied", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const initial = await createOnboardingPlan({ repo: REPO, root, input: validInput(REV_A), github });
+    await applyOnboardingPlan({ plan: initial, root, github });
+    const upgrade = await createOnboardingPlan({ repo: REPO, root, github, revisionProposal: REV_B });
+    await applyOnboardingPlan({ plan: upgrade, root, github });
+    const configPath = path.join(root, "runtime.json");
+    await writeFile(configPath, JSON.stringify({ ...localEnrollment(root), providers: [
+      { key: "antigravity", type: "antigravity", executable: "/bin/true" },
+      { key: "claude_code", type: "claude_code", executable: "/bin/true" },
+    ], implementer_provider: "antigravity", reviewer_provider: "claude_code",
+      reviewer_github_identity: "reviewer-user", upgrade_target: { repository: REPO,
+        revision: REV_B, from_revision: REV_A } }));
+    let deployed;
+    let output = "";
+    const code = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root,
+      "--runtime-config", configPath], {
+      stdout: { write: (text) => { output += text; } },
+      stderr: { write: (text) => assert.fail(text) }, githubFactory: () => github,
+      runtimeRevision: REV_B,
+      maintenancePublisher: async () => assert.fail("satisfied upgrade must not publish another maintenance PR"),
+      hostDeployer: async (request) => { deployed = request; return { status: "running", revision: REV_B }; },
+    });
+    assert.equal(code, 0, output);
+    assert.equal(JSON.parse(output).overall_status, "RUNNING");
+    assert.equal(deployed.manifest.vccp.revision, REV_B);
+    assert.equal(JSON.parse(await readFile(configPath, "utf8")).upgrade_target, undefined);
+  });
+});
+
+test("deploy allows an explicit provider rebind when no Consumer execution is active", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
+    await applyOnboardingPlan({ plan, root, github });
+    const configPath = path.join(root, "runtime.json");
+    const config = { ...localEnrollment(root), providers: [
+      { key: "antigravity", type: "antigravity", executable: "/bin/true" },
+      { key: "claude_code", type: "claude_code", executable: "/bin/true" },
+      { key: "new-implementer", type: "antigravity", executable: "/bin/true" },
+    ], implementer_provider: "antigravity", reviewer_provider: "claude_code",
+      reviewer_github_identity: "reviewer-user" };
+    await writeFile(configPath, JSON.stringify(config));
+    let deployed;
+    let output = "";
+    const code = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root,
+      "--runtime-config", configPath, "--implementer-provider", "new-implementer"], {
+      stdout: { write: (text) => { output += text; } },
+      stderr: { write: (text) => assert.fail(text) }, githubFactory: () => github,
+      runtimeRevision: REV_A, providerRebindChecker: () => ({ status: "ready" }),
+      hostDeployer: async (request) => { deployed = request; return { status: "running", revision: REV_A }; },
+    });
+    assert.equal(code, 0, output);
+    assert.equal(JSON.parse(await readFile(configPath, "utf8")).implementer_provider, "new-implementer");
+    assert.equal(deployed.localConfig.implementer_provider, "new-implementer");
+  });
+});
+
+test("deploy preserves provider bindings while a Consumer execution is active", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
+    await applyOnboardingPlan({ plan, root, github });
+    const configPath = path.join(root, "runtime.json");
+    const config = { ...localEnrollment(root), providers: [
+      { key: "antigravity", type: "antigravity", executable: "/bin/true" },
+      { key: "claude_code", type: "claude_code", executable: "/bin/true" },
+      { key: "new-implementer", type: "antigravity", executable: "/bin/true" },
+    ], implementer_provider: "antigravity", reviewer_provider: "claude_code",
+      reviewer_github_identity: "reviewer-user" };
+    await writeFile(configPath, JSON.stringify(config));
+    let output = "";
+    const code = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root,
+      "--runtime-config", configPath, "--implementer-provider", "new-implementer"], {
+      stdout: { write: (text) => { output += text; } },
+      stderr: { write: (text) => assert.fail(text) }, githubFactory: () => github,
+      providerRebindChecker: () => ({ status: "blocked", reason: "active Consumer execution exists (LAUNCH_CONFIRMED)" }),
+      hostDeployer: async () => assert.fail("must preserve the active provider binding"),
+    });
+    assert.equal(code, 2);
+    assert.equal(JSON.parse(output).next_action.type, "bind_local_agent_providers");
+    assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), config);
   });
 });
 

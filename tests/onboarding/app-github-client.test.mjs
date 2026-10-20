@@ -32,7 +32,7 @@ test("public VCCP revision reads use credential-free Git while Consumer access s
   assert.ok(calls.every(({ command, args }) => command === "git" && args.includes("-c")
     && args.includes("credential.helper=")));
   assert.ok(calls.every(({ options }) => options.env.GIT_CONFIG_NOSYSTEM === "1"
-    && options.env.GIT_CONFIG_GLOBAL === os.devNull));
+    && options.env.GIT_CONFIG_GLOBAL === (process.platform === "win32" ? "NUL" : os.devNull)));
   assert.ok(calls.some(({ args }) => args.includes("ls-remote")));
   assert.ok(calls.some(({ args }) => args.includes("fetch")));
   assert.ok(calls.some(({ args }) => args.includes("cat-file")));
@@ -61,4 +61,41 @@ test("createRef forwards narrowly requested permissions to the App bridge", asyn
     ref: { ref: "refs/heads/codex-vccp-deploy-plan", sha: "abc" },
     additional_permissions: { workflows: "write" },
   }]);
+});
+
+test("public Git reads use the Windows NUL device for an empty global config", () => {
+  const originalPlatform = process.platform;
+  let env;
+  try {
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    const client = new AppGitHubClient({
+      runtimeConfig: { github_app: {} },
+      gitRunner: (_command, _args, options) => { env = options.env; return { status: 0, stdout: "", stderr: "" }; },
+    });
+    client.publicGit(["ls-remote"]);
+    assert.equal(env.GIT_CONFIG_GLOBAL, "NUL");
+  } finally {
+    Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+  }
+});
+
+test("Windows GitHub App bridge uses Python Launcher with Python 3", async () => {
+  const originalPlatform = process.platform;
+  let invocation;
+  try {
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    const client = new AppGitHubClient({
+      runtimeConfig: { github_app: {} },
+      pythonRunner: (command, args) => {
+        invocation = { command, args };
+        return { status: 0, stdout: JSON.stringify({ ok: true, result: { id: 1 } }), stderr: "" };
+      },
+    });
+    assert.deepEqual(await client.request("getRepository", CONSUMER), { id: 1 });
+    assert.deepEqual(invocation, {
+      command: "py", args: ["-3", "-m", "vccp_runtime.onboarding_github"],
+    });
+  } finally {
+    Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+  }
 });

@@ -33,11 +33,17 @@ def dispatch(request: dict, *, provider=None):
         "listPullRequests": ("GET", f"{repo_path}/pulls?state=open&per_page=100", None),
         "createPullRequest": ("POST", f"{repo_path}/pulls", request.get("pull_request")),
     }
+    if not provider:
+        raise ValueError("GitHub App provider is required")
+    if action == "checkPermissions":
+        requested = request.get("additional_permissions") or {}
+        if requested != {"workflows": "write"}:
+            raise ValueError("unsupported GitHub App permission preflight")
+        provider.get_token(repo, additional_permissions=requested)
+        return {"checked": True, "permissions": requested}
     if action not in endpoints:
         raise ValueError("GitHub operation is not available to the onboarding client")
     method, path, body = endpoints[action]
-    if not provider:
-        raise ValueError("GitHub App provider is required")
     additional_permissions = {}
     if action == "createTree":
         tree = request.get("tree") or {}
@@ -69,6 +75,18 @@ def dispatch(request: dict, *, provider=None):
         return {"readable": False, "reason": "insufficient permission to read repository policy"}
     if status < 200 or status >= 300:
         raise GitHubHTTPError(status, action)
+    if action in {"listLabels", "listPullRequests"}:
+        rows = list(payload) if isinstance(payload, list) else []
+        page = 2
+        while isinstance(payload, list) and len(payload) == 100:
+            _, next_page = provider.request("GET", f"{path}&page={page}", repo)
+            if not isinstance(next_page, list):
+                raise ValueError(f"GitHub {action} returned a non-list page")
+            rows.extend(next_page)
+            if len(next_page) < 100:
+                break
+            page += 1
+        payload = rows
     if action == "getBranchProtection":
         return {"readable": True, "value": payload}
     if action == "listRulesets":

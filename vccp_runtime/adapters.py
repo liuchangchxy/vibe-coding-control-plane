@@ -311,8 +311,7 @@ class GitHubWorkflowAdapter:
         linked_prs = [self.api.get(f"/repos/{repo}/pulls/{pr_number}") for pr_number in linked_numbers]
         open_linked = [p for p in linked_prs if p.get("state") == "open"]
         pr = linked_prs[0] if len(linked_numbers) == 1 and len(linked_prs) == 1 else None
-        reviews = self.api.get(f"/repos/{repo}/pulls/{pr['number']}/reviews?per_page=100") if pr else None
-        reviews_complete = isinstance(reviews, list) and len(reviews) < 100
+        reviews = self._all_pages(f"/repos/{repo}/pulls/{pr['number']}/reviews?per_page=100") if pr else None
         head = pr.get("head", {}) if pr else {}
         current_sha = head.get("sha")
         current_review = None
@@ -324,7 +323,7 @@ class GitHubWorkflowAdapter:
                 raise RuntimeError("required check run response is incomplete")
             check_runs = tuple(run for run in runs if isinstance(run, dict)
                                and str(run.get("head_sha", "")).casefold() == current_sha.casefold())
-        if reviews_complete and pr and pr.get("state") == "open" and len(linked_numbers) == 1 and len(open_linked) == 1 and pr.get("base", {}).get("ref") == self.base_branch and \
+        if reviews is not None and pr and pr.get("state") == "open" and len(linked_numbers) == 1 and len(open_linked) == 1 and pr.get("base", {}).get("ref") == self.base_branch and \
                 pr.get("user", {}).get("login", "").casefold() in self.authors:
             current_head_reviews = [r for r in reviews or []
                                     if r.get("commit_id", "").casefold() == (current_sha or "").casefold()
@@ -356,6 +355,19 @@ class GitHubWorkflowAdapter:
             allow_no_change=allow_no_change, frozen_spec_digest=spec_digest,
             issue_title=str(issue.get("title") or ""),
         )
+
+    def _all_pages(self, endpoint):
+        separator = "&" if "?" in endpoint else "?"
+        results = []
+        page = 1
+        while True:
+            payload = self.api.get(f"{endpoint}{separator}page={page}")
+            if not isinstance(payload, list):
+                raise RuntimeError("GitHub formal review response is invalid")
+            results.extend(payload)
+            if len(payload) < 100:
+                return results
+            page += 1
 
     def close_noop_issue(self, repo, issue_number):
         # Freshly prove no canonical relationship and retain only coordination labels
@@ -468,6 +480,10 @@ class GitHubWorkflowAdapter:
     def restore_repair_coordination_state(self, repo, issue_number, new_state, expected_revision):
         """Idempotently promote a grant; leave needs-human in place until target is verified."""
         before = self._facts(repo, issue_number)
+        if (before.revision != str(expected_revision) and before.issue_open and before.frozen_spec
+                and not before.canceled and before.coordination_state == new_state
+                and before.active_labels == (new_state,) and not before.terminal_labels):
+            return True
         staged = (before.terminal_labels == ("needs-human",)
                   and before.active_labels == (new_state,))
         if (before.revision != str(expected_revision)
