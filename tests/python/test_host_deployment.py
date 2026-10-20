@@ -16,6 +16,62 @@ from vccp_runtime.host_deployment import (inspect_windows_task, reconcile_macos_
 
 
 class HostDeploymentTests(unittest.TestCase):
+    def test_windows_missing_task_with_empty_query_output_is_confirmed_missing(self):
+        import vccp_runtime.host_deployment as deployment
+        def runner(command, **_kwargs):
+            if command[:2] == ["schtasks.exe", "/Query"]:
+                return SimpleNamespace(returncode=1, stdout="", stderr="")
+            if command[0] == "powershell.exe":
+                return SimpleNamespace(returncode=3, stdout="", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        self.assertIsNone(deployment._windows_query("VCCP-Consumer-example", runner))
+
+    def test_windows_reconcile_creates_task_after_empty_missing_query(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            subprocess.run(["git", "init", "-q", str(runtime)], check=True)
+            subprocess.run(["git", "-C", str(runtime), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(runtime), "config", "user.name", "Test"], check=True)
+            (runtime / "runtime.py").write_text("pinned\n")
+            subprocess.run(["git", "-C", str(runtime), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(runtime), "commit", "-qm", "pinned"], check=True)
+            revision = subprocess.check_output(["git", "-C", str(runtime), "rev-parse", "HEAD"], text=True).strip()
+            pinned = root / revision
+            runtime.rename(pinned)
+            manifest, config = root / "manifest.yml", root / "runtime.json"
+            manifest.write_text("manifest\n")
+            config.write_text("{}\n")
+            calls = []
+            class CreatedTask(Exception):
+                pass
+            def runner(command, **_kwargs):
+                calls.append(command)
+                if command[:2] == ["schtasks.exe", "/Query"]:
+                    return SimpleNamespace(returncode=1, stdout="", stderr="")
+                if command[0] == "powershell.exe":
+                    return SimpleNamespace(returncode=3, stdout="", stderr="")
+                if command[:2] == ["schtasks.exe", "/Create"]:
+                    raise CreatedTask
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            with self.assertRaises(CreatedTask):
+                reconcile_windows_task(repo="owner/consumer", runtime_root=str(pinned),
+                    manifest_path=str(manifest), runtime_config_path=str(config),
+                    python_executable=sys.executable, readiness=lambda _runtime: {"status": "ready"},
+                    runner=runner)
+            self.assertTrue(any(call[:2] == ["schtasks.exe", "/Create"] for call in calls))
+
+    def test_windows_task_query_non_not_found_error_still_blocks(self):
+        import vccp_runtime.host_deployment as deployment
+        def runner(command, **_kwargs):
+            if command[:2] == ["schtasks.exe", "/Query"]:
+                return SimpleNamespace(returncode=1, stdout="", stderr="")
+            return SimpleNamespace(returncode=4, stdout="", stderr="inspection unavailable")
+        with self.assertRaisesRegex(ValueError, "state could not be inspected"):
+            deployment._windows_query("VCCP-Consumer-example", runner)
+
     def test_windows_process_repo_match_uses_exact_argument_value(self):
         import vccp_runtime.host_deployment as deployment
         processes = [

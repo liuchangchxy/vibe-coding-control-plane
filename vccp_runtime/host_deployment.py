@@ -38,6 +38,14 @@ def _windows_query(task_name, runner):
     result = _run(["schtasks.exe", "/Query", "/TN", task_name, "/XML"], runner)
     if result.returncode:
         detail = f"{result.stdout or ''}\n{result.stderr or ''}".casefold()
+        if not detail.strip():
+            check = _run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                          f"try {{ $tasks = Get-ScheduledTask -ErrorAction Stop; "
+                          f"if (@($tasks | Where-Object TaskName -eq '{task_name}').Count -eq 0) "
+                          "{ exit 3 } else { exit 0 } } catch { exit 4 }"], runner)
+            if check.returncode == 3:
+                return None
+            raise ValueError(f"Windows Task Scheduler state could not be inspected: {detail.strip()}")
         if any(phrase in detail for phrase in ("cannot find the file", "does not exist", "cannot find the task",
                                                "cannot find the path specified")):
             return None
