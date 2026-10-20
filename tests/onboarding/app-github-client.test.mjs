@@ -78,3 +78,24 @@ test("public Git reads use the Windows NUL device for an empty global config", (
     Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
   }
 });
+
+test("Windows GitHub App bridge uses Python Launcher with Python 3", async () => {
+  const originalPlatform = process.platform;
+  let invocation;
+  try {
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    const client = new AppGitHubClient({
+      runtimeConfig: { github_app: {} },
+      pythonRunner: (command, args) => {
+        invocation = { command, args };
+        return { status: 0, stdout: JSON.stringify({ ok: true, result: { id: 1 } }), stderr: "" };
+      },
+    });
+    assert.deepEqual(await client.request("getRepository", CONSUMER), { id: 1 });
+    assert.deepEqual(invocation, {
+      command: "py", args: ["-3", "-m", "vccp_runtime.onboarding_github"],
+    });
+  } finally {
+    Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+  }
+});
