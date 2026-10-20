@@ -13,6 +13,7 @@ import { createManifest, parseManifest, stringifyManifest, validateManifest } fr
 const SOURCE = "liuchangchxy/vibe-coding-control-plane";
 const REV_A = "a".repeat(40);
 const REV_B = "b".repeat(40);
+const REV_C = "c".repeat(40);
 const REPO = "example/consumer";
 
 function validInput(revision = REV_A) {
@@ -98,6 +99,7 @@ async function readinessReport(root, github, localConfig = localEnrollment(root)
     githubFactory: () => github,
     runtimeQualifier: async () => ({ runtime_activation: { status: "ready", blockers: [] } }),
     runtimeRevision: REV_A,
+    hostInspector: () => ({ status: "not_installed" }),
   });
   return { code, report: JSON.parse(output) };
 }
@@ -742,6 +744,7 @@ test("status reports NEEDS_ACTION until the qualified Runner is actually running
       githubFactory: () => github,
       runtimeQualifier: async () => ({ runtime_activation: { status: "ready", blockers: [] } }),
       runtimeRevision: REV_A,
+      hostInspector: () => ({ mechanism: "windows_task_scheduler", status: "stopped" }),
     });
     const report = JSON.parse(output);
     assert.equal(code, 2);
@@ -752,7 +755,7 @@ test("status reports NEEDS_ACTION until the qualified Runner is actually running
     assert.equal(report.desired_revision, REV_A);
     assert.equal(report.installation_lock.status, "satisfied");
     assert.equal(report.machine_runtime.implementer_provider, null);
-    assert.ok(["launchd", "unsupported", "windows_sidecar"].includes(report.host_runner.mechanism));
+    assert.ok(["launchd", "unsupported", "windows_task_scheduler"].includes(report.host_runner.mechanism));
   });
 });
 
@@ -924,6 +927,119 @@ test("deploy binds explicitly selected providers once then delegates the ready r
     assert.equal(written.reviewer_provider, "claude_code");
     assert.equal(written.reviewer_github_identity, "reviewer-user");
     assert.equal(deployed.manifest.vccp.revision, REV_A);
+  });
+});
+
+test("deploy keeps an installed manifest pin unless a revision is explicitly proposed", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(REV_A), github });
+    await applyOnboardingPlan({ plan, root, github });
+    const configPath = path.join(root, "runtime.json");
+    await writeFile(configPath, JSON.stringify({ ...localEnrollment(root), providers: [
+      { key: "antigravity", type: "antigravity", executable: "/bin/true" },
+      { key: "claude_code", type: "claude_code", executable: "/bin/true" },
+    ], implementer_provider: "antigravity", reviewer_provider: "claude_code",
+      reviewer_github_identity: "reviewer-user" }));
+    let deployed;
+    let output = "";
+    const code = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root,
+      "--runtime-config", configPath], {
+      stdout: { write: (text) => { output += text; } },
+      stderr: { write: (text) => assert.fail(text) }, githubFactory: () => github,
+      runtimeRevision: REV_A,
+      hostDeployer: async (request) => { deployed = request; return { status: "running", revision: REV_A }; },
+    });
+    assert.equal(code, 0);
+    assert.equal(JSON.parse(output).desired_revision, REV_A);
+    assert.equal(deployed.manifest.vccp.revision, REV_A);
+  });
+});
+
+test("an upgrade rerun keeps its merged target when canonical main has advanced again", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    github.reachableRevisions.add(REV_C);
+    const initial = await createOnboardingPlan({ repo: REPO, root, input: validInput(REV_A), github });
+    await applyOnboardingPlan({ plan: initial, root, github });
+    const upgrade = await createOnboardingPlan({ repo: REPO, root, github, revisionProposal: REV_B });
+    await applyOnboardingPlan({ plan: upgrade, root, github });
+    const originalGetBranch = github.getBranch.bind(github);
+    github.getBranch = async (repo, name) => repo === SOURCE && name === "main"
+      ? { name, commit: { sha: REV_C } } : originalGetBranch(repo, name);
+    const configPath = path.join(root, "runtime.json");
+    await writeFile(configPath, JSON.stringify({ ...localEnrollment(root), providers: [
+      { key: "antigravity", type: "antigravity", executable: "/bin/true" },
+      { key: "claude_code", type: "claude_code", executable: "/bin/true" },
+    ], implementer_provider: "antigravity", reviewer_provider: "claude_code",
+      reviewer_github_identity: "reviewer-user" }));
+    let deployed;
+    let output = "";
+    const code = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root,
+      "--runtime-config", configPath], {
+      stdout: { write: (text) => { output += text; } },
+      stderr: { write: (text) => assert.fail(text) }, githubFactory: () => github,
+      runtimeRevision: REV_B,
+      hostDeployer: async (request) => { deployed = request; return { status: "running", revision: REV_B }; },
+    });
+    assert.equal(code, 0, output);
+    assert.equal(JSON.parse(output).desired_revision, REV_B);
+    assert.equal(deployed.manifest.vccp.revision, REV_B);
+  });
+});
+
+test("deploy allows an explicit provider rebind when no Consumer execution is active", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
+    await applyOnboardingPlan({ plan, root, github });
+    const configPath = path.join(root, "runtime.json");
+    const config = { ...localEnrollment(root), providers: [
+      { key: "antigravity", type: "antigravity", executable: "/bin/true" },
+      { key: "claude_code", type: "claude_code", executable: "/bin/true" },
+      { key: "new-implementer", type: "antigravity", executable: "/bin/true" },
+    ], implementer_provider: "antigravity", reviewer_provider: "claude_code",
+      reviewer_github_identity: "reviewer-user" };
+    await writeFile(configPath, JSON.stringify(config));
+    let deployed;
+    let output = "";
+    const code = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root,
+      "--runtime-config", configPath, "--implementer-provider", "new-implementer"], {
+      stdout: { write: (text) => { output += text; } },
+      stderr: { write: (text) => assert.fail(text) }, githubFactory: () => github,
+      runtimeRevision: REV_A, providerRebindChecker: () => ({ status: "ready" }),
+      hostDeployer: async (request) => { deployed = request; return { status: "running", revision: REV_A }; },
+    });
+    assert.equal(code, 0, output);
+    assert.equal(JSON.parse(await readFile(configPath, "utf8")).implementer_provider, "new-implementer");
+    assert.equal(deployed.localConfig.implementer_provider, "new-implementer");
+  });
+});
+
+test("deploy preserves provider bindings while a Consumer execution is active", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
+    await applyOnboardingPlan({ plan, root, github });
+    const configPath = path.join(root, "runtime.json");
+    const config = { ...localEnrollment(root), providers: [
+      { key: "antigravity", type: "antigravity", executable: "/bin/true" },
+      { key: "claude_code", type: "claude_code", executable: "/bin/true" },
+      { key: "new-implementer", type: "antigravity", executable: "/bin/true" },
+    ], implementer_provider: "antigravity", reviewer_provider: "claude_code",
+      reviewer_github_identity: "reviewer-user" };
+    await writeFile(configPath, JSON.stringify(config));
+    let output = "";
+    const code = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root,
+      "--runtime-config", configPath, "--implementer-provider", "new-implementer"], {
+      stdout: { write: (text) => { output += text; } },
+      stderr: { write: (text) => assert.fail(text) }, githubFactory: () => github,
+      providerRebindChecker: () => ({ status: "blocked", reason: "active Consumer execution exists (LAUNCH_CONFIRMED)" }),
+      hostDeployer: async () => assert.fail("must preserve the active provider binding"),
+    });
+    assert.equal(code, 2);
+    assert.equal(JSON.parse(output).next_action.type, "bind_local_agent_providers");
+    assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), config);
   });
 });
 

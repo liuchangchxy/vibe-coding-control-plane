@@ -848,6 +848,37 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(result["items"][0]["status"], "needs-human")
         self.assertEqual(len(self.implementer.launches), 1)
 
+    def test_legacy_flow_is_reconstructed_from_exact_current_pr_and_complete_attempt_history(self):
+        connection = self.core.store._connect()
+        connection.execute("UPDATE flows SET trusted=0,initial_confirmed=0,repair_budget_known=0 "
+                           "WHERE repo=? AND issue_number=?", (self.repo, self.issue))
+        connection.commit()
+        connection.close()
+        self.update(check_runs=self.failure())
+
+        result = self.driver().advance_once(self.repo, "owner", 100)
+
+        flow = self.core.store.flow(self.repo, self.issue)
+        self.assertTrue(flow["trusted"])
+        self.assertTrue(flow["initial_confirmed"])
+        self.assertTrue(flow["repair_budget_known"])
+        self.assertEqual(result["items"][0]["trigger"], "ci_repair")
+        self.assertEqual(result["items"][0]["status"], "launched")
+
+    def test_legacy_flow_is_not_reconstructed_when_public_head_moved_past_local_history(self):
+        connection = self.core.store._connect()
+        connection.execute("UPDATE flows SET trusted=0,initial_confirmed=0 WHERE repo=? AND issue_number=?",
+                           (self.repo, self.issue))
+        connection.commit()
+        connection.close()
+        self.update(pr_head_sha=SHA_B, check_runs=self.failure(SHA_B))
+
+        result = self.driver().advance_once(self.repo, "owner", 100)
+
+        self.assertFalse(self.core.store.flow(self.repo, self.issue)["trusted"])
+        self.assertEqual(result["items"][0]["status"], "needs-human")
+        self.assertEqual(len(self.implementer.launches), 1)
+
     def test_restart_adoption_without_budget_evidence_blocks_ci_repair(self):
         connection = self.core.store._connect()
         connection.execute("DELETE FROM attempts WHERE repo=? AND issue_number=?", (self.repo, self.issue))

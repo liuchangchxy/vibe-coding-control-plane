@@ -19,7 +19,6 @@ from uuid import uuid4
 
 MAX_AUTOMATED_REPAIRS = 5
 MAX_REPAIRS_PER_CAUSE = 3
-MAX_HUMAN_CONTINUATIONS = 3
 REPAIRS_PER_CONTINUATION = 1
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 _REPAIR_CAUSES = {"implementation_failure", "reviewer_rejection"}
@@ -414,7 +413,7 @@ class _Store:
                 connection.execute("UPDATE attempts SET resulting_head_sha=expected_head_sha "
                                    "WHERE phase='PR_BOUND' AND expected_head_sha IS NOT NULL")
                 connection.execute("UPDATE attempts SET expected_head_sha=NULL WHERE phase='PR_BOUND'")
-                connection.execute("UPDATE flows SET trusted=0,initial_confirmed=0 WHERE EXISTS "
+                connection.execute("UPDATE flows SET trusted=0,initial_confirmed=0,repair_budget_known=0 WHERE EXISTS "
                                    "(SELECT 1 FROM attempts WHERE attempts.repo=flows.repo "
                                    "AND attempts.issue_number=flows.issue_number AND attempts.kind='repair' "
                                    "AND attempts.phase='PR_BOUND')")
@@ -958,13 +957,6 @@ class _Store:
                 connection.commit()
                 return {"status": "already_authorized", "authorization_id": existing["authorization_id"],
                         "activated": bool(existing["activated"])}
-            count = connection.execute(
-                "SELECT COUNT(*) AS count FROM repair_continuations WHERE repo=? AND issue_number=?",
-                (_repo_key(candidate.repo), candidate.issue_number),
-            ).fetchone()["count"]
-            if count >= MAX_HUMAN_CONTINUATIONS:
-                connection.commit()
-                return {"status": "continuation_limit_exhausted", "limit": MAX_HUMAN_CONTINUATIONS}
             authorization_id = str(uuid4())
             connection.execute(
                 "INSERT INTO repair_continuations(authorization_id,repo,issue_number,pr_number,head_sha,"
@@ -1127,6 +1119,63 @@ class _Store:
             row = connection.execute("SELECT * FROM flows WHERE repo=? AND issue_number=?",
                                      (_repo_key(repo), issue)).fetchone()
             return dict(row) if row else None
+
+    def normalize_legacy_flow(self, repo: str, issue: int, pr_number: int,
+                              branch: str, head_sha: str) -> bool:
+        """Rebuild trust and a missing repair count from a complete local attempt chain."""
+        if not _SHA_RE.fullmatch(head_sha or ""):
+            return False
+        repo_key = _repo_key(repo)
+        connection = self.transaction()
+        try:
+            flow = connection.execute("SELECT * FROM flows WHERE repo=? AND issue_number=?",
+                                      (repo_key, issue)).fetchone()
+            if flow is None or flow["repair_budget_known"] or (flow["trusted"] and flow["initial_confirmed"]):
+                connection.commit()
+                return bool(flow and flow["trusted"] and flow["initial_confirmed"] and flow["repair_budget_known"])
+            if flow["pr_number"] != pr_number or flow["branch"] != branch:
+                connection.commit()
+                return False
+            rows = connection.execute("SELECT * FROM attempts WHERE repo=? AND issue_number=? "
+                                      "ORDER BY created_at,rowid", (repo_key, issue)).fetchall()
+            initial = [row for row in rows if row["kind"] == "initial_dispatch"]
+            repairs = [row for row in rows if row["kind"] == "repair" and row["phase"] != "BUDGET_EXHAUSTED"]
+            if len(initial) != 1 or flow["repair_count"] != len(repairs):
+                connection.commit()
+                return False
+            chain = [*initial, *repairs]
+            bound = []
+            allowed_phases = {"PR_BOUND", "STOPPED_CANCELLED", "TERMINAL_UNRESOLVED",
+                              "CLAIM_FAILED", "LAUNCH_NOT_STARTED"}
+            for row in chain:
+                if row["phase"] not in allowed_phases:
+                    connection.commit()
+                    return False
+                if row["phase"] in {"PR_BOUND", "STOPPED_CANCELLED", "TERMINAL_UNRESOLVED"}:
+                    if (row["pr_number"] != pr_number or row["branch"] != branch
+                            or not row["resulting_head_sha"]):
+                        connection.commit()
+                        return False
+                    bound.append(row)
+                if row["launch_outcome"] == "unknown":
+                    connection.commit()
+                    return False
+                if row["launch_outcome"] == "confirmed" and not row["execution_id"]:
+                    connection.commit()
+                    return False
+            if (initial[0]["launch_outcome"] != "confirmed" or not bound
+                    or bound[-1]["resulting_head_sha"].casefold() != head_sha.casefold()):
+                connection.commit()
+                return False
+            connection.execute("UPDATE flows SET trusted=1,initial_confirmed=1,repair_budget_known=1 "
+                               "WHERE repo=? AND issue_number=?", (repo_key, issue))
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def renew_owner_lease(self, repo: str, issue: int, owner: str, now: float, ttl: float):
         connection = self.transaction()

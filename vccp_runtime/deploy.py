@@ -8,7 +8,9 @@ import subprocess
 import sys
 
 from .activation import qualify_activation
-from .host_deployment import reconcile_macos_launch_agent, remove_macos_launch_agent
+from .host_deployment import (inspect_windows_task, reconcile_macos_launch_agent,
+                              reconcile_windows_task, remove_macos_launch_agent,
+                              remove_windows_task)
 from .runtime_checkout import ensure_runtime_checkout
 
 
@@ -47,8 +49,11 @@ def deploy_host(*, repo: str, manifest: dict, local_config: dict,
         return {**result, "revision": revision, "runtime_root": str(runtime_root),
                 "readiness": readiness_result.get("value")}
     if selected_platform == "win32":
-        return {"status": "blocked", "revision": revision, "runtime_root": str(runtime_root),
-                "reason": "no verified Windows resident host reconciler is configured"}
+        result = (host_reconciler or reconcile_windows_task)(repo=repo, runtime_root=str(runtime_root),
+            manifest_path=manifest_path, runtime_config_path=runtime_config_path,
+            python_executable=sys.executable, readiness=full_readiness, runner=runner)
+        return {**result, "revision": revision, "runtime_root": str(runtime_root),
+                "readiness": result.get("readiness")}
     return {"status": "blocked", "revision": revision, "runtime_root": str(runtime_root),
             "reason": f"unsupported resident host platform: {selected_platform}"}
 
@@ -68,7 +73,11 @@ def remove_host(*, repo: str, local_config: dict, runtime_config_path: str,
         except KeyError:
             return {"status": "blocked", "reason": "runtime config lacks the Consumer database identity required to verify RuntimeLock"}
     if selected_platform == "win32":
-        return {"status": "blocked", "reason": "no verified Windows resident host remover is configured"}
+        try:
+            return remove_windows_task(repo=repo, database_path=local_config["database_path"],
+                runtime_config_path=runtime_config_path, runner=runner)
+        except KeyError:
+            return {"status": "blocked", "reason": "runtime config lacks the Consumer database identity required to verify RuntimeLock"}
     return {"status": "blocked", "reason": f"unsupported resident host platform: {selected_platform}"}
 
 
@@ -76,11 +85,21 @@ def main() -> int:
     try:
         payload = json.load(sys.stdin)
         operation = payload.pop("operation", "deploy")
-        result = remove_host(**payload) if operation == "remove" else deploy_host(**payload)
+        if operation == "remove":
+            result = remove_host(**payload)
+        elif operation == "status":
+            local_config = payload["local_config"]
+            result = inspect_windows_task(repo=payload["repo"],
+                manifest_path=payload["manifest_path"], runtime_config_path=payload["runtime_config_path"])
+        elif operation == "provider-rebind-check":
+            problem = _active_work(payload["repo"], payload["local_config"]["database_path"])
+            result = {"status": "blocked" if problem else "ready", "reason": problem}
+        else:
+            result = deploy_host(**payload)
     except (KeyError, TypeError, ValueError, OSError) as error:
         result = {"status": "blocked", "reason": str(error)}
     print(json.dumps(result, ensure_ascii=False))
-    return 0 if result.get("status") == "running" else 2
+    return 0 if result.get("status") in {"running", "stopped", "already_removed", "removed"} else 2
 
 
 if __name__ == "__main__":

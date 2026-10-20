@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import shutil
 import asyncio
 import threading
 import time
@@ -85,14 +86,30 @@ class _ReviewWorkspace:
         if actual.returncode != 0 or actual.stdout.strip().lower() != head.lower():
             raise ValueError("fetched pull request head does not match captured SHA")
         path = self.path_for(repo, pr, head)
-        if path.exists():
-            if path.is_symlink() or not path.is_dir():
-                raise ValueError("Reviewer workspace path is not a real directory")
-            current = _run(["git", "rev-parse", "HEAD"], path)
-            status = _run(["git", "status", "--porcelain=v1", "--untracked-files=all"], path)
-            if current.returncode or current.stdout.strip().lower() != head.lower() or status.stdout.strip():
-                raise ValueError("existing Reviewer workspace is not clean at the exact head")
-            return path
+        try:
+            path.parent.resolve().relative_to(self.root)
+        except ValueError:
+            raise ValueError("Reviewer workspace parent escapes its disposable root") from None
+        if path.exists() or path.is_symlink():
+            if path.is_symlink():
+                path.unlink()
+            else:
+                try:
+                    path.resolve().relative_to(self.root)
+                except ValueError:
+                    raise ValueError("Reviewer workspace path escapes its disposable root") from None
+                if path.is_dir():
+                    current = _run(["git", "rev-parse", "HEAD"], path)
+                    status = _run(["git", "status", "--porcelain=v1", "--untracked-files=all"], path)
+                    branch = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], path)
+                    if (current.returncode == 0 and current.stdout.strip().lower() == head.lower()
+                            and status.returncode == 0 and not status.stdout.strip()
+                            and branch.stdout.strip() == "HEAD"):
+                        return path
+                    _run(["git", "worktree", "remove", "--force", str(path)], self.source)
+                if path.exists():
+                    shutil.rmtree(path) if path.is_dir() else path.unlink()
+                _run(["git", "worktree", "prune"], self.source)
         path.parent.mkdir(parents=True, exist_ok=True)
         added = _run(["git", "worktree", "add", "--detach", str(path), head.lower()], self.source)
         if added.returncode != 0:

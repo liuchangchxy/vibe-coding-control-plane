@@ -165,6 +165,33 @@ class ReviewerAgentTests(unittest.TestCase):
             self.assertFalse(hasattr(provider, "_workers"))
             self.assertFalse(hasattr(provider, "_results"))
 
+    def test_dirty_reviewer_workspace_is_rebuilt_at_the_exact_head(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, head = self._repo(root)
+            provider = ClaudeAgentSDKReviewer(None, FakeAPI(head), MANIFEST,
+                                               str(source), str(root / "reviews"))
+            workspace = provider.workspace.prepare(REPO, 12, head)
+            (workspace / "untracked.txt").write_text("disposable drift\n")
+            repaired = provider.workspace.prepare(REPO, 12, head)
+            self.assertEqual(repaired, workspace)
+            self.assertEqual(git(repaired, "rev-parse", "HEAD"), head)
+            self.assertEqual(git(repaired, "status", "--porcelain"), "")
+
+    def test_stale_reviewer_workspace_is_rebuilt_at_the_exact_head(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, head = self._repo(root)
+            provider = ClaudeAgentSDKReviewer(None, FakeAPI(head), MANIFEST,
+                                               str(source), str(root / "reviews"))
+            workspace = provider.workspace.prepare(REPO, 12, head)
+            base = git(source, "rev-parse", "HEAD~1")
+            git(workspace, "checkout", base)
+            repaired = provider.workspace.prepare(REPO, 12, head)
+            self.assertEqual(repaired, workspace)
+            self.assertEqual(git(repaired, "rev-parse", "HEAD"), head)
+            self.assertEqual(git(repaired, "rev-parse", "--abbrev-ref", "HEAD"), "HEAD")
+
     def test_reviewer_resumes_same_session_after_per_call_turn_limit(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

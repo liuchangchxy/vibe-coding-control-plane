@@ -5,6 +5,7 @@ import argparse
 import json
 from pathlib import Path
 import re
+import shutil
 import subprocess
 
 
@@ -31,12 +32,27 @@ def _verify_checkout(source: Path, checkout: Path, revision: str) -> Path:
     if root != checkout.resolve() or _common_git_directory(root) != _common_git_directory(source):
         raise ValueError("existing revision checkout does not belong to the configured VCCP source")
     actual = _git(root, "rev-parse", "--verify", "HEAD").stdout.strip().lower()
-    if actual != revision.lower():
+    branch = _git(root, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    if actual != revision.lower() or branch != "HEAD":
         raise ValueError("existing revision checkout has the wrong VCCP revision")
     dirty = _git(root, "status", "--porcelain=v1", "--untracked-files=all").stdout
     if dirty.strip():
         raise ValueError("existing revision checkout is dirty")
     return root
+
+
+def _recreate_checkout(source: Path, checkout: Path) -> None:
+    """Discard only a registered exact-path worktree owned by this VCCP source."""
+    if checkout.is_symlink() or not checkout.is_dir():
+        raise ValueError("existing revision checkout is not a real directory")
+    root = Path(_git(checkout, "rev-parse", "--show-toplevel").stdout.strip()).resolve()
+    if root != checkout.resolve() or _common_git_directory(root) != _common_git_directory(source):
+        raise ValueError("existing revision checkout does not belong to the configured VCCP source")
+    removed = _git(source, "worktree", "remove", "--force", str(checkout), check=False)
+    if removed.returncode != 0:
+        raise ValueError("Git could not recreate the managed VCCP runtime checkout")
+    if checkout.exists():
+        shutil.rmtree(checkout)
 
 
 def ensure_runtime_checkout(source: str | Path, runtimes_root: str | Path,
@@ -53,7 +69,12 @@ def ensure_runtime_checkout(source: str | Path, runtimes_root: str | Path,
     root.mkdir(parents=True, exist_ok=True)
     checkout = root / revision.lower()
     if checkout.exists() or checkout.is_symlink():
-        return _verify_checkout(source_path, checkout, revision)
+        try:
+            return _verify_checkout(source_path, checkout, revision)
+        except ValueError as error:
+            if "does not belong" in str(error) or "not a real directory" in str(error):
+                raise
+            _recreate_checkout(source_path, checkout)
 
     object_check = _git(source_path, "cat-file", "-e", f"{revision.lower()}^{{commit}}", check=False)
     if object_check.returncode != 0:
