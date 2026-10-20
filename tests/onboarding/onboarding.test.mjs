@@ -366,6 +366,11 @@ test("schema, generated manifest, onboarding guide, contract, and Reviewer promp
   assert.match(contract, /same linked PR and implementation branch/);
   assert.match(contract, /schema v1 is unsupported/);
   assert.match(reviewer, /Dispatcher alone admits or rejects repairs/);
+  assert.match(reviewer, /VCCP deploy revision-upgrade PR/);
+  assert.match(reviewer, /full 64-hex PLAN id/);
+  assert.match(reviewer, /reviewer-task-prompt\.md/);
+  assert.match(reviewer, /A verified VCCP maintenance PR has no Issue/);
+  assert.match(reviewer, /Do not use it for remove PRs, onboarding PRs/);
   for (const text of [template, onboarding, contract, reviewer]) {
     assert.doesNotMatch(text, /three formal `?REQUEST_CHANGES`? repair rounds/i);
   }

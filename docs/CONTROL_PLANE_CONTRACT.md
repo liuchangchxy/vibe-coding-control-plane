@@ -62,8 +62,8 @@ Before formal review, verify all of the following from current GitHub state:
 - PR is open and not Draft.
 - Base branch equals the consumer manifest's configured branch.
 - PR author is in the configured Implementer allow-list.
-- Exactly one linked Frozen Issue can be determined.
-- That Issue has `frozen-spec` and has neither `infra-blocked` nor `needs-human`.
+- For a normal development PR, exactly one linked Frozen Issue can be determined and it has `frozen-spec` with neither `infra-blocked` nor `needs-human`.
+- A VCCP deploy revision-upgrade PR may use the maintenance review path instead of an Issue only when its deploy metadata, exact managed-file diff, manifest/lock revisions, artifact hashes, and canonical target commit all verify. This path does not apply to removal or other infrastructure PRs.
 - Current head SHA is unambiguous and still current at decision submission.
 - Every configured required check has a successful result for that exact head SHA. The consumer defines accepted success conclusions in its manifest.
 - The formal review is submitted against the exact current head SHA.
