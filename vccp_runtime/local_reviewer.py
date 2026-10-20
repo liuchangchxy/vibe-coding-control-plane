@@ -77,22 +77,28 @@ class LocalReviewerWriter:
         return data
 
     def _existing_decision(self, repo: str, pr: int, head: str):
-        status, reviews = self.provider.request(
-            "GET", f"/repos/{repo}/pulls/{pr}/reviews?per_page=100", repo)
-        if status != 200 or not isinstance(reviews, list) or len(reviews) >= 100:
-            raise ValueError("formal review state is incomplete")
+        reviews = self._formal_reviews(repo, pr)
         return next((review for review in reviews
                      if str((review.get("user") or {}).get("login") or "").casefold() == self.reviewer_login
                      and str(review.get("commit_id") or "").casefold() == head.casefold()
                      and review.get("state") in {"APPROVED", "CHANGES_REQUESTED"}), None)
 
     def _formal_review_exists_for_head(self, repo: str, pr: int, head: str) -> bool:
-        status, reviews = self.provider.request(
-            "GET", f"/repos/{repo}/pulls/{pr}/reviews?per_page=100", repo)
-        if status != 200 or not isinstance(reviews, list) or len(reviews) >= 100:
-            raise ValueError("formal review state is incomplete")
+        reviews = self._formal_reviews(repo, pr)
         return any(str(review.get("commit_id") or "").casefold() == head.casefold()
                    for review in reviews if isinstance(review, dict))
+
+    def _formal_reviews(self, repo: str, pr: int):
+        reviews = []
+        for page in range(1, 31):
+            status, payload = self.provider.request(
+                "GET", f"/repos/{repo}/pulls/{pr}/reviews?per_page=100&page={page}", repo)
+            if status != 200 or not isinstance(payload, list):
+                raise ValueError("formal review state is incomplete")
+            reviews.extend(payload)
+            if len(payload) < 100:
+                return reviews
+        raise ValueError("formal review history is incomplete")
 
     def _enable_auto_merge(self, repo: str, pull_request: dict):
         method = str(self.manifest["merge"]["method"]).upper()
@@ -194,7 +200,7 @@ class GitHubUserReviewerProvider:
             raise ValueError("Reviewer GitHub request is outside the configured Consumer")
         allowed = (
             method == "GET" and re.fullmatch(r"/repos/[^/]+/[^/]+/pulls/\d+", path)
-            or method == "GET" and re.fullmatch(r"/repos/[^/]+/[^/]+/pulls/\d+/reviews\?per_page=100", path)
+            or method == "GET" and re.fullmatch(r"/repos/[^/]+/[^/]+/pulls/\d+/reviews\?per_page=100&page=\d+", path)
             or method == "POST" and re.fullmatch(r"/repos/[^/]+/[^/]+/pulls/\d+/reviews", path)
             or method == "POST" and path == "/graphql"
         )

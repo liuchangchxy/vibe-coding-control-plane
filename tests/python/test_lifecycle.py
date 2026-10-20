@@ -59,6 +59,11 @@ class FakeWorkflow:
         return True
 
     def restore_repair_coordination_state(self, repo, issue, new_state, expected_revision):
+        snapshot = self.observe(repo, issue)
+        if (snapshot.coordination_state == new_state and snapshot.active_labels == (new_state,)
+                and not snapshot.terminal_labels and snapshot.issue_open and snapshot.frozen_spec
+                and not snapshot.canceled):
+            return True
         return self.transition_coordination_state(repo, issue, "needs-human", new_state, expected_revision)
 
     def discover_active(self, repo):
@@ -247,11 +252,15 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(pending["status"], "authorized_pending_activation")
         self.assertTrue(self.workflow.restore_repair_coordination_state(
             self.repo, self.issue, "changes-requested", needs_human.revision))
-        race = self.core.reconcile_once(self.repo, "owner", now=199)
-        self.assertEqual(race["items"][-1]["status"], "continuation_activation_pending")
+        # Simulate process exit after GitHub promotion but before SQLite activation.
+        promoted = replace(needs_human, revision="r9+", coordination_state="changes-requested",
+                          terminal_labels=(), active_labels=("changes-requested",))
+        self.workflow.snapshots[(self.repo, self.issue)] = promoted
+        race = self.core.authorize_repair_continuation(candidate, "maintainer")
+        self.assertEqual(race["status"], "authorized")
         self.assertEqual(self.core.store.attempt("legacy-budget")["phase"], "BUDGET_EXHAUSTED")
         self.assertEqual(self.core.authorize_repair_continuation(candidate, "maintainer")["status"],
-                         "authorized")
+                         "already_authorized")
         restored = self.core.store.flow(self.repo, self.issue)
         self.assertEqual((restored["trusted"], restored["initial_confirmed"], restored["repair_count"],
                           restored["repair_budget_known"]), (1, 1, 3, 1))

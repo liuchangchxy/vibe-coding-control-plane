@@ -77,8 +77,9 @@ class FakeGitHub:
         issue = self.issues[key]
         if "/issues/" in path and "?" not in path:
             return issue
-        if path.endswith("/reviews?per_page=100"):
-            return self.reviews[key]
+        if "/reviews?per_page=100&page=" in path:
+            page = int(path.rsplit("page=", 1)[1])
+            return self.reviews[key][(page - 1) * 100:page * 100]
         if "/check-runs?per_page=100" in path:
             sha = path.split("/commits/", 1)[1].split("/check-runs", 1)[0]
             runs = self.checks[key].get(sha, [])

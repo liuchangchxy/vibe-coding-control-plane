@@ -59,8 +59,9 @@ class FakeProvider:
             runs = self.checks or [{"name": "Unit Tests", "head_sha": HEAD, "status": "completed",
                                     "conclusion": "success", "id": 1}]
             return 200, {"total_count": len(runs), "check_runs": runs}
-        if path.endswith("/pulls/12/reviews?per_page=100"):
-            return 200, self.reviews
+        if "/pulls/12/reviews?per_page=100&page=" in path:
+            page = int(path.rsplit("page=", 1)[1])
+            return 200, self.reviews[(page - 1) * 100:page * 100]
         if path.endswith("/issues/7"):
             return 200, {"state": "open", "labels": [{"name": name} for name in self.labels]}
         if path.endswith("/pulls/12/reviews"):
@@ -434,7 +435,7 @@ class LocalReviewerWriterTests(unittest.TestCase):
                 self.review_reads = 0
 
             def request(self, method, path, repo, payload=None):
-                if path.endswith("/pulls/12/reviews?per_page=100"):
+                if path.endswith("/pulls/12/reviews?per_page=100&page=1"):
                     self.review_reads += 1
                     if self.review_reads == 2:
                         self.reviews = [{"commit_id": HEAD, "state": "APPROVED"}]
@@ -448,6 +449,14 @@ class LocalReviewerWriterTests(unittest.TestCase):
         self.assertEqual(result["status"], "formal_review_exists")
         self.assertFalse(any(call[0] == "POST" and call[1].endswith("/pulls/12/reviews")
                              for call in provider.calls))
+
+    def test_formal_review_checks_read_past_the_first_hundred(self):
+        provider = FakeProvider(reviews=[{"id": index, "commit_id": "b" * 40,
+                                          "state": "COMMENTED"} for index in range(100)]
+                                + [{"id": 101, "commit_id": HEAD, "state": "APPROVED"}])
+        writer = LocalReviewerWriter(provider, FakeWorkflow(), REPO, "liuchangchxy", MANIFEST)
+        self.assertTrue(writer._formal_review_exists_for_head(REPO, 12, HEAD))
+        self.assertEqual([call[1].rsplit("page=", 1)[1] for call in provider.calls], ["1", "2"])
 
     def test_durable_reviewer_claim_is_unique_per_repository_pr_and_head(self):
         with tempfile.TemporaryDirectory() as root:

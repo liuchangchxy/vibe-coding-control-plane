@@ -1039,16 +1039,20 @@ class _Store:
                     has_push = True
                     break
             if not has_push:
-                # Historical compatibility override: when controlled_pushes has no repo rows,
+                # Historical compatibility override: when this exact flow has no controlled pushes,
                 # require:
                 # 1. An explicit maintainer override bound to this exact exhausted flow.
                 # 2. A matching BUDGET_EXHAUSTED attempt with ordinal > 0.
                 # 3. All prior attempts in history have launch_outcome == "confirmed" and valid execution_id.
                 # 4. The attempt preceding BUDGET_EXHAUSTED has resulting_head_sha == candidate.head_sha.
-                repo_push_count = connection.execute(
-                    "SELECT COUNT(*) AS count FROM controlled_pushes WHERE repo=?", (repo,)
+                flow_push_count = connection.execute(
+                    "SELECT COUNT(*) AS count FROM controlled_pushes push "
+                    "JOIN attempts attempt ON attempt.attempt_id=push.attempt_id "
+                    "WHERE push.repo=? AND attempt.repo=? AND attempt.issue_number=? "
+                    "AND attempt.pr_number=? AND attempt.branch=?",
+                    (repo, repo, candidate.issue_number, candidate.pr_number, candidate.branch),
                 ).fetchone()["count"]
-                if repo_push_count == 0 and exhausted:
+                if flow_push_count == 0 and exhausted:
                     grant = connection.execute(
                         "SELECT authorization_id, authorized_by, legacy_maintenance_override "
                         "FROM repair_continuations WHERE repo=? AND issue_number=? AND pr_number=? "
@@ -1982,6 +1986,11 @@ class RuntimeCore:
                 if not restore or not restore(candidate.repo, candidate.issue_number, target, snapshot.revision):
                     return {"status": "authorization_pending_activation",
                             "authorization_id": existing["authorization_id"]}
+            elif (snapshot.coordination_state not in {target, "agent-working"}
+                  or snapshot.terminal_labels
+                  or (snapshot.active_labels and target not in snapshot.active_labels)):
+                return {"status": "authorization_pending_activation",
+                        "authorization_id": existing["authorization_id"]}
             if not existing["activated"]:
                 self.store.activate_continuation(existing["authorization_id"])
                 return {"status": "authorized", "authorization_id": existing["authorization_id"],

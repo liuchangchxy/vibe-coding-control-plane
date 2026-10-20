@@ -104,6 +104,10 @@ class FakeWorkflow:
             return True
 
     def restore_repair_coordination_state(self, repo, issue_number, new_state, expected_revision):
+        if (self.current.coordination_state in {new_state, "agent-working", "changes-requested"} and not self.current.terminal_labels
+                and new_state in {self.current.coordination_state, "changes-requested"}
+                and self.current.issue_open and self.current.frozen_spec):
+            return True
         return self.transition_coordination_state(repo, issue_number, "needs-human", new_state, expected_revision)
 
 

@@ -23,7 +23,9 @@ class FakeAPI:
     def get(self, path):
         if path.endswith("/issues/7"):
             return {"number": 7, "body": "Frozen spec criterion: preserve the API."}
-        if "/pulls/12/reviews?" in path: return self.reviews
+        if "/pulls/12/reviews?" in path:
+            page = int(path.rsplit("page=", 1)[1])
+            return self.reviews[(page - 1) * 100:page * 100]
         if "/pulls/12/files?" in path:
             return [{"filename": "code.py", "status": "modified", "additions": 1,
                      "deletions": 1, "patch": "-print('review me')\\n+print('changed')"}]
