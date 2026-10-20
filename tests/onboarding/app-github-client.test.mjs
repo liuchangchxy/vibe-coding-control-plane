@@ -64,11 +64,17 @@ test("createRef forwards narrowly requested permissions to the App bridge", asyn
 });
 
 test("public Git reads use the Windows NUL device for an empty global config", () => {
+  const originalPlatform = process.platform;
   let env;
-  const client = new AppGitHubClient({
-    runtimeConfig: { github_app: {} },
-    gitRunner: (_command, _args, options) => { env = options.env; return { status: 0, stdout: "", stderr: "" }; },
-  });
-  client.publicGit(["ls-remote"]);
-  assert.equal(env.GIT_CONFIG_GLOBAL, "NUL");
+  try {
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    const client = new AppGitHubClient({
+      runtimeConfig: { github_app: {} },
+      gitRunner: (_command, _args, options) => { env = options.env; return { status: 0, stdout: "", stderr: "" }; },
+    });
+    client.publicGit(["ls-remote"]);
+    assert.equal(env.GIT_CONFIG_GLOBAL, "NUL");
+  } finally {
+    Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+  }
 });
