@@ -75,6 +75,18 @@ def dispatch(request: dict, *, provider=None):
         return {"readable": False, "reason": "insufficient permission to read repository policy"}
     if status < 200 or status >= 300:
         raise GitHubHTTPError(status, action)
+    if action in {"listLabels", "listPullRequests"}:
+        rows = list(payload) if isinstance(payload, list) else []
+        page = 2
+        while isinstance(payload, list) and len(payload) == 100:
+            _, next_page = provider.request("GET", f"{path}&page={page}", repo)
+            if not isinstance(next_page, list):
+                raise ValueError(f"GitHub {action} returned a non-list page")
+            rows.extend(next_page)
+            if len(next_page) < 100:
+                break
+            page += 1
+        payload = rows
     if action == "getBranchProtection":
         return {"readable": True, "value": payload}
     if action == "listRulesets":

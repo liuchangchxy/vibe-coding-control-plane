@@ -4,16 +4,27 @@ import json
 from contextlib import closing
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
 import sys
 import xml.etree.ElementTree as ET
 
 from vccp_runtime.host_deployment import (inspect_windows_task, reconcile_macos_launch_agent,
-    reconcile_windows_task, remove_macos_launch_agent, remove_windows_task)
+    reconcile_windows_task, remove_macos_launch_agent, remove_windows_task, _consumer_windows_processes,
+    _runtime_config_digest)
 
 
 class HostDeploymentTests(unittest.TestCase):
+    def test_windows_process_repo_match_uses_exact_argument_value(self):
+        import vccp_runtime.host_deployment as deployment
+        processes = [
+            {"ProcessId": 1, "CommandLine": "python -m vccp_runtime.runner --repo owner/app --continuous"},
+            {"ProcessId": 2, "CommandLine": "python -m vccp_runtime.runner --repo owner/app2 --continuous"},
+        ]
+        with patch.object(deployment, "_windows_processes", return_value=processes):
+            self.assertEqual([row["ProcessId"] for row in _consumer_windows_processes("owner/app", None)], [1])
+
     def test_windows_status_verifies_task_process_pinned_checkout_and_config_digests(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -37,7 +48,7 @@ class HostDeploymentTests(unittest.TestCase):
             task_name = f"VCCP-Consumer-{suffix}"
             description = (f"VCCP Consumer {repo} runtime_revision={revision} "
                 f"manifest_sha256={hashlib.sha256(manifest.read_bytes()).hexdigest()} "
-                f"config_sha256={hashlib.sha256(config.read_bytes()).hexdigest()}")
+                f"config_sha256={_runtime_config_digest(config)}")
             args = (f'-u -m vccp_runtime.runner --manifest "{manifest.resolve()}" '
                     f'--runtime-config "{config.resolve()}" --repo {repo} --continuous --poll-interval 30')
             xml = (f'<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><RegistrationInfo>'
@@ -360,7 +371,7 @@ class HostDeploymentTests(unittest.TestCase):
                 "ProgramArguments": args, "WorkingDirectory": str(runtime.resolve()),
                 "EnvironmentVariables": {"PYTHONPATH": str(runtime.resolve())},
                 "VCCPManifestSHA256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
-                "VCCPRuntimeConfigSHA256": hashlib.sha256(config.read_bytes()).hexdigest()}))
+                "VCCPRuntimeConfigSHA256": _runtime_config_digest(config)}))
             calls = []
             def command(command, **kwargs):
                 calls.append(command)

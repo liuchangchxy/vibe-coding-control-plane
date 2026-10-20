@@ -26,6 +26,14 @@ def _windows_task_name(repo: str) -> str:
     return f"VCCP-Consumer-{suffix}"
 
 
+def _runtime_config_digest(path: str | Path) -> str:
+    config = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    if isinstance(config, dict):
+        config.pop("upgrade_target", None)
+    canonical = json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _windows_query(task_name, runner):
     result = _run(["schtasks.exe", "/Query", "/TN", task_name, "/XML"], runner)
     if result.returncode:
@@ -51,9 +59,9 @@ def _windows_processes(runner):
 
 
 def _consumer_windows_processes(repo, runner):
-    identity = f"--repo {repo}".casefold()
+    identity = re.compile(r"(?:^|\s)--repo(?:\s+|=)[\"']?" + re.escape(repo) + r"[\"']?(?=\s|$)", re.I)
     return [item for item in _windows_processes(runner)
-            if identity in str(item.get("CommandLine", "")).casefold()]
+            if identity.search(str(item.get("CommandLine", "")))]
 
 
 def _wait_windows_stopped(repo, runner):
@@ -110,7 +118,7 @@ def inspect_windows_task(*, repo: str, manifest_path: str, runtime_config_path: 
         working_directory = action.findtext("{*}WorkingDirectory")
         revision_match = re.search(r"runtime_revision=([0-9a-f]{40})", description, re.I)
         manifest_hash = hashlib.sha256(Path(manifest_path).expanduser().read_bytes()).hexdigest()
-        config_hash = hashlib.sha256(Path(runtime_config_path).expanduser().read_bytes()).hexdigest()
+        config_hash = _runtime_config_digest(runtime_config_path)
         digest_match = re.search(r"manifest_sha256=([0-9a-f]{64}) config_sha256=([0-9a-f]{64})", description, re.I)
         config_matches = bool(digest_match and digest_match.group(1).lower() == manifest_hash
                               and digest_match.group(2).lower() == config_hash)
@@ -154,7 +162,7 @@ def reconcile_windows_task(*, repo: str, runtime_root: str, manifest_path: str,
         return {"status": "blocked", "reason": "exact pinned runtime checkout is unavailable"}
     task_name = _windows_task_name(repo)
     manifest_hash = hashlib.sha256(manifest.read_bytes()).hexdigest()
-    config_hash = hashlib.sha256(config.read_bytes()).hexdigest()
+    config_hash = _runtime_config_digest(config)
     description = (f"VCCP Consumer {repo.casefold()} runtime_revision={runtime.name.lower()} "
                    f"manifest_sha256={manifest_hash} config_sha256={config_hash}")
     existing = _windows_query(task_name, runner)
@@ -341,7 +349,7 @@ def reconcile_macos_launch_agent(*, repo: str, runtime_root: str, manifest_path:
                          str(Path(runtime_config_path).expanduser().resolve()), "--repo", repo,
                          "--continuous", "--poll-interval", "30"]
         manifest_digest = hashlib.sha256(Path(manifest_path).expanduser().read_bytes()).hexdigest()
-        config_digest = hashlib.sha256(Path(runtime_config_path).expanduser().read_bytes()).hexdigest()
+        config_digest = _runtime_config_digest(runtime_config_path)
         if (current.get("WorkingDirectory") == str(runtime)
                 and current.get("ProgramArguments") == expected_args
                 and current.get("EnvironmentVariables", {}).get("PYTHONPATH") == str(runtime)
@@ -392,7 +400,7 @@ def reconcile_macos_launch_agent(*, repo: str, runtime_root: str, manifest_path:
         "StandardErrorPath": old.get("StandardErrorPath", str(destination.parent / f"{label}.err.log")),
         "ProcessType": "Standard",
         "VCCPManifestSHA256": hashlib.sha256(Path(manifest_path).expanduser().read_bytes()).hexdigest(),
-        "VCCPRuntimeConfigSHA256": hashlib.sha256(Path(runtime_config_path).expanduser().read_bytes()).hexdigest(),
+        "VCCPRuntimeConfigSHA256": _runtime_config_digest(runtime_config_path),
     }
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(destination.name + f".{os.getpid()}.tmp")

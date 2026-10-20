@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { createOnboardingPlan } from "../../lib/onboarding/plan.mjs";
 import { applyOnboardingPlan, auditConsumer } from "../../lib/onboarding/apply.mjs";
-import { runOnboardingCli } from "../../lib/onboarding/cli.mjs";
+import { fastForwardMergedConsumer, runOnboardingCli } from "../../lib/onboarding/cli.mjs";
 import { createManifest, parseManifest, stringifyManifest, validateManifest } from "../../lib/onboarding/manifest.mjs";
 
 const SOURCE = "liuchangchxy/vibe-coding-control-plane";
@@ -48,7 +48,8 @@ class FakeGitHub {
   async getRepository() { return this.repository; }
   async getBranch(repo, name) {
     if (repo === SOURCE && name === "main") return { name, commit: { sha: REV_B } };
-    return repo === REPO && name === "main" ? { name, commit: { sha: "c".repeat(40) } } : null;
+    return repo === REPO && this.repository.branches.includes(name)
+      ? { name, commit: { sha: "c".repeat(40) } } : null;
   }
   async getCommit(source, sha) { return source === SOURCE && this.reachableRevisions.has(sha); }
   async listLabels() { return structuredClone(this.labels); }
@@ -125,6 +126,38 @@ test("fresh input creates a read-only plan pinned to a reachable canonical revis
     assert.equal(github.labelCreates.length, 0);
     await assert.rejects(readFile(path.join(root, ".github/control-plane.yml")));
   });
+});
+
+test("deploy checkout convergence fast-forwards only a clean base branch", async () => {
+  const parent = await mkdtemp(path.join(tmpdir(), "vccp-fast-forward-"));
+  try {
+    const remote = path.join(parent, "remote.git");
+    const consumer = path.join(parent, "consumer");
+    const updater = path.join(parent, "updater");
+    execFileSync("git", ["init", "--bare", "-q", remote]);
+    execFileSync("git", ["init", "-q", "-b", "main", consumer]);
+    execFileSync("git", ["-C", consumer, "config", "user.email", "test@example.com"]);
+    execFileSync("git", ["-C", consumer, "config", "user.name", "Test"]);
+    await writeFile(path.join(consumer, "README.md"), "base\n");
+    execFileSync("git", ["-C", consumer, "add", "."]);
+    execFileSync("git", ["-C", consumer, "commit", "-qm", "base"]);
+    execFileSync("git", ["-C", consumer, "remote", "add", "origin", remote]);
+    execFileSync("git", ["-C", consumer, "push", "-qu", "origin", "main"]);
+    execFileSync("git", ["clone", "-q", "--branch", "main", remote, updater]);
+    execFileSync("git", ["-C", updater, "config", "user.email", "test@example.com"]);
+    execFileSync("git", ["-C", updater, "config", "user.name", "Test"]);
+    await writeFile(path.join(updater, "README.md"), "merged\n");
+    execFileSync("git", ["-C", updater, "commit", "-qam", "merged maintenance PR"]);
+    execFileSync("git", ["-C", updater, "push", "-q", "origin", "HEAD:main"]);
+    assert.equal(fastForwardMergedConsumer(consumer, "main"), true);
+    assert.equal((await readFile(path.join(consumer, "README.md"), "utf8")).replace(/\r\n/g, "\n"), "merged\n");
+    await writeFile(path.join(consumer, "README.md"), "local edits\n");
+    await writeFile(path.join(updater, "README.md"), "next merge\n");
+    execFileSync("git", ["-C", updater, "commit", "-qam", "next merge"]);
+    execFileSync("git", ["-C", updater, "push", "-q", "origin", "HEAD:main"]);
+    assert.equal(fastForwardMergedConsumer(consumer, "main"), false);
+    assert.equal(await readFile(path.join(consumer, "README.md"), "utf8"), "local edits\n");
+  } finally { await rm(parent, { recursive: true, force: true }); }
 });
 
 test("clean consumer plans VCCP cleanup creation and an exact managed cleanup is idempotent", async () => {
@@ -366,6 +399,13 @@ test("schema v1 parses as legacy, preserves stale-plan protection, and never rew
     assert.equal(applied.overall_status, "repository_upgrade_required");
     assert.deepEqual(applied.applied, []);
 
+    const deployPlan = await createOnboardingPlan({ repo: REPO, root, github, upgradeLegacy: true });
+    assert.equal(deployPlan.overall_status, "repository_changes_planned",
+      JSON.stringify(deployPlan.items.filter(({ status }) => ["blocked", "conflict"].includes(status))));
+    assert.equal(deployPlan.desired_manifest.schema_version, 2);
+    assert.ok(deployPlan.items.some(({ id, path: file, status }) => id === "manifest" && file && status === "update"));
+    assert.ok(deployPlan.items.some(({ id, status }) => id !== "manifest" && ["create", "update"].includes(status)));
+
     let auditOutput = "";
     let auditErrors = "";
     const auditCode = await runOnboardingCli(["audit", "--repo", REPO, "--path", root], {
@@ -415,6 +455,7 @@ test("schema v1 parses as legacy, preserves stale-plan protection, and never rew
 test("deploy turns a valid schema v1 Consumer into a deterministic v2 maintenance upgrade", async () => {
   await withRepo(async (root) => {
     const github = new FakeGitHub();
+    github.repository.branches.push("release");
     const source = `schema_version: 1\nvccp:\n  source: ${SOURCE}\n  revision: ${REV_A}\nrepository:\n  base_branch: release\n  implementer_authors:\n    - custom-builder[bot]\nissue_contract:\n  frozen_spec_label: frozen-spec\n  active_coordination_labels: [agent-ready, agent-working, changes-requested]\n  terminal_coordination_labels: [infra-blocked, needs-human]\n  max_request_changes_rounds: 3\nreviewer:\n  transport: chatgpt-work-github-webhook-task\n  events: [pull_request.opened, pull_request.ready_for_review, pull_request.synchronize]\n  exact_head_sha_required: true\n  required_checks_completion: same_run_wait_until_terminal\n  required_checks:\n    - name: Custom CI\n      accepted_conclusions: [success]\nmerge:\n  native_auto_merge: true\n  enable_native_auto_merge_by: reviewer\n  method: rebase\n  direct_merge_forbidden: true\n  admin_bypass_forbidden_in_normal_flow: true\nreporting:\n  pull_request_template: true\n`;
     await mkdir(path.join(root, ".github"), { recursive: true });
     await writeFile(path.join(root, ".github/control-plane.yml"), source);
@@ -429,7 +470,8 @@ test("deploy turns a valid schema v1 Consumer into a deterministic v2 maintenanc
     });
     const report = JSON.parse(output);
     assert.equal(code, 2);
-    assert.equal(report.overall_status, "MAINTENANCE_PR_OPEN");
+    assert.equal(report.overall_status, "MAINTENANCE_PR_OPEN",
+      JSON.stringify(report.items?.filter(({ status }) => ["blocked", "conflict"].includes(status)) ?? report.errors));
     assert.equal(published.overall_status, "repository_changes_planned");
     assert.equal(published.desired_manifest.schema_version, 2);
     assert.equal(published.desired_manifest.repository.base_branch, "release");
@@ -1005,7 +1047,8 @@ test("deploy persists an open upgrade target, resumes it after merge, and clears
       githubFactory: () => github, maintenancePublisher: async ({ plan }) => ({ status: "open", plan_id: plan.plan_id }),
     });
     assert.equal(firstCode, 2);
-    assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")).upgrade_target, { repository: REPO, revision: REV_B });
+    assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")).upgrade_target,
+      { repository: REPO, revision: REV_B, from_revision: REV_A });
 
     output = "";
     const rerunCode = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root, "--runtime-config", configPath], {

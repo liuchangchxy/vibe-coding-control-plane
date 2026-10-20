@@ -15,6 +15,24 @@ class Provider:
 
 
 class OnboardingGitHubTests(unittest.TestCase):
+    def test_app_bridge_paginates_labels_and_open_pull_requests(self):
+        class PaginatedProvider(Provider):
+            def request(self, method, path, repo, payload=None, **kwargs):
+                self.calls.append((method, path, repo, payload, kwargs))
+                page = int(path.rsplit("&page=", 1)[1]) if "&page=" in path else 1
+                if "/labels?" in path:
+                    return 200, ([{"name": f"label-{i}"} for i in range(100)] if page == 1 else [{"name": "last"}])
+                if "/pulls?" in path:
+                    return 200, ([{"number": i} for i in range(100)] if page == 1 else [{"number": 101}])
+                return super().request(method, path, repo, payload, **kwargs)
+
+        provider = PaginatedProvider()
+        labels = dispatch({"action": "listLabels", "repo": "owner/repo"}, provider=provider)
+        pulls = dispatch({"action": "listPullRequests", "repo": "owner/repo"}, provider=provider)
+        self.assertEqual(len(labels), 101)
+        self.assertEqual(len(pulls), 101)
+        self.assertTrue(any("page=2" in call[1] for call in provider.calls))
+
     def test_workflow_permission_preflight_only_checks_token_permissions(self):
         provider = Provider()
         result = dispatch({"action": "checkPermissions", "repo": "owner/repo",
