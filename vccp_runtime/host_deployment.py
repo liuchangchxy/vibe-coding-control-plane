@@ -88,11 +88,17 @@ def _restore_windows_task(task_name, previous, runner):
         repo = re.search(r"--repo\s+([^\s\"]+)", arguments)
         if action is None or not repo:
             return False
+        expected_command = str(Path(action.findtext("{*}Command", "")).resolve()).casefold()
+        expected_arguments = re.sub(r"\s+", " ", arguments).strip().casefold()
         try:
-            return any(str(item.get("CommandLine", "")).casefold().find(arguments.casefold()) >= 0
-                       and str(Path(item.get("ExecutablePath", "")).resolve()).casefold()
-                       == str(Path(action.findtext("{*}Command", "")).resolve()).casefold()
-                       for item in _consumer_windows_processes(repo.group(1), runner))
+            for _ in range(20):
+                processes = _consumer_windows_processes(repo.group(1), runner)
+                if any(re.sub(r"\s+", " ", str(item.get("CommandLine", "")).strip()).casefold().endswith(expected_arguments)
+                       and str(Path(item.get("ExecutablePath", "")).resolve()).casefold() == expected_command
+                       for item in processes):
+                    return True
+                time.sleep(0.25)
+            return False
         except (OSError, ValueError, json.JSONDecodeError):
             return False
     finally:
@@ -176,7 +182,13 @@ def reconcile_windows_task(*, repo: str, runtime_root: str, manifest_path: str,
                 and observed.get("running_checkout_clean") and observed.get("config_matches")):
             return {"status": "running", "no_op": True, **observed}
         stopped = _run(["schtasks.exe", "/End", "/TN", task_name], runner)
-        if stopped.returncode and _consumer_windows_processes(repo, runner):
+        try:
+            remaining = _consumer_windows_processes(repo, runner)
+        except (OSError, ValueError, json.JSONDecodeError):
+            restored = _restore_windows_task(task_name, existing, runner)
+            return {"status": "blocked", "reason": "Windows Runner process state could not be inspected",
+                    "previous_runner_restored": restored}
+        if stopped.returncode and remaining:
             return {"status": "blocked", "reason": "existing Consumer Runner could not be stopped"}
         try:
             stopped = _wait_windows_stopped(repo, runner)

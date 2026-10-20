@@ -142,6 +142,44 @@ class HostDeploymentTests(unittest.TestCase):
             self.assertTrue(any(call[:2] == ["schtasks.exe", "/End"] for call in calls))
             self.assertTrue(any(call[:2] == ["schtasks.exe", "/Delete"] for call in calls))
 
+    def test_windows_reconcile_restarts_an_idle_registered_task_when_end_fails(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runtime = root / ("b" * 40)
+            runtime.mkdir()
+            manifest, config = root / "manifest.yml", root / "runtime.json"
+            manifest.write_text("manifest\n")
+            config.write_text("{}\n")
+            repo = "owner/consumer"
+            old_xml = (f'<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><RegistrationInfo>'
+                       f'<Description>VCCP Consumer {repo} runtime_revision={"a" * 40}</Description></RegistrationInfo>'
+                       f'<Actions><Exec><Command>{sys.executable}</Command><Arguments>-m vccp_runtime.runner '
+                       f'--repo {repo}</Arguments></Exec></Actions></Task>')
+            running = False
+            calls = []
+            def runner(command, **_kwargs):
+                nonlocal running
+                calls.append(command)
+                if command[:2] == ["schtasks.exe", "/Query"]:
+                    return SimpleNamespace(returncode=0, stdout=old_xml, stderr="")
+                if command[:2] == ["schtasks.exe", "/End"]:
+                    return SimpleNamespace(returncode=1, stdout="", stderr="no running instance")
+                if command[:2] == ["schtasks.exe", "/Create"]:
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if command[:2] == ["schtasks.exe", "/Run"]:
+                    running = True
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if command[0] == "powershell.exe":
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            result = reconcile_windows_task(repo=repo, runtime_root=str(runtime), manifest_path=str(manifest),
+                runtime_config_path=str(config), python_executable=sys.executable,
+                readiness=lambda _runtime: {"status": "ready"}, runner=runner)
+            self.assertEqual(result["status"], "blocked", result)  # no exact pinned process was launched
+            self.assertTrue(running)
+            self.assertTrue(any(call[:2] == ["schtasks.exe", "/Create"] for call in calls))
+            self.assertTrue(any(call[:2] == ["schtasks.exe", "/Run"] for call in calls))
+
     def test_windows_deploy_status_remove_converges_on_one_pinned_runner(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
