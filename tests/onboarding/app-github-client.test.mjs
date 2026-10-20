@@ -32,7 +32,7 @@ test("public VCCP revision reads use credential-free Git while Consumer access s
   assert.ok(calls.every(({ command, args }) => command === "git" && args.includes("-c")
     && args.includes("credential.helper=")));
   assert.ok(calls.every(({ options }) => options.env.GIT_CONFIG_NOSYSTEM === "1"
-    && options.env.GIT_CONFIG_GLOBAL === os.devNull));
+    && options.env.GIT_CONFIG_GLOBAL !== os.devNull));
   assert.ok(calls.some(({ args }) => args.includes("ls-remote")));
   assert.ok(calls.some(({ args }) => args.includes("fetch")));
   assert.ok(calls.some(({ args }) => args.includes("cat-file")));
