@@ -423,10 +423,16 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(driver.advance_once(self.repo, "owner", 102)["items"][0]["status"],
                          "WAITING_REVIEW")
 
-    def test_infrastructure_and_ambiguous_ci_failures_fail_closed(self):
+    def test_infrastructure_ci_failure_reobserves_twice_before_terminal(self):
         self.update(check_runs=self.failure(conclusion="timed_out"))
-        result = self.driver().advance_once(self.repo, "owner", 100)
-        self.assertEqual(result["items"][0]["status"], "infra-blocked")
+        driver = self.driver()
+        first = driver.advance_once(self.repo, "owner", 100)
+        self.assertEqual(first["items"][0]["status"], "WAITING_CI")
+        self.assertEqual(first["items"][0]["infrastructure_retry"], 1)
+        second = driver.advance_once(self.repo, "owner", 101)
+        self.assertEqual(second["items"][0]["infrastructure_retry"], 2)
+        third = driver.advance_once(self.repo, "owner", 102)
+        self.assertEqual(third["items"][0]["status"], "infra-blocked")
         self.assertEqual(len(self.implementer.launches), 1)
 
         self.tearDown(); self.setUp()

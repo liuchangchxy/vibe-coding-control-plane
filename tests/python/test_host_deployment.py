@@ -70,15 +70,31 @@ class HostDeploymentTests(unittest.TestCase):
             config.write_text("{}\n")
             repo = "owner/consumer"
             description = f"VCCP Consumer {repo} runtime_revision={'a' * 40} manifest_sha256={'0' * 64} config_sha256={'0' * 64}"
+            executable = str(Path(sys.executable).resolve())
+            arguments = f'-m vccp_runtime.runner --runtime-config "{config.resolve()}" --repo {repo} --manifest "{manifest.resolve()}"'
             old_xml = (f'<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><RegistrationInfo>'
-                       f'<Description>{description}</Description></RegistrationInfo></Task>')
+                       f'<Description>{description}</Description></RegistrationInfo><Actions><Exec>'
+                       f'<Command>{executable}</Command><Arguments>{arguments}</Arguments>'
+                       f'</Exec></Actions></Task>')
             calls = []
+            ended = False
+            run_count = 0
             def runner(command, **_kwargs):
+                nonlocal ended, run_count
                 calls.append(command)
                 if command[0] == "schtasks.exe" and command[1] == "/Query":
                     return SimpleNamespace(returncode=0, stdout=old_xml, stderr="")
                 if command[0] == "powershell.exe":
+                    if ended and run_count == 0:
+                        return SimpleNamespace(returncode=0, stdout="", stderr="")
+                    return SimpleNamespace(returncode=0, stdout=json.dumps({
+                        "ProcessId": 42, "ExecutablePath": executable,
+                        "CommandLine": f'{executable} {arguments}'}), stderr="")
+                if command[:2] == ["schtasks.exe", "/End"]:
+                    ended = True
                     return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if command[:2] == ["schtasks.exe", "/Run"]:
+                    run_count += 1
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
             result = reconcile_windows_task(repo=repo, runtime_root=str(runtime),
                 manifest_path=str(manifest), runtime_config_path=str(config),
@@ -136,9 +152,15 @@ class HostDeploymentTests(unittest.TestCase):
             repo = "owner/consumer"
             current_task = None
             running = False
+            end_idle = True
+            old_description = f"VCCP Consumer {repo} runtime_revision={'a' * 40} manifest_sha256={'0' * 64} config_sha256={'0' * 64}"
+            old_task = (f'<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><RegistrationInfo>'
+                        f'<Description>{old_description}</Description></RegistrationInfo><Actions><Exec>'
+                        f'<Command>{sys.executable}</Command><Arguments>-m vccp_runtime.runner '
+                        f'--runtime-config "{config}" --repo {repo}</Arguments></Exec></Actions></Task>')
 
             def runner(command, **_kwargs):
-                nonlocal current_task, running
+                nonlocal current_task, running, end_idle
                 if command[0] == "schtasks.exe":
                     if command[1] == "/Query":
                         if current_task is None:
@@ -151,6 +173,8 @@ class HostDeploymentTests(unittest.TestCase):
                         running = True
                     elif command[1] == "/End":
                         running = False
+                        if end_idle:
+                            return SimpleNamespace(returncode=1, stdout="", stderr="ERROR: no running instance")
                     elif command[1] == "/Delete":
                         current_task = None
                     return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -164,6 +188,7 @@ class HostDeploymentTests(unittest.TestCase):
                     return SimpleNamespace(returncode=0, stdout=json.dumps(process), stderr="")
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
 
+            current_task = old_task
             deployed = reconcile_windows_task(repo=repo, runtime_root=str(runtime),
                 manifest_path=str(manifest), runtime_config_path=str(config),
                 python_executable=sys.executable, readiness=lambda _path: {"status": "ready"}, runner=runner)

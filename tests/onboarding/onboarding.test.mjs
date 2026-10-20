@@ -412,6 +412,37 @@ test("schema v1 parses as legacy, preserves stale-plan protection, and never rew
   });
 });
 
+test("deploy turns a valid schema v1 Consumer into a deterministic v2 maintenance upgrade", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const source = `schema_version: 1\nvccp:\n  source: ${SOURCE}\n  revision: ${REV_A}\nrepository:\n  base_branch: release\n  implementer_authors:\n    - custom-builder[bot]\nissue_contract:\n  frozen_spec_label: frozen-spec\n  active_coordination_labels: [agent-ready, agent-working, changes-requested]\n  terminal_coordination_labels: [infra-blocked, needs-human]\n  max_request_changes_rounds: 3\nreviewer:\n  transport: chatgpt-work-github-webhook-task\n  events: [pull_request.opened, pull_request.ready_for_review, pull_request.synchronize]\n  exact_head_sha_required: true\n  required_checks_completion: same_run_wait_until_terminal\n  required_checks:\n    - name: Custom CI\n      accepted_conclusions: [success]\nmerge:\n  native_auto_merge: true\n  enable_native_auto_merge_by: reviewer\n  method: rebase\n  direct_merge_forbidden: true\n  admin_bypass_forbidden_in_normal_flow: true\nreporting:\n  pull_request_template: true\n`;
+    await mkdir(path.join(root, ".github"), { recursive: true });
+    await writeFile(path.join(root, ".github/control-plane.yml"), source);
+    const configPath = path.join(root, "runtime.json");
+    await writeFile(configPath, JSON.stringify(localEnrollment(root)));
+    let published;
+    let output = "";
+    const code = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root, "--runtime-config", configPath], {
+      stdout: { write: (text) => { output += text; } }, stderr: { write: (text) => assert.fail(text) },
+      githubFactory: () => github,
+      maintenancePublisher: async ({ plan }) => { published = plan; return { status: "open", number: 17 }; },
+    });
+    const report = JSON.parse(output);
+    assert.equal(code, 2);
+    assert.equal(report.overall_status, "MAINTENANCE_PR_OPEN");
+    assert.equal(published.overall_status, "repository_changes_planned");
+    assert.equal(published.desired_manifest.schema_version, 2);
+    assert.equal(published.desired_manifest.repository.base_branch, "release");
+    assert.deepEqual(published.desired_manifest.repository.implementer_authors, ["custom-builder[bot]"]);
+    assert.deepEqual(published.desired_manifest.reviewer.required_checks, [{ name: "Custom CI", accepted_conclusions: ["success"] }]);
+    assert.equal(published.desired_manifest.merge.method, "rebase");
+    assert.equal(published.desired_manifest.reporting.pull_request_template, true);
+    assert.equal(published.items.find(({ id }) => id === "manifest").status, "update");
+    assert.match(published.items.find(({ id }) => id === "manifest").content, /schema_version: 2/);
+    assert.equal(await readFile(path.join(root, ".github/control-plane.yml"), "utf8"), source);
+  });
+});
+
 test("apply writes the consumer state and the second plan/apply is a no-op", async () => {
   await withRepo(async (root) => {
     const github = new FakeGitHub();
@@ -953,6 +984,55 @@ test("deploy keeps an installed manifest pin unless a revision is explicitly pro
     assert.equal(code, 0);
     assert.equal(JSON.parse(output).desired_revision, REV_A);
     assert.equal(deployed.manifest.vccp.revision, REV_A);
+  });
+});
+
+test("deploy persists an open upgrade target, resumes it after merge, and clears it after runtime convergence", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const initial = await createOnboardingPlan({ repo: REPO, root, input: validInput(REV_A), github });
+    await applyOnboardingPlan({ plan: initial, root, github });
+    const configPath = path.join(root, "runtime.json");
+    await writeFile(configPath, JSON.stringify({ ...localEnrollment(root), providers: [
+      { key: "antigravity", type: "antigravity", executable: "/bin/true" },
+      { key: "claude_code", type: "claude_code", executable: "/bin/true" },
+    ], implementer_provider: "antigravity", reviewer_provider: "claude_code", reviewer_github_identity: "reviewer-user" }));
+
+    let output = "";
+    const firstCode = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root,
+      "--runtime-config", configPath, "--propose-revision", REV_B], {
+      stdout: { write: (text) => { output += text; } }, stderr: { write: (text) => assert.fail(text) },
+      githubFactory: () => github, maintenancePublisher: async ({ plan }) => ({ status: "open", plan_id: plan.plan_id }),
+    });
+    assert.equal(firstCode, 2);
+    assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")).upgrade_target, { repository: REPO, revision: REV_B });
+
+    output = "";
+    const rerunCode = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root, "--runtime-config", configPath], {
+      stdout: { write: (text) => { output += text; } }, stderr: { write: (text) => assert.fail(text) },
+      githubFactory: () => github, maintenancePublisher: async ({ plan }) => {
+        assert.equal(plan.desired_manifest.vccp.revision, REV_B);
+        return { status: "open", plan_id: plan.plan_id };
+      },
+    });
+    assert.equal(rerunCode, 2);
+
+    const mergedUpgrade = await createOnboardingPlan({ repo: REPO, root, github, revisionProposal: REV_B });
+    await applyOnboardingPlan({ plan: mergedUpgrade, root, github });
+    github.reachableRevisions.add(REV_C);
+    const getBranch = github.getBranch.bind(github);
+    github.getBranch = async (repo, name) => repo === SOURCE && name === "main"
+      ? { name, commit: { sha: REV_C } } : getBranch(repo, name);
+    let deployed;
+    output = "";
+    const resumeCode = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root, "--runtime-config", configPath], {
+      stdout: { write: (text) => { output += text; } }, stderr: { write: (text) => assert.fail(text) },
+      githubFactory: () => github, runtimeRevision: REV_B,
+      hostDeployer: async (request) => { deployed = request; return { status: "running", revision: REV_B }; },
+    });
+    assert.equal(resumeCode, 0, output);
+    assert.equal(deployed.manifest.vccp.revision, REV_B);
+    assert.equal(JSON.parse(await readFile(configPath, "utf8")).upgrade_target, undefined);
   });
 });
 

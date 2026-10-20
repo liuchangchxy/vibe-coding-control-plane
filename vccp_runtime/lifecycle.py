@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+import re
 
 from .core import RepairCandidate, _ci_cause_is_current
 
@@ -334,8 +335,20 @@ class LifecycleDriver:
                 results.append({"issue": issue, "trigger": "ci_repair", **self.core.dispatch_repair(candidate)})
                 continue
             if check_state == "infrastructure":
-                results.append(self._terminal(repo_key, issue, snapshot, "infra-blocked", current,
-                                              "explicit_infrastructure_failure"))
+                prior = self.core.store.lifecycle_state(repo_key, issue)
+                match = re.fullmatch(r"infrastructure-retry:(\d+)",
+                    (prior or {}).get("outcome") or "")
+                retries = int(match.group(1)) if match else 0
+                if retries >= 2:
+                    results.append(self._terminal(repo_key, issue, snapshot, "infra-blocked", current,
+                                                  "explicit_infrastructure_failure"))
+                else:
+                    deadline = self._set_waiting(repo_key, issue, "WAITING_CI", head, current)
+                    self.core.store.set_lifecycle(repo_key, issue, "WAITING_CI", head, current,
+                                                  self.timeouts["waiting_ci"],
+                                                  outcome=f"infrastructure-retry:{retries + 1}")
+                    results.append({"issue": issue, "status": "WAITING_CI", "head": head,
+                                    "deadline_at": deadline, "infrastructure_retry": retries + 1})
                 continue
             if check_state == "ambiguous":
                 results.append(self._terminal(repo_key, issue, snapshot, "needs-human", current,

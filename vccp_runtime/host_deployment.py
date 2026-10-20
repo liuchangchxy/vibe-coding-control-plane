@@ -72,7 +72,21 @@ def _restore_windows_task(task_name, previous, runner):
         previous_xml = ET.tostring(previous, encoding="unicode")
         temporary.write_text(f'<?xml version="1.0" encoding="UTF-16"?>{previous_xml}', encoding="utf-16")
         created = _run(["schtasks.exe", "/Create", "/TN", task_name, "/XML", str(temporary), "/F"], runner)
-        return created.returncode == 0 and _run(["schtasks.exe", "/Run", "/TN", task_name], runner).returncode == 0
+        if created.returncode or _run(["schtasks.exe", "/Run", "/TN", task_name], runner).returncode:
+            return False
+        restored = ET.fromstring(temporary.read_text(encoding="utf-16").lstrip("\ufeff"))
+        action = restored.find(".//{*}Actions/{*}Exec")
+        arguments = action.findtext("{*}Arguments", "") if action is not None else ""
+        repo = re.search(r"--repo\s+([^\s\"]+)", arguments)
+        if action is None or not repo:
+            return False
+        try:
+            return any(str(item.get("CommandLine", "")).casefold().find(arguments.casefold()) >= 0
+                       and str(Path(item.get("ExecutablePath", "")).resolve()).casefold()
+                       == str(Path(action.findtext("{*}Command", "")).resolve()).casefold()
+                       for item in _consumer_windows_processes(repo.group(1), runner))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -154,7 +168,7 @@ def reconcile_windows_task(*, repo: str, runtime_root: str, manifest_path: str,
                 and observed.get("running_checkout_clean") and observed.get("config_matches")):
             return {"status": "running", "no_op": True, **observed}
         stopped = _run(["schtasks.exe", "/End", "/TN", task_name], runner)
-        if stopped.returncode:
+        if stopped.returncode and _consumer_windows_processes(repo, runner):
             return {"status": "blocked", "reason": "existing Consumer Runner could not be stopped"}
         try:
             stopped = _wait_windows_stopped(repo, runner)

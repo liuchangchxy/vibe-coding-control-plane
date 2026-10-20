@@ -186,6 +186,7 @@ test("maintenance publisher creates a deterministic removal PR and adopts it on 
     const github = {
       async listPullRequests() { return prs; },
       async getBranch() { return { commit: { sha: base } }; },
+      async checkPermissions(_repo, permissions) { calls.permissionChecks ??= []; calls.permissionChecks.push(permissions); },
       async getCommit(_repo, shaValue) { return shaValue === base
         ? { sha: base, commit: { tree: { sha: "base-tree" } } }
         : { sha: shaValue, commit: { message: `VCCP remove ${REPO} plan ${plan.plan_id}` }, parents: [{ sha: base }] }; },
@@ -208,6 +209,40 @@ test("maintenance publisher creates a deterministic removal PR and adopts it on 
       { path: ".github/workflows/managed.yml", mode: "100644", type: "blob", sha: null },
     ]);
     assert.deepEqual(calls.refPermissions[0], { workflows: "write" });
+    assert.deepEqual(calls.permissionChecks, [{ workflows: "write" }]);
     assert.match(first.branch, /^codex-vccp-remove-/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("maintenance publisher checks workflow permission before any repository mutation", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vccp-publish-workflow-"));
+  try {
+    execFileSync("git", ["init", "-q", root]);
+    execFileSync("git", ["-C", root, "config", "user.email", "test@example.invalid"]);
+    execFileSync("git", ["-C", root, "config", "user.name", "Test"]);
+    execFileSync("git", ["-C", root, "remote", "add", "origin", `https://github.com/${REPO}.git`]);
+    await writeFile(path.join(root, ".gitignore"), "runtime.json\n");
+    execFileSync("git", ["-C", root, "add", "."]);
+    execFileSync("git", ["-C", root, "commit", "-qm", "base"]);
+    const base = execFileSync("git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const calls = [];
+    const github = {
+      async listPullRequests() { return []; },
+      async getBranch() { return { commit: { sha: base } }; },
+      async checkPermissions(_repo, permissions) { calls.push(["checkPermissions", permissions]); throw new Error("permission denied"); },
+      async createLabel() { calls.push(["createLabel"]); },
+      async createBlob() { calls.push(["createBlob"]); },
+      async createTree() { calls.push(["createTree"]); },
+      async createCommit() { calls.push(["createCommit"]); },
+      async createRef() { calls.push(["createRef"]); },
+      async createPullRequest() { calls.push(["createPullRequest"]); },
+    };
+    const plan = { command: "deploy", repo: REPO, plan_id: "e".repeat(64), snapshot: { base_branch: "main", base_branch_sha: base },
+      items: [{ path: ".github/workflows/managed.yml", status: "create", content: "name: managed\n" },
+        { id: "labels", status: "create", create: [{ name: "VCCP / Ready" }] }] };
+    const result = await publishMaintenancePlan({ plan, github, root });
+    assert.equal(result.status, "unavailable");
+    assert.match(result.detail, /permission denied/);
+    assert.deepEqual(calls, [["checkPermissions", { workflows: "write" }]]);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
