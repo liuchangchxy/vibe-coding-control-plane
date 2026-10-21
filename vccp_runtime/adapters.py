@@ -544,7 +544,7 @@ def generic_prompt(request: LaunchRequest, workspace: str, policy: dict,
     common = (f"Repository: {request.repo}\nFrozen Issue: #{request.issue_number}\nWorkspace: {workspace}\n"
               "Read the Frozen Issue from GitHub and treat it as the sole task specification. "
               f"Controlled GitHub writer: {app_gh}\nControlled git push wrapper: {app_git_push}\n"
-              "Do not expand scope or merge. Report tests actually run. Ordinary host-human gh writes are "
+              "Prefer the smallest shared root-cause change satisfying the Frozen Issue. Do not add speculative validation, fallback paths, abstractions, compatibility layers, or unrelated hardening. Do not expand scope or merge. Report tests actually run. Ordinary host-human gh writes are "
               "forbidden; use only the configured controlled App writer for GitHub writes. Ordinary git push "
               "is forbidden; use only the configured controlled push wrapper. Do not persist or request GitHub "
               "tokens. The PR body MUST include a GitHub closing reference to this Frozen Issue, for example "
