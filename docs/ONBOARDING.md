@@ -1,6 +1,6 @@
 # Consumer Onboarding
 
-This guide covers two separate concerns: repository onboarding installs the shared Control Plane contract, while machine-local activation supplies paths, credentials, and ownership needed to construct the Generic Runtime. Every consumer owns its application CI and its own Reviewer Task instance. Run the CLI from a local clone of VCCP and the target consumer checkout; it does not copy the VCCP source tree into the consumer. Newly generated consumer manifests use schema v2 and one shared three-repair budget.
+This guide covers two separate concerns: repository onboarding installs the shared Control Plane contract, while machine-local activation supplies paths, credentials, and ownership needed to construct the Generic Runtime. Every consumer owns its application CI and binds its Local Reviewer in machine-local configuration. Run the CLI from a local clone of VCCP and the target consumer checkout; it does not copy the VCCP source tree into the consumer. Newly generated consumer manifests use schema v2 and one shared three-repair budget.
 
 ## 1. Configure the consumer
 
@@ -45,9 +45,9 @@ When cleanup is missing, APPLY installs a thin workflow adapter referencing VCCP
 
 The optional `.github/PULL_REQUEST_TEMPLATE/vccp.md` is only a reporting aid. If the consumer already has a default PR template, onboarding leaves it untouched and does not force a second template. The Reviewer contract itself enforces exactly one linked Frozen Issue and current PR state.
 
-## 3. Create a per-repository Reviewer task
+## 3. Configure the per-repository Local Reviewer
 
-In ChatGPT Work, create a GitHub webhook Task specifically for this consumer repository and attach the rendered `.github/vccp/reviewer-task-prompt.md`. This is an external step: local CLI cannot create or verify the Task or claim it exists. The Task starts on `opened`, `ready_for_review`, and `synchronize`; within the same event-triggered run it treats both an unobserved check (which may not have been created yet) and a queued/in-progress/pending check as not-yet-terminal and continues waiting. It rechecks the captured head SHA after every wait, and only reports a still-absent check as `missing/timeout` at the run deadline/platform limit. A terminal unaccepted conclusion stops approval. No check-completion trigger or separate polling mechanism is used.
+Use the machine-local provider bindings `reviewer_provider` and `reviewer_github_identity` (or the corresponding `deploy` flags) to select the Consumer's independent Local Reviewer. The Claude Agent SDK Reviewer reads a disposable exact-head workspace and returns a structured verdict; the VCCP Runtime validates current checks and writes the formal GitHub review. The generated `.github/vccp/reviewer-task-prompt.md` remains the managed review contract, not an instruction to create an external ChatGPT Work Task.
 
 Branch protection and rulesets are read-only audited and remain an external maintainer step. Onboarding never replaces these objects. The existing Python Generic Runtime is the runtime wiring boundary; no future Dispatcher registration is required by repository onboarding.
 
@@ -138,7 +138,7 @@ For evidence reporting, use the operational levels below: Level 1 repository rea
 
 ### Consumer upgrade and start sequence
 
-1. Read the Consumer's current default branch, manifest, installation lock, and pinned VCCP revision. Independently verify the external Reviewer Task state and whether a production Dispatcher owner already exists. A local prompt file does not prove a Reviewer Task exists or is enabled; if the execution context cannot inspect Work Tasks, report `Reviewer external status requires verification`.
+1. Read the Consumer's default branch, manifest, installation lock, and pinned VCCP revision. Verify the machine-local Reviewer provider/identity binding and whether a production Dispatcher owner already exists.
 2. Select a full 40-character VCCP commit SHA. Never pin a branch name.
 3. From the VCCP checkout at that exact SHA, run `node scripts/onboard-consumer.mjs plan --repo OWNER/REPO --path /path/to/consumer --input onboarding.json`. Inspect the desired revision, file diffs, required checks, artifacts, and external steps.
 4. Apply only the saved PLAN, using `node scripts/onboard-consumer.mjs apply --repo OWNER/REPO --path /path/to/consumer --plan /path/to/plan.json`. APPLY revalidates observed state and rejects a stale plan.
@@ -154,7 +154,7 @@ The `claude_agent_sdk` Reviewer uses the installed `claude-agent-sdk` dependency
 
 Repository changes are published on a deterministic maintenance branch and opened as a PR when the configured GitHub client has the required write permission. The command never writes the Consumer base branch. If the GitHub App cannot publish the PR, output contains the complete PLAN and a structured `maintenance_pr_required` action; finish that exact PLAN through an authorized GitHub connector, merge the maintenance PR, and rerun `deploy`. Repeated runs adopt the same open PR and use existing repository/runtime/launcher facts to resume. Once the manifest is merged, `deploy` prepares `~/.vccp/runtimes/<full-sha>/`, preflights machine readiness, then reconciles and verifies the native host. An unchanged running host is a no-op when its runtime, manifest, and config match.
 
-`node scripts/vccp.mjs status --repo OWNER/REPO --path /path/to/consumer --runtime-config /absolute/path/to/consumer-runtime.json` is the read-only deployment view. Its overall status is `READY`, `NEEDS_ACTION`, or `BLOCKED`; repository, machine, and runtime facts explain the result. A stopped or uninstalled Consumer needs action. A running owner on the wrong revision or a blocked repository is blocked. `READY` requires the exact clean runtime to be running with matching manifest/config digests and successful machine qualification. External Reviewer Tasks and repository policies remain explicitly `unverified` when the current GitHub connection cannot read them.
+`node scripts/vccp.mjs status --repo OWNER/REPO --path /path/to/consumer --runtime-config /absolute/path/to/consumer-runtime.json` is the read-only deployment view. Its overall status is `READY`, `NEEDS_ACTION`, or `BLOCKED`; repository, machine, and runtime facts explain the result. A stopped or uninstalled Consumer needs action. A running owner on the wrong revision or a blocked repository is blocked. `READY` requires the exact clean runtime to be running with matching manifest/config digests and successful machine qualification. Repository policies remain explicitly `unverified` when the current GitHub connection cannot read them.
 
 ### Unified `vccp remove`
 
@@ -174,9 +174,9 @@ Use `--admin` only when the explicitly authorized maintenance operation must byp
 
 ### Reviewer and Dispatcher are different paths
 
-The Dispatcher discovers Frozen Issues through the production Runtime's 30-second polling loop and launches the Implementer. Reviewer is a separate ChatGPT Work GitHub Webhook Task triggered by PR `opened`, `ready_for_review`, and `synchronize` events. VCCP does not require a fully webhook-driven lifecycle: Reviewer events do not imply that Dispatcher polling must be replaced. Do not add a webhook receiver, public endpoint, tunnel, queue, event gateway, or cloud function to this deployment path.
+The Dispatcher discovers Frozen Issues through the production Runtime cycle and launches the Implementer. On an actionable PR with accepted exact-head checks, the same Runtime advances the independent Local Reviewer. No separate external Reviewer webhook Task is required.
 
-The Reviewer Task is an external state. Reuse an existing Task for this repository when verified; create one only when none exists. If it cannot be inspected, leave its status unverified. An empty repository webhook listing does not prove that a ChatGPT Work Task is absent.
+The Local Reviewer is owned by the Consumer's Runtime. Its exact-head execution and formal review outcome are observable through local Runtime and GitHub state.
 
 ### Readiness, Runner modes, and logs
 
