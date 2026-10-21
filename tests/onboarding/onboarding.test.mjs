@@ -538,6 +538,59 @@ test("revision changes only through an explicit proposal and lock-confirmed upgr
   });
 });
 
+test("a revision-only upgrade never regresses a managed Reviewer prompt to a stale template", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const oldTemplates = await mkdtemp(path.join(tmpdir(), "vccp-templates-old-"));
+    const newTemplates = await mkdtemp(path.join(tmpdir(), "vccp-templates-new-"));
+    try {
+      // REV_A is the stale authoritative revision; REV_B carries the current prompt.
+      for (const [directory, version] of [[oldTemplates, "old"], [newTemplates, "new"]]) {
+        await writeFile(path.join(directory, "coordination-label-cleanup.yml"), "on:\n  issues:\n    types: [closed]\nruns-on: ubuntu-latest\njobs: {}\n");
+        await writeFile(path.join(directory, "pull_request_template.md"), `maintenance-aware ${version}\n`);
+        await writeFile(path.join(directory, "reviewer-task-prompt.md"),
+          `# ChatGPT Work Reviewer Task — Canonical Prompt\n\nReview contract ${version}.\n\nYou are the Reviewer for exactly one consumer repository. Read that repository's \`.github/control-plane.yml\` as configuration and this prompt as the authority contract.\n`);
+      }
+      const hashOf = (content) => createHash("sha256").update(content).digest("hex");
+      const reviewerPath = ".github/vccp/reviewer-task-prompt.md";
+      const promptPath = path.join(root, reviewerPath);
+
+      // The Consumer already carries REV_B's prompt and a lock that proves it.
+      const installed = await createOnboardingPlan({ repo: REPO, root, input: validInput(REV_B), github,
+        templatesRoot: newTemplates });
+      assert.equal((await applyOnboardingPlan({ plan: installed, root, github })).overall_status, "repository_ready");
+      const currentPrompt = await readFile(promptPath, "utf8");
+      assert.match(currentPrompt, /Review contract new/);
+      const currentLockSource = await readFile(path.join(root, ".github/vccp/installation-lock.json"), "utf8");
+      assert.equal(JSON.parse(currentLockSource).artifacts.find(({ path: file }) => file === reviewerPath).sha256,
+        hashOf(currentPrompt.replace(/\r\n/g, "\n")));
+
+      // A revision-only upgrade whose prompt is unchanged must not manufacture a diff.
+      const upgrade = await createOnboardingPlan({ repo: REPO, root, github, revisionProposal: REV_B,
+        templatesRoot: newTemplates, runtimeRevision: REV_B });
+      assert.equal(upgrade.overall_status, "repository_ready");
+      assert.equal(upgrade.items.find((item) => item.id === `file:${reviewerPath}`).status, "satisfied");
+      assert.equal(upgrade.items.find((item) => item.id === "installation-lock").status, "satisfied");
+      assert.equal(await readFile(promptPath, "utf8"), currentPrompt);
+
+      // Regression for the EasyExam deploy that reverted a correct prompt: a checkout
+      // still at REV_A, upgrading to REV_B, must never emit REV_A's older prompt.
+      const stale = await createOnboardingPlan({ repo: REPO, root, github, revisionProposal: REV_B,
+        templatesRoot: oldTemplates, runtimeRevision: REV_A });
+      assert.equal(stale.overall_status, "repository_blocked");
+      assert.equal(stale.generated_files, undefined);
+      assert.equal(JSON.stringify(stale).includes("Review contract old"), false);
+      assert.equal(stale.items.find((item) => item.path === reviewerPath).status, "blocked");
+      assert.equal(stale.items.some((item) => item.content !== undefined && item.path === reviewerPath), false);
+      assert.equal(await readFile(promptPath, "utf8"), currentPrompt);
+      assert.equal(await readFile(path.join(root, ".github/vccp/installation-lock.json"), "utf8"), currentLockSource);
+    } finally {
+      await rm(oldTemplates, { recursive: true, force: true });
+      await rm(newTemplates, { recursive: true, force: true });
+    }
+  });
+});
+
 test("managed artifact drift blocks apply without overwriting consumer edits", async () => {
   await withRepo(async (root) => {
     const github = new FakeGitHub();
@@ -926,7 +979,7 @@ test("deploy reuses PLAN and opens a structured maintenance PR without changing 
       stderr: { write: (text) => assert.fail(text) },
       githubFactory: () => github,
       maintenancePublisher: async () => ({ status: "open", number: 7, url: "https://github.com/example/consumer/pull/7" }),
-      runtimeRevision: REV_A,
+      runtimeRevision: REV_B,
     });
     const report = JSON.parse(output);
     assert.equal(code, 2);
@@ -936,6 +989,34 @@ test("deploy reuses PLAN and opens a structured maintenance PR without changing 
     assert.equal(report.next_action.type, "maintenance_pr_review_and_merge");
     assert.equal(github.labelCreates.length, 0);
     await assert.rejects(readFile(path.join(root, ".github/control-plane.yml")));
+  });
+});
+
+test("deploy refuses to render a revision upgrade from a stale VCCP checkout", async () => {
+  await withRepo(async (root) => {
+    const github = new FakeGitHub();
+    const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(REV_A), github });
+    await applyOnboardingPlan({ plan, root, github });
+    const configPath = path.join(root, "runtime.json");
+    await writeFile(configPath, JSON.stringify(localEnrollment(root)));
+    let output = "";
+    let errors = "";
+    const code = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root,
+      "--runtime-config", configPath, "--propose-revision", REV_B], {
+      stdout: { write: (text) => { output += text; } },
+      stderr: { write: (text) => { errors += text; } },
+      githubFactory: () => github,
+      runtimeRevision: REV_A,
+      maintenancePublisher: async () => assert.fail("must not publish artifacts rendered from a stale checkout"),
+    });
+    const report = JSON.parse(output);
+    assert.equal(errors, "");
+    assert.equal(code, 2);
+    assert.equal(report.overall_status, "BLOCKED");
+    const blocked = report.items.find(({ status }) => status === "blocked");
+    assert.equal(blocked.status, "blocked");
+    assert.match(blocked.reason, /runtime revision a{40}, not target revision b{40}/);
+    assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")).upgrade_target, undefined);
   });
 });
 
@@ -1040,6 +1121,7 @@ test("deploy persists an open upgrade target, resumes it after merge, and clears
       "--runtime-config", configPath, "--propose-revision", REV_B], {
       stdout: { write: (text) => { output += text; } }, stderr: { write: (text) => assert.fail(text) },
       githubFactory: () => github, maintenancePublisher: async ({ plan }) => ({ status: "open", plan_id: plan.plan_id }),
+      runtimeRevision: REV_B,
     });
     assert.equal(firstCode, 2);
     assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")).upgrade_target,
@@ -1048,7 +1130,8 @@ test("deploy persists an open upgrade target, resumes it after merge, and clears
     output = "";
     const rerunCode = await runOnboardingCli(["deploy", "--repo", REPO, "--path", root, "--runtime-config", configPath], {
       stdout: { write: (text) => { output += text; } }, stderr: { write: (text) => assert.fail(text) },
-      githubFactory: () => github, maintenancePublisher: async ({ plan }) => {
+      githubFactory: () => github, runtimeRevision: REV_B,
+      maintenancePublisher: async ({ plan }) => {
         assert.equal(plan.desired_manifest.vccp.revision, REV_B);
         return { status: "open", plan_id: plan.plan_id };
       },
