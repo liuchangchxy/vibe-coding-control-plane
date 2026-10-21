@@ -11,7 +11,7 @@ Frozen Issue (frozen-spec + agent-ready)
 → Dispatcher/Sidecar claim (agent-working)
 → Implementer PR
 → consumer-defined required checks for the current head SHA
-→ per-repository ChatGPT Work Reviewer task
+→ local exact-head Reviewer (Claude Agent SDK)
 → native APPROVE or REQUEST_CHANGES
 → GitHub native Auto-merge
 ```
@@ -20,7 +20,7 @@ Formal `REQUEST_CHANGES` reopens work on the same PR. VCCP v2 allows three autom
 
 ## Use this repository
 
-Start with [consumer onboarding](docs/ONBOARDING.md). The Node CLI produces a read-only JSON PLAN, applies only explicitly safe changes from a saved plan, and audits committed consumer state. It never creates ChatGPT Work Tasks or writes branch protection.
+Start with [consumer onboarding](docs/ONBOARDING.md). The Node CLI produces a read-only JSON PLAN, applies only explicitly safe changes from a saved plan, and audits committed consumer state. It does not change branch protection.
 
 The same CLI supports `vccp deploy` and `vccp remove` for Consumer runtime lifecycle. Remove opens a deterministic maintenance PR for VCCP-owned files, then stops and unregisters only that Consumer's machine runtime after the PR is merged. It preserves GitHub history and policies, shared credentials/providers, SQLite history, and shared runtime checkouts.
 
