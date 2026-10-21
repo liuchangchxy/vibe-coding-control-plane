@@ -64,6 +64,18 @@ class HostDeploymentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "state could not be inspected"):
             deployment._windows_query("VCCP-Consumer-example", runner)
 
+    def test_windows_localized_query_failure_still_confirms_missing_task(self):
+        import vccp_runtime.host_deployment as deployment
+        calls = []
+        def runner(command, **_kwargs):
+            calls.append(command)
+            if command[:2] == ["schtasks.exe", "/Query"]:
+                return SimpleNamespace(returncode=1, stdout="", stderr="错误: 系统找不到指定的文件。")
+            return SimpleNamespace(returncode=3, stdout="", stderr="")
+        self.assertIsNone(deployment._windows_query("VCCP-Consumer-example", runner))
+        self.assertTrue(any(command[0] == "powershell.exe" and "Schedule.Service" in command[-1]
+                            for command in calls))
+
     def test_windows_process_repo_match_uses_exact_argument_value(self):
         import vccp_runtime.host_deployment as deployment
         processes = [
@@ -276,6 +288,8 @@ class HostDeploymentTests(unittest.TestCase):
                         current_task = None
                     return SimpleNamespace(returncode=0, stdout="", stderr="")
                 if command[0] == "powershell.exe":
+                    if "Schedule.Service" in command[-1]:
+                        return SimpleNamespace(returncode=3 if current_task is None else 0, stdout="", stderr="")
                     if not running or current_task is None:
                         return SimpleNamespace(returncode=0, stdout="", stderr="")
                     task = ET.fromstring(current_task)

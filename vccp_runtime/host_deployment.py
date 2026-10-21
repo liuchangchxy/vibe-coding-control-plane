@@ -37,20 +37,17 @@ def _runtime_config_digest(path: str | Path) -> str:
 def _windows_query(task_name, runner):
     result = _run(["schtasks.exe", "/Query", "/TN", task_name, "/XML"], runner)
     if result.returncode:
-        detail = f"{result.stdout or ''}\n{result.stderr or ''}".casefold()
-        if not detail.strip():
-            check = _run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-                          "$service = New-Object -ComObject Schedule.Service; $service.Connect(); "
-                          f"try {{ $service.GetFolder('\\').GetTask('{task_name}') | Out-Null; exit 0 }} "
-                          "catch [System.Runtime.InteropServices.COMException] { "
-                          "if ($_.Exception.HResult -eq -2147024894) { exit 3 }; exit 4 }"], runner)
-            if check.returncode == 3:
-                return None
-            raise ValueError(f"Windows Task Scheduler state could not be inspected: {detail.strip()}")
-        if any(phrase in detail for phrase in ("cannot find the file", "does not exist", "cannot find the task",
-                                               "cannot find the path specified")):
+        # schtasks localizes its failure text, so task absence is decided by the
+        # scheduler object model instead of by matching error message strings.
+        check = _run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                      "$service = New-Object -ComObject Schedule.Service; $service.Connect(); "
+                      f"try {{ $service.GetFolder('\\').GetTask('{task_name}') | Out-Null; exit 0 }} "
+                      "catch { if ($_.Exception.HResult -eq -2147024894) { exit 3 }; exit 4 }"], runner)
+        if check.returncode == 3:
             return None
-        raise ValueError(f"Windows Task Scheduler state could not be inspected: {detail.strip()}")
+        detail = "\n".join(part.strip() for part in
+                           (result.stdout, result.stderr, check.stdout, check.stderr) if part and part.strip())
+        raise ValueError(f"Windows Task Scheduler state could not be inspected: {detail}")
     return ET.fromstring(result.stdout.lstrip("\ufeff"))
 
 
@@ -300,6 +297,12 @@ def remove_windows_task(*, repo: str, database_path: str, runtime_config_path: s
 
 
 def _run(command, runner, **kwargs):
+    # Native Windows tools (schtasks, PowerShell) write console code page bytes.
+    # Python's UTF-8 mode would otherwise fail to decode them and silently drop
+    # stdout/stderr, hiding task and Runner process state.
+    if os.name == "nt":
+        kwargs.setdefault("encoding", "oem")
+        kwargs.setdefault("errors", "replace")
     return runner(command, text=True, capture_output=True, check=False, timeout=20, **kwargs)
 
 
