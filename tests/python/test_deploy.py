@@ -113,6 +113,31 @@ class ProviderRebindCheckTests(unittest.TestCase):
         self.assertEqual(result["status"], "blocked")
         self.assertIn("active Consumer execution", result["reason"])
 
+    def test_retry_eligible_history_does_not_block_provider_rebind_or_change_ledger(self):
+        with tempfile.TemporaryDirectory() as folder:
+            database = Path(folder) / "state.sqlite"
+            with closing(sqlite3.connect(database)) as connection:
+                connection.execute("CREATE TABLE attempts(repo TEXT, phase TEXT, closeout_pending INTEGER)")
+                connection.executemany("INSERT INTO attempts VALUES('owner/repo', ?, 0)",
+                                       [("RETRY_ELIGIBLE",), ("MERGED_SUCCESS",)])
+                connection.commit()
+            before = database.read_bytes()
+            code, result = self.run_check(database)
+            self.assertEqual(database.read_bytes(), before)
+        self.assertEqual((code, result), (2, {"status": "ready", "reason": None}))
+
+    def test_retry_eligible_pending_closeout_still_blocks_provider_rebind(self):
+        with tempfile.TemporaryDirectory() as folder:
+            database = Path(folder) / "state.sqlite"
+            with closing(sqlite3.connect(database)) as connection:
+                connection.execute("CREATE TABLE attempts(repo TEXT, phase TEXT, closeout_pending INTEGER)")
+                connection.execute("INSERT INTO attempts VALUES('owner/repo', 'RETRY_ELIGIBLE', 1)")
+                connection.commit()
+            code, result = self.run_check(database)
+        self.assertEqual(code, 2)
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("active Consumer execution", result["reason"])
+
     def test_provider_rebind_check_never_raises_name_error(self):
         with tempfile.TemporaryDirectory() as folder:
             database = Path(folder) / "missing" / "state.sqlite"
