@@ -486,7 +486,16 @@ def _active_work(repo, database_path):
                 if active:
                     return f"active Consumer execution exists ({', '.join(sorted(set(active)))})"
             if "controlled_pushes" in tables:
-                pending = connection.execute("SELECT 1 FROM controlled_pushes WHERE lower(repo)=lower(?) AND phase='intent' LIMIT 1", (repo,)).fetchone()
+                # An intent only fences the external push it began. When a later row proves the
+                # same attempt delivered the same ref at the same SHA, that intent is superseded
+                # evidence rather than active work; anything else still blocks.
+                pending = connection.execute(
+                    "SELECT 1 FROM controlled_pushes intent WHERE lower(intent.repo)=lower(?) "
+                    "AND intent.phase='intent' AND NOT EXISTS ("
+                    "SELECT 1 FROM controlled_pushes done WHERE done.phase='completed' "
+                    "AND done.attempt_id=intent.attempt_id AND lower(done.repo)=lower(intent.repo) "
+                    "AND done.destination_ref=intent.destination_ref "
+                    "AND lower(done.expected_sha)=lower(intent.expected_sha)) LIMIT 1", (repo,)).fetchone()
                 if pending:
                     return "active controlled push is awaiting durable closeout"
             if "reviewer_executions" in tables:

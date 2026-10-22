@@ -10,6 +10,8 @@ from pathlib import Path
 from vccp_runtime.deploy import _macos_dispatcher_label, deploy_host, main
 from vccp_runtime.host_deployment import _runtime_config_digest
 
+SHA = "5e9688e1716d570431692ae1b0d61c5c44a2eee4"
+
 
 class DeployHostTests(unittest.TestCase):
     def test_default_macos_label_includes_owner_and_has_collision_resistant_suffix(self):
@@ -116,6 +118,46 @@ class ProviderRebindCheckTests(unittest.TestCase):
             database = Path(folder) / "missing" / "state.sqlite"
             code, result = self.run_check(database)
         self.assertEqual((code, result), (2, {"status": "ready", "reason": None}))
+
+    def pushes(self, database, rows):
+        with closing(sqlite3.connect(database)) as connection:
+            connection.execute("CREATE TABLE attempts(repo TEXT, phase TEXT, closeout_pending INTEGER)")
+            connection.execute("CREATE TABLE controlled_pushes(attempt_id TEXT, repo TEXT, "
+                               "destination_ref TEXT, expected_sha TEXT, phase TEXT)")
+            connection.executemany("INSERT INTO controlled_pushes VALUES(?,?,?,?,?)", rows)
+            connection.commit()
+
+    def test_intent_superseded_by_the_same_completed_push_does_not_block(self):
+        with tempfile.TemporaryDirectory() as folder:
+            database = Path(folder) / "state.sqlite"
+            self.pushes(database, [("attempt-1", "owner/repo", "branch/1", SHA, "intent"),
+                                   ("attempt-1", "owner/repo", "branch/1", SHA, "completed")])
+            code, result = self.run_check(database)
+        self.assertEqual((code, result), (2, {"status": "ready", "reason": None}))
+
+    def test_a_lone_intent_still_blocks(self):
+        with tempfile.TemporaryDirectory() as folder:
+            database = Path(folder) / "state.sqlite"
+            self.pushes(database, [("attempt-1", "owner/repo", "branch/1", SHA, "intent")])
+            code, result = self.run_check(database)
+        self.assertEqual(code, 2)
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("active controlled push", result["reason"])
+
+    def test_completed_push_must_match_attempt_ref_and_sha_to_supersede(self):
+        other = "a" * 40
+        for label, completed in {
+            "another attempt": ("attempt-2", "owner/repo", "branch/1", SHA, "completed"),
+            "another ref": ("attempt-1", "owner/repo", "branch/2", SHA, "completed"),
+            "another sha": ("attempt-1", "owner/repo", "branch/1", other, "completed"),
+            "another repository": ("attempt-1", "owner/other", "branch/1", SHA, "completed"),
+        }.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as folder:
+                database = Path(folder) / "state.sqlite"
+                self.pushes(database, [("attempt-1", "owner/repo", "branch/1", SHA, "intent"), completed])
+                code, result = self.run_check(database)
+                self.assertEqual(code, 2)
+                self.assertEqual(result["status"], "blocked")
 
 
 if __name__ == "__main__":
