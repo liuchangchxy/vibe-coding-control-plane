@@ -1,9 +1,13 @@
+import io
+import json
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from unittest.mock import patch
 from pathlib import Path
 
-from vccp_runtime.deploy import _macos_dispatcher_label, deploy_host
+from vccp_runtime.deploy import _macos_dispatcher_label, deploy_host, main
 from vccp_runtime.host_deployment import _runtime_config_digest
 
 
@@ -72,6 +76,46 @@ class DeployHostTests(unittest.TestCase):
             self.assertEqual(result["status"], "running")
             self.assertEqual(calls[0][0][1:], ["-m", "vccp_runtime.deploy"])
             self.assertEqual(calls[0][1]["cwd"], str(source))
+
+
+class ProviderRebindCheckTests(unittest.TestCase):
+    """The onboarding CLI switches Providers only through this deploy entry point."""
+
+    def run_check(self, database):
+        payload = {"operation": "provider-rebind-check", "repo": "owner/repo",
+                   "local_config": {"database_path": str(database)}}
+        out = io.StringIO()
+        with patch("sys.stdin", io.StringIO(json.dumps(payload))), patch("sys.stdout", out):
+            code = main()
+        return code, json.loads(out.getvalue())
+
+    def test_provider_rebind_check_is_ready_without_active_work(self):
+        with tempfile.TemporaryDirectory() as folder:
+            database = Path(folder) / "state.sqlite"
+            with closing(sqlite3.connect(database)) as connection:
+                connection.execute("CREATE TABLE attempts(repo TEXT, phase TEXT, closeout_pending INTEGER)")
+                connection.execute("INSERT INTO attempts VALUES('owner/repo', 'MERGED_SUCCESS', 0)")
+                connection.commit()
+            code, result = self.run_check(database)
+        self.assertEqual((code, result), (2, {"status": "ready", "reason": None}))
+
+    def test_provider_rebind_check_blocks_on_active_work(self):
+        with tempfile.TemporaryDirectory() as folder:
+            database = Path(folder) / "state.sqlite"
+            with closing(sqlite3.connect(database)) as connection:
+                connection.execute("CREATE TABLE attempts(repo TEXT, phase TEXT, closeout_pending INTEGER)")
+                connection.execute("INSERT INTO attempts VALUES('owner/repo', 'PR_BOUND', 0)")
+                connection.commit()
+            code, result = self.run_check(database)
+        self.assertEqual(code, 2)
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("active Consumer execution", result["reason"])
+
+    def test_provider_rebind_check_never_raises_name_error(self):
+        with tempfile.TemporaryDirectory() as folder:
+            database = Path(folder) / "missing" / "state.sqlite"
+            code, result = self.run_check(database)
+        self.assertEqual((code, result), (2, {"status": "ready", "reason": None}))
 
 
 if __name__ == "__main__":

@@ -175,6 +175,98 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn("criterion 2 needs browser evidence", result["items"][0]["outcome"])
         self.assertEqual(len(self.implementer.launches), 1)
 
+    # --- Reviewer APPROVE must become durable before GitHub fast auto-merge -------
+
+    class ApprovingReviewer:
+        """Reviewer that submits APPROVE into the pass that launched it."""
+
+        def __init__(self, repo, event="APPROVE", decision_status="review_submitted", **fields):
+            self.repo, self.event, self.decision_status, self.fields = repo, event, decision_status, fields
+            self.calls = []
+
+        def advance(self, repo, issue, pr, head):
+            self.calls.append((repo, issue, pr, head))
+            return {"status": "review_decision_submitted", "event": self.event,
+                    "head_sha": head, "decision_status": self.decision_status, **self.fields}
+
+    def test_reviewer_approve_is_durable_waiting_merge_in_the_same_pass(self):
+        # Case A: the approval lands inside this pass, GitHub has not merged yet.
+        reviewer = self.ApprovingReviewer(self.repo)
+        self.update(check_runs=self.accepted())
+        result = self.driver(local_reviewer=reviewer).advance_once(self.repo, "owner", 100)
+
+        self.assertEqual(result["items"][0]["status"], "WAITING_MERGE")
+        state = self.core.store.lifecycle_state(self.repo, self.issue)
+        self.assertEqual((state["phase"], state["head_sha"]), ("WAITING_MERGE", SHA))
+
+        # The next pass sees the APPROVED review and still waits: nothing is merged yet.
+        self.update(formal_review_state="APPROVED", formal_review_id="review-9",
+                    formal_review_head_sha=SHA)
+        self.assertEqual(self.driver().advance_once(self.repo, "owner", 101)["items"][0]["status"],
+                         "WAITING_MERGE")
+
+    def test_approve_followed_by_fast_auto_merge_and_auto_close_reaches_merged_success(self):
+        # Case B: GitHub merges and closes the Issue between the two passes. The Issue
+        # timeline loses willCloseTarget, so the canonical PR disappears from the snapshot
+        # and the bound attempt is fenced; the durable WAITING_MERGE written in the
+        # approval pass is the only proof left.
+        reviewer = self.ApprovingReviewer(self.repo)
+        self.update(check_runs=self.accepted())
+        self.assertEqual(self.driver(local_reviewer=reviewer).advance_once(self.repo, "owner", 100)
+                         ["items"][0]["status"], "WAITING_MERGE")
+        self.workflow.merged[44] = {"headRefName": "implement/7", "headRefOid": SHA}
+        self.workflow.snapshots[(self.repo, self.issue)] = self.hidden_closing_link_snapshot()
+
+        cycle = run_once(self.runtime(), self.repo, "owner", 101)
+
+        self.assertIn("merged_success", [item.get("status") for item in cycle["lifecycle"]["items"]])
+        self.assertNotIn("unresolved_canonical_pr",
+                         [item.get("status") for item in cycle["lifecycle"]["items"]])
+        self.assertEqual(self.core.store.attempts_for_repo(self.repo)[0]["phase"], "MERGED_SUCCESS")
+        state = self.core.store.lifecycle_state(self.repo, self.issue)
+        self.assertEqual((state["phase"], state["head_sha"]), ("MERGED_SUCCESS", SHA))
+        self.assertEqual(state["outcome"], "merged")
+        self.assertNotEqual(self.core.store.attempts_for_repo(self.repo)[0]["phase"],
+                            "STOPPED_CANCELLED")
+
+    def test_fast_merge_without_the_durable_approval_head_does_not_recover(self):
+        # The same race with the durable WAITING_MERGE removed is exactly production's
+        # failure; this pins the proof the fix supplies rather than the recovery path.
+        self.workflow.merged[44] = {"headRefName": "implement/7", "headRefOid": SHA}
+        self.workflow.snapshots[(self.repo, self.issue)] = self.hidden_closing_link_snapshot()
+        self.core.reconcile_once(self.repo, "owner", 101)
+        self.assertEqual(self.core.store.attempts_for_repo(self.repo)[0]["phase"], "STOPPED_CANCELLED")
+        self.driver().advance_once(self.repo, "owner", 102)
+        self.assertEqual(self.core.store.attempts_for_repo(self.repo)[0]["phase"], "STOPPED_CANCELLED")
+
+    def test_reviewer_approve_at_another_head_never_writes_waiting_merge(self):
+        reviewer = self.ApprovingReviewer(self.repo, head_sha=SHA_B)
+        self.update(check_runs=self.accepted())
+        result = self.driver(local_reviewer=reviewer).advance_once(self.repo, "owner", 100)
+        self.assertEqual(result["items"][0]["status"], "WAITING_REVIEW")
+        self.assertEqual(self.core.store.lifecycle_state(self.repo, self.issue)["phase"],
+                         "WAITING_REVIEW")
+
+    def test_reviewer_report_of_an_existing_changes_requested_never_writes_waiting_merge(self):
+        # decision_status alone is not approval: the state it reports must be APPROVED.
+        reviewer = self.ApprovingReviewer(self.repo, decision_status="already_reviewed",
+                                          state="CHANGES_REQUESTED")
+        self.update(check_runs=self.accepted())
+        result = self.driver(local_reviewer=reviewer).advance_once(self.repo, "owner", 100)
+        self.assertEqual(result["items"][0]["status"], "WAITING_REVIEW")
+        self.assertEqual(self.core.store.lifecycle_state(self.repo, self.issue)["phase"],
+                         "WAITING_REVIEW")
+
+    def test_reviewer_request_changes_never_writes_waiting_merge(self):
+        # Case C: rejection is not approval; it must reach the ordinary decision path.
+        reviewer = self.ApprovingReviewer(self.repo, event="REQUEST_CHANGES")
+        self.update(check_runs=self.accepted())
+        result = self.driver(local_reviewer=reviewer).advance_once(self.repo, "owner", 100)
+        self.assertEqual(result["items"][0]["status"], "WAITING_REVIEW")
+        self.assertEqual(self.core.store.lifecycle_state(self.repo, self.issue)["phase"],
+                         "WAITING_REVIEW")
+        self.assertEqual(reviewer.calls, [(self.repo, self.issue, 44, SHA)])
+
     def test_every_consumer_required_check_must_be_accepted_and_conflicting_failures_are_ambiguous(self):
         manifest = {**self.manifest, "reviewer": {"required_checks": [
             {"name": "Unit", "accepted_conclusions": ["success"],
