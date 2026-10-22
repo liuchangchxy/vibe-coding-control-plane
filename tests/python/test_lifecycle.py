@@ -162,6 +162,19 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(result["items"][0]["reviewer"]["status"], "reviewer_running")
         self.assertEqual(reviewer.calls, [(self.repo, self.issue, 44, SHA)])
 
+    def test_reviewer_insufficient_evidence_stops_for_human_without_repair(self):
+        class Reviewer:
+            def advance(self, repo, issue, pr, head):
+                return {"status": "reviewer_insufficient_evidence", "head_sha": head,
+                        "summary": "criterion 2 needs browser evidence"}
+
+        self.update(check_runs=self.accepted())
+        result = self.driver(local_reviewer=Reviewer()).advance_once(self.repo, "owner", 100)
+
+        self.assertEqual(result["items"][0]["status"], "needs-human")
+        self.assertIn("criterion 2 needs browser evidence", result["items"][0]["outcome"])
+        self.assertEqual(len(self.implementer.launches), 1)
+
     def test_every_consumer_required_check_must_be_accepted_and_conflicting_failures_are_ambiguous(self):
         manifest = {**self.manifest, "reviewer": {"required_checks": [
             {"name": "Unit", "accepted_conclusions": ["success"],
@@ -180,11 +193,13 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(len(self.implementer.launches), 1)
 
     def test_explicit_implementation_failure_dispatches_one_core_repair_and_dedupes(self):
-        self.update(check_runs=self.failure())
+        self.update(check_runs=self.failure(),
+                    formal_review_body="an older review that must not authorize this repair")
         first = self.driver().advance_once(self.repo, "owner", 100)
         self.assertEqual(first["items"][0]["trigger"], "ci_repair")
         self.assertEqual(first["items"][0]["status"], "launched")
         self.assertEqual(len(self.implementer.launches), 2)
+        self.assertIsNone(self.implementer.launches[-1].review_feedback)
         self.driver().advance_once(self.repo, "owner", 101)
         self.assertEqual(len(self.implementer.launches), 2)
 
@@ -453,11 +468,17 @@ class LifecycleTests(unittest.TestCase):
     def test_exact_head_reviewer_rejection_dispatches_existing_repair(self):
         self.update(check_runs=self.accepted(), coordination_state="changes-requested",
                     formal_review_state="CHANGES_REQUESTED", formal_review_id="review-4",
-                    formal_review_head_sha=SHA)
+                    formal_review_head_sha=SHA,
+                    frozen_spec_body="Acceptance: a row with a comma stays one row.",
+                    formal_review_body="Criterion 2 fails: export.py:88 splits quoted commas.")
         result = self.driver().advance_once(self.repo, "owner", 100)
         self.assertEqual(result["items"][0]["trigger"], "reviewer_repair")
         self.assertEqual(result["items"][0]["status"], "launched")
         self.assertEqual(len(self.implementer.launches), 2)
+        launch = self.implementer.launches[-1]
+        self.assertEqual(launch.review_feedback,
+                         "Criterion 2 fails: export.py:88 splits quoted commas.")
+        self.assertEqual(launch.frozen_spec_body, "Acceptance: a row with a comma stays one row.")
 
     def test_ci_and_reviewer_candidates_use_classified_caps_and_global_boundary(self):
         driver = self.driver()

@@ -212,9 +212,9 @@ class LocalReviewerWriterTests(unittest.TestCase):
         scenarios = (
             ("RUNNING", "sdk_review_checkpoint:" + json.dumps({
                 "phase": "completed", "session_id": "sdk-session", "resume_count": 1,
-                "total_turns": 42, "result": {"event": "BLOCKED", "body": "incomplete"}},
+                "total_turns": 42, "result": {"event": "MAYBE", "body": "incomplete"}},
                 separators=(",", ":")), "reviewer_result_unavailable", "completed_checkpoint_invalid"),
-            ("COMPLETED", json.dumps({"event": "BLOCKED", "body": "incomplete"}),
+            ("COMPLETED", json.dumps({"event": "MAYBE", "body": "incomplete"}),
              "reviewer_invalid_decision", "invalid_reviewer_decision"),
         )
         for initial_state, outcome, expected_status, expected_outcome in scenarios:
@@ -234,6 +234,35 @@ class LocalReviewerWriterTests(unittest.TestCase):
                 self.assertEqual(result["status"], expected_status)
                 self.assertEqual(record["state"], "FAILED")
                 self.assertEqual(record["outcome"], expected_outcome)
+
+    def test_insufficient_evidence_is_completed_without_github_write_or_repair(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = _Store(str(Path(root) / "runtime.sqlite"))
+            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_agent_sdk", now=100)
+            outcome = json.dumps({"event": "BLOCKED",
+                                  "body": "Criterion 2 needs browser evidence, which is unavailable."},
+                                 separators=(",", ":"))
+            store.update_reviewer_execution(REPO, 12, HEAD, "COMPLETED", "sdk-session",
+                                            outcome=outcome, now=110)
+            provider = FakeProvider()
+            driver = LocalReviewerDriver(
+                store, FakeReviewAgent(),
+                LocalReviewerWriter(provider, FakeWorkflow(), REPO, "liuchangchxy", MANIFEST),
+                "claude_agent_sdk")
+
+            first = driver.advance(REPO, 7, 12, HEAD)
+            replay = driver.advance(REPO, 7, 12, HEAD)
+            record = store.reviewer_execution(REPO, 12, HEAD)
+
+        self.assertEqual(first["status"], "reviewer_insufficient_evidence")
+        self.assertEqual(first["summary"],
+                         "Criterion 2 needs browser evidence, which is unavailable.")
+        self.assertEqual(replay, first)
+        self.assertEqual(record["state"], "COMPLETED")
+        self.assertEqual(json.loads(record["outcome"]), {
+            "event": "BLOCKED", "body": "Criterion 2 needs browser evidence, which is unavailable."})
+        self.assertFalse([call for call in provider.calls
+                          if call[0] in {"POST", "DELETE"} or call[1] == "/graphql"])
 
     def test_runner_restart_resumes_only_durable_turn_boundary_checkpoint(self):
         class IdempotentProvider(FakeProvider):

@@ -351,8 +351,13 @@ class LocalReviewerDriver:
                     "head_sha": head}
         if checkpoint["phase"] == "completed":
             result = checkpoint.get("result")
-            if (not isinstance(result, dict) or result.get("event") not in {"APPROVE", "REQUEST_CHANGES"}
-                    or not isinstance(result.get("body"), str) or not result["body"].strip()):
+            if (not isinstance(result, dict)
+                    or result.get("event") not in {"APPROVE", "REQUEST_CHANGES", "BLOCKED"}
+                    or not isinstance(result.get("body"), str)):
+                self.store.update_reviewer_execution(repo, pr, head, "FAILED",
+                                                     outcome="completed_checkpoint_invalid")
+                return {"status": "reviewer_result_unavailable", "head_sha": head}
+            if result["event"] != "BLOCKED" and not result["body"].strip():
                 self.store.update_reviewer_execution(repo, pr, head, "FAILED",
                                                      outcome="completed_checkpoint_invalid")
                 return {"status": "reviewer_result_unavailable", "head_sha": head}
@@ -596,6 +601,15 @@ class LocalReviewerDriver:
 
     def _submit_decision(self, repo, issue, pr, head, result):
         event, body = result.get("event"), result.get("body")
+        if event == "BLOCKED":
+            # The Reviewer could not decide an acceptance criterion from available evidence.
+            # That is neither approval nor a rejection the Implementer could repair. The
+            # result is stored in replayable form so a restart reports the same conclusion.
+            replay = json.dumps({"event": "BLOCKED", "body": body if isinstance(body, str) else ""},
+                                ensure_ascii=False, separators=(",", ":"))
+            self.store.update_reviewer_execution(repo, pr, head, "COMPLETED", outcome=replay)
+            return {"status": "reviewer_insufficient_evidence", "head_sha": head,
+                    "summary": body if isinstance(body, str) else ""}
         if event not in {"APPROVE", "REQUEST_CHANGES"} or not isinstance(body, str) or not body.strip():
             self.store.update_reviewer_execution(repo, pr, head, "FAILED",
                                                  outcome="invalid_reviewer_decision")

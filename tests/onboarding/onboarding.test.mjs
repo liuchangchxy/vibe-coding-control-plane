@@ -365,11 +365,11 @@ test("schema, generated manifest, onboarding guide, contract, and Reviewer promp
   assert.match(contract, /repair:<repo>:pr:<pr_number>:head:<failed_or_rejected_head_sha>/);
   assert.match(contract, /same linked PR and implementation branch/);
   assert.match(contract, /schema v1 is unsupported/);
-  assert.match(reviewer, /Dispatcher alone admits or rejects repairs/);
+  assert.match(reviewer, /Runtime alone admits repairs under its independent caps and hard total budget/);
   assert.match(reviewer, /VCCP deploy revision-upgrade PR/);
   assert.match(reviewer, /full 64-hex PLAN id/);
   assert.match(reviewer, /reviewer-task-prompt\.md/);
-  assert.match(reviewer, /A verified VCCP maintenance PR has no Issue/);
+  assert.match(reviewer, /host supplies a VCCP deploy revision-upgrade PR/);
   assert.match(reviewer, /Do not use it for remove PRs, onboarding PRs/);
   for (const text of [template, onboarding, contract, reviewer]) {
     assert.doesNotMatch(text, /three formal `?REQUEST_CHANGES`? repair rounds/i);
@@ -710,32 +710,31 @@ test("reviewer manifest rejects unsupported check-completion task events", async
   });
 });
 
-test("rendered Reviewer prompt waits for same-run checks and enables Auto-merge before approval", async () => {
+test("rendered Reviewer prompt is host-operated and separates blocking, sibling, and undecidable reviews", async () => {
   await withRepo(async (root) => {
     const github = new FakeGitHub();
     const plan = await createOnboardingPlan({ repo: REPO, root, input: validInput(), github });
     await applyOnboardingPlan({ plan, root, github });
     const prompt = await readFile(path.join(root, ".github/vccp/reviewer-task-prompt.md"), "utf8");
-    assert.match(prompt, /same event-triggered run/);
-    assert.match(prompt, /terminal/);
-    assert.match(prompt, /If a required check has not appeared yet, treat it as not-yet-terminal and continue waiting/);
-    assert.match(prompt, /remains absent until this run's reasonable waiting deadline or the platform execution limit[\s\S]*report `missing\/timeout`[\s\S]*exit without formal approval/);
-    assert.match(prompt, /After every wait and state re-read, verify the PR's current head SHA is still the captured SHA/);
-    assert.match(prompt, /enable native Auto-merge[\s\S]*APPROVE/);
-    assert.match(prompt, /Dispatcher alone admits or rejects repairs under its independent CI and Reviewer caps and hard total budget/);
-    assert.match(prompt, /If required CI is red, exit without a product `REQUEST_CHANGES`/);
-    assert.match(prompt, /No first-finding early exit/);
-    assert.match(prompt, /Root-cause-wide sibling audit/);
-    assert.match(prompt, /Cumulative review/);
-    assert.match(prompt, /Complete actionable blocking list/);
-    assert.match(prompt, /No scope inflation/);
-    assert.match(prompt, /Evidence types/);
-    assert.match(prompt, /listed locations are confirmed examples, not an exhaustive patch list/);
-    assert.match(prompt, /next review to repeat the Frozen-Spec-wide audit/);
-    assert.doesNotMatch(prompt, /Count formal `REQUEST_CHANGES` reviews/);
-    assert.doesNotMatch(prompt, /After the third formal request/);
+    assert.match(prompt, /What the host already established/);
+    assert.match(prompt, /It revalidates these facts against the same head before writing any formal review/);
+    assert.match(prompt, /You do not change GitHub state/);
+    assert.match(prompt, /sole product specification/);
+    assert.match(prompt, /`INSUFFICIENT_EVIDENCE`/);
+    assert.match(prompt, /Requires an empty `findings`/);
+    assert.match(prompt, /Put it in `findings`/);
+    assert.match(prompt, /Record it in `siblings`/);
+    assert.match(prompt, /does not block this PR/);
+    assert.match(prompt, /Do not scan the repository for new problems/);
+    assert.match(prompt, /Runtime alone admits repairs under its independent caps and hard total budget/);
+    assert.match(prompt, /Never decide against a head other than the one supplied/);
+    assert.match(prompt, /only a human maintainer resolves a terminal stop/);
+    assert.doesNotMatch(prompt, /same event-triggered run/);
+    assert.doesNotMatch(prompt, /enable native Auto-merge/);
+    assert.doesNotMatch(prompt, /dispatcher alone/i);
     assert.doesNotMatch(prompt, /check_run\.completed/);
-    assert.match(prompt, /never direct merge/i);
+    assert.doesNotMatch(prompt, /deliberately hunt for new findings/);
+    assert.doesNotMatch(prompt, /Count formal `REQUEST_CHANGES` reviews/);
   });
 });
 

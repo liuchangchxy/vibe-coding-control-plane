@@ -7,7 +7,7 @@ This document defines the cross-repository automation contract. GitHub Issues, P
 - **Human** freezes the Issue specification, resolves terminal stops, and owns decisions beyond the frozen scope.
 - **Dispatcher** is the sole automated repair admission authority. It detects actionable causes, deduplicates repairs, enforces the shared budget, and moves the Issue to `needs-human` when another repair would exceed it. It does not define requirements or review code.
 - **Implementer** works only within the Frozen Spec, opens a PR, reports actual checks honestly, and repairs the existing PR after a formal request. It cannot approve or merge its own work or clear terminal labels.
-- **Reviewer** evaluates only the Frozen Spec and the current PR head. It submits a native GitHub `APPROVE` or `REQUEST_CHANGES` review and enables native Auto-merge on the successful path. It never direct-merges or expands scope.
+- **Reviewer** evaluates only the Frozen Spec and the current PR head. Its structured verdict separates blocking findings, independent sibling defects, and criteria it cannot decide from available evidence. The VCCP host validates the decision against the same head, then submits a native GitHub `APPROVE` or `REQUEST_CHANGES` review and enables native Auto-merge on the successful path. The Reviewer model never writes GitHub state, direct-merges, or expands scope.
 - **GitHub** owns PR state, checks, formal reviews, branch protection, and the merge performed by native Auto-merge.
 
 ## Issue coordination states
@@ -48,9 +48,9 @@ Each consumer has one authorized production Dispatcher owner. This is a deployme
 2. Dispatcher/Sidecar claims it and marks `agent-working`.
 3. Implementer opens a PR linked to exactly one Frozen Issue. The PR author must be allow-listed by that consumer's manifest.
 4. The consumer's configured required checks run against the PR head. These are consumer-defined; this contract defines no application check names or commands.
-5. A per-repository ChatGPT Work Reviewer webhook task runs for a GitHub event. On every run it reconstructs state from GitHub, identifies the one current head SHA, and makes at most one decision. A run must not rely on a prior run's memory.
-6. In that same event-triggered run, Reviewer waits for every configured required check on the exact current head SHA. A check not yet observed (including one GitHub has not created yet) and an observed `queued`, `in_progress`, or `pending` check are both not-yet-terminal; absence on the first read is not an immediate missing-check failure. After every wait and re-read, verify the PR still has the captured head SHA. If it changes, stop the old run without a formal decision; `synchronize` starts the run for the new SHA. A terminal conclusion outside `accepted_conclusions` stops the approval path. If a check remains absent until the run's reasonable wait deadline or platform execution limit, report `missing/timeout` and exit without approval or inventing a CI result. There is no separate polling service, scheduled polling, Reviewer Wake, marker, comment wake, or check-run Task trigger.
-7. If Frozen Spec criteria fail, Reviewer submits native `REQUEST_CHANGES` bound to the exact current head SHA and sets the Issue state to `changes-requested`. On the successful path, Reviewer enables native Auto-merge with the configured method, then submits `APPROVE` bound to the same exact SHA. If enabling Auto-merge fails, it does not approve.
+5. The per-repository Local Reviewer runs through VCCP Runtime on one exact PR head. The host verifies GitHub facts and performs formal review writes; the Claude Agent SDK agent inspects a read-only workspace and returns a structured verdict.
+6. Runtime observes each required check for the captured exact head SHA before requesting a Reviewer decision. An absent, queued, in-progress, or pending check is not yet terminal. The head must be rechecked after each observation; stale heads receive no decision. A terminal unaccepted check stops approval, and a check that never appears cannot be called successful.
+7. If Frozen Spec criteria fail, Reviewer submits native `REQUEST_CHANGES` bound to the exact current head SHA and sets the Issue state to `changes-requested`. On the successful path, the host enables native Auto-merge with the configured method, then submits `APPROVE` bound to the same exact SHA. If enabling Auto-merge fails, it does not approve. If no blocking finding is confirmed but a criterion cannot be decided from available evidence, the Reviewer returns `INSUFFICIENT_EVIDENCE`; the host writes no approval or rejection and moves the Issue to `needs-human` for a human.
 8. GitHub native Auto-merge merges once repository branch protection, approval, and required checks are satisfied.
 
 CI passing is necessary when configured, but never implies Reviewer approval. Old checks or reviews for a prior SHA cannot authorize the current head.
@@ -68,11 +68,15 @@ Before formal review, verify all of the following from current GitHub state:
 - Every configured required check has a successful result for that exact head SHA. The consumer defines accepted success conclusions in its manifest.
 - The formal review is submitted against the exact current head SHA.
 
-Wait within the triggering Reviewer run while exact-head checks are not yet observed or remain nonterminal. Report missing only if a check is still absent at the run's waiting deadline/platform limit. Recheck the PR head SHA after each wait. Do not use a separate polling service or rely on a future check-completion event to wake a Task. Reviewer events are `pull_request.opened`, `pull_request.ready_for_review`, and `pull_request.synchronize`; commit updates can be opt-in through the webhook configuration. Whether a consumer's Dispatcher/Sidecar is strictly event-driven must be established independently; this contract does not claim that property is proven.
+The Runtime observes exact-head checks before Local Reviewer execution. Stale heads receive no approval. The local Reviewer model operates on a disposable exact-head workspace and has no GitHub write tools; the VCCP host alone submits GitHub reviews and enables native Auto-merge.
+
+A Reviewer decision has three channels. `findings` are blocking defects that violate the Frozen Spec; they alone authorize a Reviewer-caused repair. `siblings` record an independent defect caused by the same confirmed error pattern; they are written into the exact-head review body for later human triage and never block the PR, create Issues, or authorize repair. Out-of-scope observations are omitted. `INSUFFICIENT_EVIDENCE` carries no findings and stops the automated flow instead of forcing an approval or rejection.
 
 ## Same-PR repair
 
 The implementer must update the same PR and linked Issue; opening a replacement PR does not satisfy repair. A push changes the head SHA, invalidating prior checks and review conclusions for authorization purposes. Required checks and review must apply to the new current head.
+
+The Runtime supplies the Implementer with the Frozen Issue body on every launch and with the formal review body only when the admitted cause is `reviewer_rejection`. That body is read from the same current GitHub snapshot that proved the formal review and its exact head are the admitted cause, so it never carries feedback from an older head. CI-caused repairs receive no review feedback. This handoff requires no GitHub read access in the Implementer process.
 
 ## Manifest and runtime boundaries
 
@@ -88,7 +92,7 @@ For each required check, the lifecycle driver uses the current PR head SHA only.
 
 ## Merge and prohibited mechanisms
 
-Use GitHub native `APPROVE`, `REQUEST_CHANGES`, branch protection, and Auto-merge. Reviewer enables native Auto-merge after confirming Frozen Spec and checks, and before approving. Reviewer never direct-merges. Normal flow forbids admin bypass. Do not use comment text as authorization, marker comments as wake signals, a Reviewer Wake job, a separate polling service, a custom merge controller, paid inference/API dependencies, reverse proxies, cookies, browser-session workarounds, or `gh-aw` as a v1 dependency.
+Use GitHub native `APPROVE`, `REQUEST_CHANGES`, branch protection, and Auto-merge. The VCCP host enables native Auto-merge after the Reviewer confirms Frozen Spec and checks, and before submitting `APPROVE`. The Reviewer model never direct-merges. Normal flow forbids admin bypass. Do not use comment text as authorization, marker comments as wake signals, a Reviewer Wake job, a separate polling service, a custom merge controller, paid inference/API dependencies, reverse proxies, cookies, browser-session workarounds, or `gh-aw` as a v1 dependency.
 
 ## Consumer-owned configuration
 

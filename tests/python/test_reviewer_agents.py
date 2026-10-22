@@ -349,6 +349,36 @@ class ReviewerAgentTests(unittest.TestCase):
         self.assertIsNone(ClaudeAgentSDKReviewer._to_review({**result, "findings": []}))
         self.assertIsNone(ClaudeAgentSDKReviewer._to_review({**APPROVAL, "findings": [result["findings"][0]]}))
 
+    def test_structured_siblings_are_recorded_but_never_block_the_pr(self):
+        self.assertIn("siblings", ClaudeAgentSDKReviewer._SCHEMA["required"])
+        result = {**APPROVAL, "siblings": [
+            {"location": "code.py:9",
+             "description": "The confirmed parsing pattern also drops empty rows here."}]}
+
+        review = ClaudeAgentSDKReviewer._to_review(result)
+
+        self.assertEqual(review["event"], "APPROVE")
+        self.assertIn("Independent siblings (not blocking this PR and not part of this repair):",
+                      review["body"])
+        self.assertIn("`code.py:9` — The confirmed parsing pattern also drops empty rows here.",
+                      review["body"])
+        self.assertFalse(ClaudeAgentSDKReviewer._to_review(
+            {**result, "siblings": [{"location": "", "description": "x"}]}))
+        self.assertFalse(ClaudeAgentSDKReviewer._to_review(
+            {**result, "siblings": [{"location": "code.py:9"}]}))
+
+    def test_insufficient_evidence_maps_to_blocked_and_never_to_rejection(self):
+        result = {"decision": "INSUFFICIENT_EVIDENCE",
+                  "summary": "Criterion 2 cannot be decided: no browser evidence was supplied.",
+                  "findings": []}
+
+        self.assertEqual(ClaudeAgentSDKReviewer._to_review(result), {
+            "event": "BLOCKED",
+            "body": "Criterion 2 cannot be decided: no browser evidence was supplied."})
+        self.assertFalse(ClaudeAgentSDKReviewer._to_review(
+            {**result, "findings": [{"severity": "blocking", "file": "code.py",
+                                     "line": 1, "description": "Regression."}]}))
+
     def test_malformed_structured_output_fails_with_session_provenance(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -389,5 +389,13 @@ class LifecycleDriver:
             if phase == "WAITING_REVIEW" and self.local_reviewer is not None:
                 result["reviewer"] = self.local_reviewer.advance(
                     repo_key, issue, snapshot.pr_number, head)
+                if result["reviewer"].get("status") == "reviewer_insufficient_evidence":
+                    # The Reviewer could not decide an acceptance criterion. Only a human
+                    # can supply the missing evidence; no repair is authorized by this.
+                    summary = " ".join(str(result["reviewer"].get("summary") or "").split())[:500]
+                    results.append(self._terminal(
+                        repo_key, issue, snapshot, "needs-human", current,
+                        "reviewer_insufficient_evidence" + (f": {summary}" if summary else "")))
+                    continue
             results.append(result)
         return {"status": "ok", "items": results}
