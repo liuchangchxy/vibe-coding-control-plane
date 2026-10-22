@@ -161,6 +161,22 @@ class LifecycleDriver:
         state = self.core.store.lifecycle_state(repo, row["issue_number"])
         return bool(state and state["phase"] == "WAITING_MERGE" and state["head_sha"])
 
+    @staticmethod
+    def _reviewer_approved_exact_head(result, head):
+        """Whether the Reviewer's own result proves a formal APPROVE at exactly ``head``."""
+        if not isinstance(result, dict) or not isinstance(head, str) or not head:
+            return False
+        if str(result.get("head_sha") or "").casefold() != head.casefold():
+            return False
+        if result.get("status") == "formal_review_exists":
+            return result.get("state") == "APPROVED"
+        if result.get("status") != "review_decision_submitted" or result.get("event") != "APPROVE":
+            return False
+        if result.get("decision_status") == "review_submitted":
+            return True
+        return (result.get("decision_status") in {"already_reviewed", "formal_review_exists"}
+                and result.get("state") == "APPROVED")
+
     def advance_once(self, repo: str, owner_id: str, now: float | None = None):
         """Observe and advance only locally bound work; never schedules agent-ready Issues."""
         if not isinstance(owner_id, str) or not owner_id.strip():
@@ -397,5 +413,12 @@ class LifecycleDriver:
                         repo_key, issue, snapshot, "needs-human", current,
                         "reviewer_insufficient_evidence" + (f": {summary}" if summary else "")))
                     continue
+                if self._reviewer_approved_exact_head(result["reviewer"], head):
+                    # The Reviewer submitted APPROVE into this very pass, so GitHub can
+                    # satisfy native Auto-merge and auto-close the Issue before the next
+                    # observation. Record the exact-head authorization now: it is the only
+                    # durable proof merge observation and fence recovery can rely on.
+                    deadline = self._set_waiting(repo_key, issue, "WAITING_MERGE", head, current)
+                    result.update(status="WAITING_MERGE", deadline_at=deadline)
             results.append(result)
         return {"status": "ok", "items": results}

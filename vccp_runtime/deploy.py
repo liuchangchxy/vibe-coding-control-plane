@@ -10,9 +10,9 @@ import subprocess
 import sys
 
 from .activation import qualify_activation
-from .host_deployment import (inspect_windows_task, reconcile_macos_launch_agent,
-                              reconcile_windows_task, remove_macos_launch_agent,
-                              remove_windows_task)
+from .host_deployment import (_active_work, inspect_windows_task,
+                              reconcile_macos_launch_agent, reconcile_windows_task,
+                              remove_macos_launch_agent, remove_windows_task)
 from .runtime_checkout import ensure_runtime_checkout
 
 
