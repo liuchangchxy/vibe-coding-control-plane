@@ -625,4 +625,5 @@ class LocalReviewerDriver:
             "review_submitted", "already_reviewed", "formal_review_exists"} else "COMPLETED"
         self.store.update_reviewer_execution(repo, pr, head, state, outcome=event)
         return {"status": "review_decision_submitted", "event": event,
-                "head_sha": head, "decision_status": decision.get("status")}
+                "head_sha": head, "decision_status": decision.get("status"),
+                "state": decision.get("state")}
