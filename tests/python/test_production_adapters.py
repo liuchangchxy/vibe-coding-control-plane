@@ -700,6 +700,35 @@ class AdapterTests(unittest.TestCase):
         for forbidden in ("EasyExam", "Reviewer-only", "three REQUEST_CHANGES rounds"):
             self.assertNotIn(forbidden, prompt)
 
+    def test_prompt_embeds_frozen_spec_and_only_rejection_repairs_get_exact_head_feedback(self):
+        spec = "Goal: export rows. Acceptance: a row containing a comma stays one row."
+        initial = generic_prompt(LaunchRequest("o/r", 3, "a", "initial_dispatch",
+                                               frozen_spec_body=spec), "local", MANIFEST,
+                                 "app-gh", "app-git-push")
+        self.assertIn("<frozen-spec>\n" + spec + "\n</frozen-spec>", initial)
+        self.assertNotIn("<review-findings>", initial)
+
+        rejection = generic_prompt(LaunchRequest(
+            "o/r", 3, "b", "repair", repair_cause_type="reviewer_rejection",
+            review_feedback="Criterion 2 still fails: `export.py:88` drops quoted commas.",
+            frozen_spec_body=spec), "local", MANIFEST, "app-gh", "app-git-push")
+        self.assertIn("<review-findings>\nCriterion 2 still fails: `export.py:88` drops quoted "
+                      "commas.\n</review-findings>", rejection)
+        self.assertIn("Handle only findings this review produced", rejection)
+        self.assertIn("the Frozen Issue wins", rejection)
+
+        ci = generic_prompt(LaunchRequest(
+            "o/r", 3, "c", "repair", repair_cause_type="implementation_failure",
+            review_feedback="review from an older head that must not authorize this repair"),
+            "local", MANIFEST, "app-gh", "app-git-push")
+        self.assertNotIn("<review-findings>", ci)
+        self.assertNotIn("review from an older head", ci)
+
+        missing = generic_prompt(LaunchRequest("o/r", 3, "d", "initial_dispatch"),
+                                 "local", MANIFEST, "app-gh", "app-git-push")
+        self.assertIn("could not be supplied", missing)
+        self.assertNotIn("<frozen-spec>", missing)
+
     def test_runtime_wiring_real_core_initial_and_schema_guard(self):
         with tempfile.TemporaryDirectory() as temp:
             api = FakeAPI(); launches = []

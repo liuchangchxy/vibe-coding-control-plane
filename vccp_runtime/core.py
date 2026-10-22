@@ -91,6 +91,7 @@ class WorkflowSnapshot:
     formal_review_state: str | None = None
     formal_review_id: str | None = None
     formal_review_head_sha: str | None = None
+    formal_review_body: str | None = None
     canonical_relationship_valid: bool = True
     canonical_link_count: int = 0
     pr_state: str | None = None
@@ -99,6 +100,7 @@ class WorkflowSnapshot:
     active_labels: tuple[str, ...] = ()
     allow_no_change: bool = False
     frozen_spec_digest: str | None = None
+    frozen_spec_body: str = ""
     issue_title: str = ""
 
 
@@ -143,8 +145,12 @@ class LaunchRequest:
     branch: str | None = None
     allow_no_change: bool = False
     frozen_spec_digest: str | None = None
+    frozen_spec_body: str | None = None
     runtime_context: dict | None = None
     completion_command: str | None = None
+    # Exact-head blocking feedback for a Reviewer-caused repair. The Runtime reads it
+    # from GitHub; the Implementer never needs GitHub read access of its own.
+    review_feedback: str | None = None
 
 
 class WorkflowPort(Protocol):
@@ -1724,6 +1730,7 @@ class RuntimeCore:
             request = LaunchRequest(repo_key, issue_number, attempt_id, "initial_dispatch",
                                     allow_no_change=observed.allow_no_change,
                                     frozen_spec_digest=observed.frozen_spec_digest,
+                                    frozen_spec_body=observed.frozen_spec_body,
                                     runtime_context={"database_path": self.database_path,
                                                      "workspace_baseline": baseline})
         return self._launch(request)
@@ -1911,6 +1918,10 @@ class RuntimeCore:
 
         self.store.mark_phase(attempt_id, "CLAIMED", recovery_timeout=self.recovery_timeout_seconds)
         self.store.mark_phase(attempt_id, "LAUNCH_INTENT", recovery_timeout=self.recovery_timeout_seconds)
+        # _eligible_repair already proved this review is the candidate's cause and is
+        # bound to the candidate head, so the body describes the head being repaired.
+        review_feedback = (fresh.formal_review_body
+                           if candidate.cause_type == "reviewer_rejection" else None)
         launch_request = LaunchRequest(
             repo=repo,
             issue_number=candidate.issue_number,
@@ -1923,6 +1934,8 @@ class RuntimeCore:
             expected_head_sha=candidate.head_sha.lower(),
             pr_number=candidate.pr_number,
             branch=candidate.branch,
+            frozen_spec_body=fresh.frozen_spec_body,
+            review_feedback=review_feedback,
         )
         return self._launch(launch_request, admission)
 

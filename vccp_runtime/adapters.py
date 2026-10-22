@@ -346,6 +346,7 @@ class GitHubWorkflowAdapter:
             formal_review_state=current_review.get("state") if current_review else None,
             formal_review_id=str(current_review.get("id")) if current_review else None,
             formal_review_head_sha=current_review.get("commit_id") if current_review else None,
+            formal_review_body=(current_review.get("body") or None) if current_review else None,
             canonical_relationship_valid=relationship_valid,
             canonical_link_count=len(linked_numbers),
             pr_state=pr.get("state") if valid_pr else None,
@@ -353,7 +354,7 @@ class GitHubWorkflowAdapter:
             check_runs=check_runs if valid_pr else (),
             active_labels=tuple(label for label in self.policy["active_coordination_labels"] if label in labels),
             allow_no_change=allow_no_change, frozen_spec_digest=spec_digest,
-            issue_title=str(issue.get("title") or ""),
+            frozen_spec_body=body, issue_title=str(issue.get("title") or ""),
         )
 
     def _all_pages(self, endpoint):
@@ -541,22 +542,51 @@ class GitHubWorkflowAdapter:
 
 def generic_prompt(request: LaunchRequest, workspace: str, policy: dict,
                    app_gh: str, app_git_push: str) -> str:
+    spec = (request.frozen_spec_body or "").strip()
     common = (f"Repository: {request.repo}\nFrozen Issue: #{request.issue_number}\nWorkspace: {workspace}\n"
-              "Read the Frozen Issue from GitHub and treat it as the sole task specification. "
-              f"Controlled GitHub writer: {app_gh}\nControlled git push wrapper: {app_git_push}\n"
-              "Prefer the smallest shared root-cause change satisfying the Frozen Issue. Do not add speculative validation, fallback paths, abstractions, compatibility layers, or unrelated hardening. Do not expand scope or merge. Report tests actually run. Ordinary host-human gh writes are "
+              f"Controlled GitHub writer: {app_gh}\nControlled git push wrapper: {app_git_push}\n\n"
+              + (f"Frozen Issue body, the only product specification:\n<frozen-spec>\n{spec}\n</frozen-spec>\n\n"
+                 if spec else "The Frozen Issue body could not be supplied to this launch. Do not infer the "
+                              "specification; report that it is missing and stop.\n\n")
+              + "How to work:\n"
+              "- The Frozen Issue fixes the product goal and acceptance criteria. Confirm what the user actually "
+              "needs, read the relevant code, and correct the stated root cause and file list from code evidence "
+              "instead of accepting them.\n"
+              "- Fix the smallest shared root cause that satisfies the Frozen Issue. When the same confirmed cause "
+              "repeats in a sibling call site, component, or state reached by that evidence, fix it there too. Do "
+              "not audit beyond that, and do not add validation, fallbacks, abstractions, compatibility layers, "
+              "refactors, or hardening the Frozen Issue does not require.\n"
+              "- Verify with evidence that distinguishes the broken behavior from the fixed one. Report exactly what "
+              "you ran; never claim a check you did not run.\n"
+              "- Keep a defect that is independent of this Frozen Issue out of this change. Note it in the PR body "
+              "and continue. If satisfying the Frozen Issue would require changing the product goal, stop and say so.\n\n"
+              "Workflow rules. Ordinary host-human gh writes are "
               "forbidden; use only the configured controlled App writer for GitHub writes. Ordinary git push "
               "is forbidden; use only the configured controlled push wrapper. Do not persist or request GitHub "
-              "tokens. The PR body MUST include a GitHub closing reference to this Frozen Issue, for example "
+              "tokens. Do not expand scope or merge. The PR body MUST include a GitHub closing reference to this "
+              "Frozen Issue, for example "
               "'Closes #<issue_number>' (or 'Fixes'/'Resolves'); a plain mention is insufficient. "
               "For PR creation use: <app-gh> pr create --title TITLE --body 'SUMMARY. Closes #<issue_number>' "
               "--head BRANCH "
               "--base BASE. For labels use: <app-gh> issue edit ISSUE --remove-label LABEL --add-label LABEL. "
               "For a push use: <app-git-push> --branch BRANCH --expected-sha FULL_SHA.\n")
     if request.attempt_kind == "repair":
-        cause_guidance = ("This repair was admitted for an exact-head CI failure; inspect the configured required "
-                          "checks on the supplied head and address the explicitly attributed implementation failure. "
-                          if request.repair_cause_type == "implementation_failure" else "")
+        if request.repair_cause_type == "implementation_failure":
+            cause_guidance = (
+                "This repair was admitted for an exact-head CI failure; inspect the configured required "
+                "checks on the supplied head and address the explicitly attributed implementation failure. ")
+        else:
+            feedback = (request.review_feedback or "").strip()
+            cause_guidance = (
+                "The blocking review below was submitted against this exact head and is the authority for this "
+                "repair. Resolve every blocking finding it confirms"
+                + (f":\n<review-findings>\n{feedback}\n</review-findings>" if feedback else
+                   "; no review body was recorded, so address the formal REQUEST_CHANGES on this head.")
+                + " Do not re-litigate a finding the code evidence disproves; state the evidence instead. "
+                  "The Frozen Issue above is the product authority; this review supplies findings only. If a "
+                  "finding conflicts with the current Frozen Issue, the Frozen Issue wins: say so instead of "
+                  "reverting a product goal. "
+                  "Handle only findings this review produced, not unrelated defects. ")
         return common + (f"Repair the existing PR #{request.pr_number} on existing branch {request.branch}. "
                          f"The exact supplied baseline is {request.expected_head_sha}; repair ordinal "
                          f"{request.repair_ordinal} is authoritative. {cause_guidance}Do not create another PR/branch, "

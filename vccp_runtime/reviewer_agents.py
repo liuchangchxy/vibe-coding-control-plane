@@ -191,8 +191,9 @@ class _ReviewerTask:
                       f"Use the checked-out code in the exact-head workspace and complete the following canonical review contract.\n"
                       f"<review-contract>\n{contract}\n</review-contract>\n\n"
                       "Do not edit files, commit, push, call GitHub, or submit a review. The VCCP host performs bounded exact-head writes after revalidation. "
-                      + ("Return structured output with decision (APPROVE or CHANGES_REQUESTED), summary, and findings containing severity, file, line, and description. "
-                         "APPROVE requires no blocking finding; CHANGES_REQUESTED requires a blocking finding."
+                      + ("Return structured output with decision (APPROVE, CHANGES_REQUESTED, or INSUFFICIENT_EVIDENCE), summary, findings, and optional siblings. "
+                         "Findings are blocking only: each needs severity, file, line, and description. Siblings are non-blocking and must not be put in findings. "
+                         "APPROVE requires no findings; CHANGES_REQUESTED requires at least one finding; INSUFFICIENT_EVIDENCE requires no findings and a summary naming the undecidable criterion and missing evidence."
                          if structured else
                          "Return one final JSON object and no other trailing text: {\"event\":\"APPROVE\"|\"REQUEST_CHANGES\",\"body\":\"complete review body\"}. "
                          "If required evidence or a prerequisite is missing, return REQUEST_CHANGES only when a Frozen Spec criterion is demonstrably unmet; otherwise report a non-decision in JSON with event \"BLOCKED\"."))
@@ -216,9 +217,12 @@ class ClaudeAgentSDKReviewer:
     _SCHEMA = {
         "type": "object",
         "properties": {
-            "decision": {"type": "string", "enum": ["APPROVE", "CHANGES_REQUESTED"]},
+            "decision": {"type": "string",
+                         "enum": ["APPROVE", "CHANGES_REQUESTED", "INSUFFICIENT_EVIDENCE"]},
             "summary": {"type": "string", "minLength": 1, "maxLength": 4000},
-            "findings": {"type": "array", "maxItems": 10, "items": {
+            # No cap: truncating would drop confirmed blockers from the Implementer's
+            # only feedback path. Every finding is required to be blocking.
+            "findings": {"type": "array", "items": {
                 "type": "object",
                 "properties": {
                     "severity": {"type": "string", "enum": ["blocking"]},
@@ -227,6 +231,17 @@ class ClaudeAgentSDKReviewer:
                     "description": {"type": "string", "minLength": 1, "maxLength": 4000},
                 },
                 "required": ["severity", "file", "line", "description"],
+                "additionalProperties": False,
+            }},
+            # Independent defects kept for human triage; never blocking and never repaired
+            # by the current PR. Location is free text because they may predate this diff.
+            "siblings": {"type": "array", "items": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "minLength": 1, "maxLength": 500},
+                    "description": {"type": "string", "minLength": 1, "maxLength": 4000},
+                },
+                "required": ["location", "description"],
                 "additionalProperties": False,
             }},
         },
@@ -325,10 +340,13 @@ class ClaudeAgentSDKReviewer:
 
     @staticmethod
     def _to_review(value):
-        if not isinstance(value, dict) or value.get("decision") not in {"APPROVE", "CHANGES_REQUESTED"}:
+        if not isinstance(value, dict) or value.get("decision") not in {
+                "APPROVE", "CHANGES_REQUESTED", "INSUFFICIENT_EVIDENCE"}:
             return None
         summary, findings = value.get("summary"), value.get("findings")
-        if not isinstance(summary, str) or not summary.strip() or not isinstance(findings, list):
+        siblings = value.get("siblings", [])
+        if (not isinstance(summary, str) or not summary.strip() or not isinstance(findings, list)
+                or not isinstance(siblings, list)):
             return None
         for item in findings:
             if (not isinstance(item, dict) or item.get("severity") != "blocking"
@@ -336,24 +354,39 @@ class ClaudeAgentSDKReviewer:
                     or not isinstance(item.get("line"), int) or item["line"] < 1
                     or not isinstance(item.get("description"), str) or not item["description"].strip()):
                 return None
-        blocking = any(item["severity"] == "blocking" for item in findings)
+        for item in siblings:
+            if (not isinstance(item, dict) or not isinstance(item.get("location"), str)
+                    or not item["location"].strip()
+                    or not isinstance(item.get("description"), str) or not item["description"].strip()):
+                return None
+        blocking = bool(findings)
         if (value["decision"] == "APPROVE" and blocking) or (
-                value["decision"] == "CHANGES_REQUESTED" and not blocking):
+                value["decision"] == "CHANGES_REQUESTED" and not blocking) or (
+                value["decision"] == "INSUFFICIENT_EVIDENCE" and blocking):
             return None
         body = summary.strip()
         if findings:
             body += "\n\nFindings:\n" + "\n".join(
                 f"- [{item['severity']}] `{item['file']}:{item['line']}` — {item['description'].strip()}"
                 for item in findings)
+        if siblings:
+            # Recorded on the exact-head review for later human triage. The decision and the
+            # repair authorization stay limited to the findings above.
+            body += ("\n\nIndependent siblings (not blocking this PR and not part of this repair):\n"
+                     + "\n".join(f"- `{item['location'].strip()}` — {item['description'].strip()}"
+                                 for item in siblings))
         if len(body) > 60000:
             return None
-        event = "APPROVE" if value["decision"] == "APPROVE" else "REQUEST_CHANGES"
+        event = {"APPROVE": "APPROVE", "CHANGES_REQUESTED": "REQUEST_CHANGES"}.get(
+            value["decision"], "BLOCKED")
         return {"event": event, "body": body}
 
     def launch_review(self, repo, issue, pr, head, *, on_checkpoint=None, started_at=None):
         path, prompt = self.task.build(repo, issue, pr, head, structured=True)
         prompt += ("\nReturn structured output only. APPROVE requires no blocking finding; "
-                   "CHANGES_REQUESTED requires a specific blocking finding supported by exact-head code.")
+                   "CHANGES_REQUESTED requires at least one specific blocking finding supported by "
+                   "exact-head code; INSUFFICIENT_EVIDENCE means no blocking finding is confirmed but "
+                   "an acceptance criterion cannot be decided from the available evidence.")
         return self._run_session(repo, issue, pr, head, path, prompt,
                                  on_checkpoint=on_checkpoint, started_at=started_at)
 
