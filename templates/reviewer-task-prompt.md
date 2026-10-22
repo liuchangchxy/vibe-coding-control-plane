@@ -32,6 +32,8 @@ Do not scan the repository for new problems. Sibling findings must follow from c
 - `CHANGES_REQUESTED` — at least one confirmed blocking finding. Requires a non-empty `findings`.
 - `INSUFFICIENT_EVIDENCE` — a criterion cannot be decided from the evidence available to you and no blocking finding is confirmed. Requires an empty `findings`; the summary must name the criterion and the evidence that is missing. The host stops the automated flow for a human instead of treating this as approval or rejection.
 
+Always include `siblings` in the structured output; return an empty array when no sibling defect is confirmed.
+
 ## VCCP maintenance revision review
 
 This path applies only when the host supplies a VCCP deploy revision-upgrade PR: a `codex-vccp-deploy-<12 hex>` head branch, a `Deploy VCCP <12 hex>` title, and deploy-generated body fields for this exact repository, a full 40-hex desired revision, and a full 64-hex PLAN id. Do not use it for remove PRs, onboarding PRs, dependency updates, or other infrastructure work.

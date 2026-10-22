@@ -350,6 +350,7 @@ class ReviewerAgentTests(unittest.TestCase):
         self.assertIsNone(ClaudeAgentSDKReviewer._to_review({**APPROVAL, "findings": [result["findings"][0]]}))
 
     def test_structured_siblings_are_recorded_but_never_block_the_pr(self):
+        self.assertIn("siblings", ClaudeAgentSDKReviewer._SCHEMA["required"])
         result = {**APPROVAL, "siblings": [
             {"location": "code.py:9",
              "description": "The confirmed parsing pattern also drops empty rows here."}]}

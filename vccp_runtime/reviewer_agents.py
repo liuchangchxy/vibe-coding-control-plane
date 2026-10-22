@@ -191,7 +191,7 @@ class _ReviewerTask:
                       f"Use the checked-out code in the exact-head workspace and complete the following canonical review contract.\n"
                       f"<review-contract>\n{contract}\n</review-contract>\n\n"
                       "Do not edit files, commit, push, call GitHub, or submit a review. The VCCP host performs bounded exact-head writes after revalidation. "
-                      + ("Return structured output with decision (APPROVE, CHANGES_REQUESTED, or INSUFFICIENT_EVIDENCE), summary, findings, and optional siblings. "
+                      + ("Return structured output with decision (APPROVE, CHANGES_REQUESTED, or INSUFFICIENT_EVIDENCE), summary, findings, and siblings (empty when none). "
                          "Findings are blocking only: each needs severity, file, line, and description. Siblings are non-blocking and must not be put in findings. "
                          "APPROVE requires no findings; CHANGES_REQUESTED requires at least one finding; INSUFFICIENT_EVIDENCE requires no findings and a summary naming the undecidable criterion and missing evidence."
                          if structured else
@@ -245,7 +245,7 @@ class ClaudeAgentSDKReviewer:
                 "additionalProperties": False,
             }},
         },
-        "required": ["decision", "summary", "findings"],
+        "required": ["decision", "summary", "findings", "siblings"],
         "additionalProperties": False,
     }
 
