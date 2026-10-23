@@ -3016,15 +3016,26 @@ class RuntimeCore:
             return False
         try:
             fresh = self.workflow.observe(repo, issue)
-            if (fresh.revision != snapshot.revision or fresh.coordination_state != snapshot.coordination_state
-                    or fresh.canceled or fresh.terminal_labels or not fresh.issue_open or not fresh.frozen_spec):
-                return False
+        except Exception:
+            return False
+        if (fresh.revision != snapshot.revision or fresh.coordination_state != snapshot.coordination_state
+                or fresh.canceled or fresh.terminal_labels or not fresh.issue_open or not fresh.frozen_spec):
+            # This pass did not stop the Issue. If the label it wanted is already there, the
+            # terminal state is confirmed and its reason still owes a notice; any other
+            # terminal label belongs to a different stop and must not get this reason.
+            if target in (fresh.terminal_labels or ()):
+                self.publish_terminal_stop(repo, issue, target, reason, summary,
+                                           fresh.pr_number, fresh.pr_head_sha)
+            return False
+        try:
             transitioned = self.workflow.transition_coordination_state(
                 repo, issue, fresh.coordination_state, target, fresh.revision)
         except Exception:
-            return False
+            transitioned = False
         # The same visible-reason rule applies to recovery stops, not only to lifecycle ones.
-        if transitioned:
+        # The notice is keyed by repository, Issue, label, reason, and head, so a transition
+        # whose write landed while reporting failure still leaves exactly one summary.
+        if transitioned or self._terminal_label_observed(repo, issue, target):
             self.publish_terminal_stop(repo, issue, target, reason, summary,
                                        fresh.pr_number, fresh.pr_head_sha)
         return transitioned

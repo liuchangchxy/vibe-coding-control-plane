@@ -61,6 +61,7 @@ class FakeWorkflow:
         self.restored = []
         self.fail_publish = 0
         self.fail_transition = False
+        self.transition_lands_silently = False
         self.ready = []
 
     def observe(self, repo, issue):
@@ -84,7 +85,8 @@ class FakeWorkflow:
             terminal_labels=terminal,
             active_labels=() if terminal else (new_state,))
         self.transitions.append((repo, issue, expected_state, new_state))
-        return True
+        # A real API write can land and still report failure (timeout after commit).
+        return not self.transition_lands_silently
 
     def restore_repair_coordination_state(self, repo, issue, new_state, expected_revision):
         current = self.snapshots[(repo, issue)]
@@ -281,6 +283,44 @@ class TerminalReasonTests(LifecycleCase):
         self.assertEqual((posted["label"], posted["reason"]),
                          ("infra-blocked", "implementer_progress_stalled"))
         self.assertEqual((posted["pr"], posted["head"]), (PR, HEAD))
+
+    def test_a_recovery_stop_whose_write_lands_silently_still_publishes_its_reason(self):
+        # The label transition committed but reported failure; GitHub is the confirmation.
+        self.workflow.transition_lands_silently = True
+
+        transitioned = self.core._recovery_terminal(
+            REPO, ISSUE, self.workflow.observe(REPO, ISSUE), "infra-blocked",
+            "recovery_timeout", "Recovery stopped without a push.")
+
+        self.assertFalse(transitioned)
+        self.assertEqual([entry["reason"] for entry in self.workflow.posted],
+                         ["recovery_timeout"])
+        self.assertEqual(self.workflow.posted[0]["label"], "infra-blocked")
+
+    def test_a_recovery_stop_already_shown_on_github_still_publishes_its_reason(self):
+        self.workflow.snapshots[(REPO, ISSUE)] = replace(
+            snapshot(), coordination_state="needs-human",
+            terminal_labels=("needs-human",), active_labels=())
+
+        transitioned = self.core._recovery_terminal(
+            REPO, ISSUE, snapshot(), "needs-human", "ambiguous_relationship",
+            "The Issue-to-PR relationship was ambiguous.")
+
+        self.assertFalse(transitioned)
+        self.assertEqual([entry["reason"] for entry in self.workflow.posted],
+                         ["ambiguous_relationship"])
+
+    def test_a_recovery_stop_never_borrows_another_stops_label(self):
+        self.workflow.snapshots[(REPO, ISSUE)] = replace(
+            snapshot(), coordination_state="infra-blocked",
+            terminal_labels=("infra-blocked",), active_labels=())
+
+        transitioned = self.core._recovery_terminal(
+            REPO, ISSUE, snapshot(), "needs-human", "ambiguous_relationship",
+            "The Issue-to-PR relationship was ambiguous.")
+
+        self.assertFalse(transitioned)
+        self.assertEqual(self.workflow.posted, [])
 
 
 class EvidenceGapRoutingTests(LifecycleCase):
