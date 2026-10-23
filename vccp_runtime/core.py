@@ -2282,6 +2282,10 @@ class RuntimeCore:
                 if phase != "TERMINAL_UNRESOLVED" or not has_adoptable_pr:
                     if phase == "TERMINAL_UNRESOLVED":
                         output.append({"issue": issue, "status": "stopped_terminal"})
+                    elif (phase == "CLAIM_FAILED" and rows[-1].get("launch_outcome") == "workflow_changed"
+                          and snapshot.coordination_state in {"agent-working", "changes-requested"}):
+                        # A failed claim holds nothing; the workflow moved on to another claimant.
+                        output.append({"issue": issue, "status": "claim_lost_to_concurrent_claim"})
                     else:
                         terminal = "needs-human"
                         self._recovery_terminal(repo_key, issue, snapshot, terminal)

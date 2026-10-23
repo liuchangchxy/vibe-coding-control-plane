@@ -289,6 +289,27 @@ class RecoveryTests(unittest.TestCase):
         self.assertFalse(self.implementer.requests)
         self.assertEqual(self.core.store.attempts_for_repo("acme/alpha")[-1]["phase"], "RETRY_ELIGIBLE")
 
+    def test_lost_claim_race_does_not_terminalize_an_issue_a_live_claim_holds(self):
+        def concurrent_claimant(workflow, repo, issue, count):
+            if count == 2:
+                key = (repo.casefold(), issue)
+                workflow.states[key] = replace(workflow.states[key],
+                                               coordination_state="agent-working", revision="2")
+        self.workflow.observe_hook = concurrent_claimant
+        result = self.start()
+        self.assertEqual(result["status"], "claim_failed")
+        self.assertEqual(self.implementer.requests, [])
+        row = self.core.store.attempt(result["attempt_id"])
+        self.assertEqual(row["phase"], "CLAIM_FAILED")
+        self.assertEqual(row["launch_outcome"], "workflow_changed")
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "agent-working")
+
+        self.workflow.observe_hook = None
+        reconciliation = self.core.reconcile_once("acme/alpha", "owner")
+        self.assertEqual(reconciliation["items"][0]["status"], "claim_lost_to_concurrent_claim")
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "agent-working")
+        self.assertFalse(self.implementer.requests)
+
     def test_agent_ready_with_canonical_pr_contradicts_claim_and_fails_closed(self):
         self.core.store.create_initial_attempt("acme/alpha", 7, "owner", 30, 60)
         self.set_snapshot(replace(self.workflow.observe("acme/alpha", 7), pr_number=44, pr_open=True,
