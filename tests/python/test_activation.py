@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -78,8 +79,14 @@ class ActivationTests(unittest.TestCase):
 
     def tearDown(self): self.temp.cleanup()
 
-    def _qualify(self, config=None, provider=None, api=None):
-        with patch("vccp_runtime.activation.DPAPIFileCredentialSource") as source:
+    def _qualify(self, config=None, provider=None, api=None, antigravity_context=None):
+        discovered = (None if antigravity_context is False else
+                      antigravity_context if antigravity_context is not None else
+                      {"ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:54195",
+                       "ANTIGRAVITY_CSRF_TOKEN": "ephemeral-csrf-token"})
+        with patch("vccp_runtime.activation.DPAPIFileCredentialSource") as source, \
+             patch("vccp_runtime.activation._discover_antigravity_agentapi_environment",
+                   return_value=discovered):
             source.return_value.load_private_key.return_value = object()
             return qualify_activation(
                 MANIFEST, self.config if config is None else config, REPO,
@@ -147,7 +154,10 @@ class ActivationTests(unittest.TestCase):
         config = dict(self.config)
         config["github_app"] = dict(self.config["github_app"], credential_source={
             "type": "posix_file", "path": str(key_path)})
-        with patch("vccp_runtime.activation.POSIXFileCredentialSource") as source:
+        with patch("vccp_runtime.activation.POSIXFileCredentialSource") as source, \
+             patch("vccp_runtime.activation._discover_antigravity_agentapi_environment",
+                   return_value={"ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:54195",
+                                 "ANTIGRAVITY_CSRF_TOKEN": "ephemeral-csrf-token"}):
             source.return_value.load_private_key.return_value = object()
             result = qualify_activation(
                 MANIFEST, config, REPO,
@@ -176,7 +186,50 @@ class ActivationTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "ready")
 
-    def test_readiness_accepts_sdk_reviewer_without_claude_cli_executable(self):
+    def test_antigravity_readiness_reports_undiscoverable_agentapi_context(self):
+        config = dict(self.config, providers=[
+            {"key": "antigravity", "type": "antigravity", "executable": str(self.executable)},
+        ], implementer_provider="antigravity")
+
+        result = self._qualify(config=config, antigravity_context=False)
+
+        self.assertEqual(result["status"], "not_ready")
+        self.assertTrue(any("AntiGravity AgentAPI endpoint is not discoverable" in item
+                            for item in result["blockers"]), result["blockers"])
+
+    def test_antigravity_readiness_accepts_discovered_agentapi_context(self):
+        config = dict(self.config, providers=[
+            {"key": "antigravity", "type": "antigravity", "executable": str(self.executable)},
+        ], implementer_provider="antigravity")
+
+        result = self._qualify(config=config)
+
+        self.assertEqual(result["status"], "ready")
+
+    def test_antigravity_readiness_accepts_explicit_agentapi_environment(self):
+        config = dict(self.config, providers=[
+            {"key": "antigravity", "type": "antigravity", "executable": str(self.executable)},
+        ], implementer_provider="antigravity")
+
+        with patch("vccp_runtime.activation.DPAPIFileCredentialSource") as source, \
+             patch("vccp_runtime.activation._discover_antigravity_agentapi_environment") as discover, \
+             patch.dict(os.environ, {"ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:60001",
+                                     "ANTIGRAVITY_CSRF_TOKEN": "explicit-token"}):
+            source.return_value.load_private_key.return_value = object()
+            result = qualify_activation(MANIFEST, config, REPO, credential_provider=self.provider,
+                                        api=self.api, writer=self.writer, push_backend=self.push_backend)
+
+        self.assertEqual(result["status"], "ready")
+        discover.assert_not_called()
+
+    def test_claude_code_readiness_never_requires_antigravity_context(self):
+        config = dict(self.config, providers=[
+            {"key": "claude_code", "type": "claude_code", "executable": str(self.executable)},
+        ], implementer_provider="claude_code")
+
+        result = self._qualify(config=config, antigravity_context=False)
+
+        self.assertEqual(result["status"], "ready")
         config = dict(self.config, providers=[
             {"key": "antigravity", "type": "antigravity", "executable": str(self.executable)},
             {"key": "claude_agent_sdk", "type": "claude_agent_sdk"},

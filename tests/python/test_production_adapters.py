@@ -551,6 +551,162 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(len(commands), 2)
         self.assertIn("http://127.0.0.1:54195/healthz", open_url.call_args.args[0].full_url)
 
+    def _windows_discovery(self, processes, connections, healthy_ports=(), executable=None):
+        """Drive _discover_antigravity_agentapi_environment through the Windows process table."""
+        from vccp_runtime.adapters import _discover_antigravity_agentapi_environment
+
+        executable = executable or r"C:\Program Files\Antigravity\resources\bin\language_server.exe"
+        commands = []
+
+        def fake_run(args, **kwargs):
+            commands.append(args)
+            if args[0] == "powershell.exe":
+                return SimpleNamespace(returncode=0, stdout=json.dumps(processes))
+            if args[0] == "netstat.exe":
+                return SimpleNamespace(returncode=0, stdout="\n".join(connections))
+            self.fail(f"unexpected command: {args}")
+
+        def fake_urlopen(request, timeout=0):
+            port = int(request.full_url.rsplit(":", 1)[1].split("/")[0])
+            if port not in healthy_ports:
+                raise OSError("connection refused")
+            class Healthy:
+                status = 200
+                def __enter__(self): return self
+                def __exit__(self, *_): return False
+                def read(self): return b'{"status":"ok"}'
+            return Healthy()
+
+        with mock.patch("vccp_runtime.adapters.sys.platform", "win32"), \
+             mock.patch("vccp_runtime.adapters.subprocess.run", side_effect=fake_run), \
+             mock.patch("vccp_runtime.adapters.urlopen", side_effect=fake_urlopen):
+            return _discover_antigravity_agentapi_environment(executable), commands, executable
+
+    def test_windows_discovery_finds_the_running_language_server(self):
+        executable = r"C:\Program Files\Antigravity\resources\bin\language_server.exe"
+        result, commands, _ = self._windows_discovery(
+            processes=[{
+                "ProcessId": 22328,
+                "ExecutablePath": executable,
+                "CommandLine": f'"{executable}" --standalone --override_ide_name antigravity '
+                               f'--https_server_port 0 --csrf_token ephemeral-csrf-token',
+            }],
+            connections=[
+                "  TCP    127.0.0.1:7894         0.0.0.0:0              LISTENING       22328",
+                "  TCP    127.0.0.1:7895         0.0.0.0:0              LISTENING       22328",
+                "  TCP    127.0.0.1:7895         127.0.0.1:50123        ESTABLISHED     99999",
+            ],
+            healthy_ports={7895},
+        )
+
+        self.assertEqual(result, {"ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:7895",
+                                  "ANTIGRAVITY_CSRF_TOKEN": "ephemeral-csrf-token"})
+        # Only the CIM query and one netstat pass are issued; no ps/lsof on Windows.
+        self.assertEqual([command[0] for command in commands], ["powershell.exe", "netstat.exe"])
+
+    def test_windows_discovery_ignores_other_processes_and_unhealthy_ports(self):
+        executable = r"C:\Program Files\Antigravity\resources\bin\language_server.exe"
+        result, _, _ = self._windows_discovery(
+            processes=[{
+                "ProcessId": 4310,
+                "ExecutablePath": r"C:\Other\language_server.exe",
+                "CommandLine": r'"C:\Other\language_server.exe" --standalone --override_ide_name antigravity '
+                               r"--csrf_token other-token",
+            }, {
+                "ProcessId": 22328,
+                "ExecutablePath": executable,
+                "CommandLine": f'"{executable}" --standalone --override_ide_name antigravity '
+                               f"--csrf_token ephemeral-csrf-token",
+            }],
+            connections=["  TCP    127.0.0.1:7895         0.0.0.0:0              LISTENING       22328"],
+            healthy_ports=set(),
+        )
+
+        self.assertIsNone(result)
+
+    def test_windows_discovery_reports_ambiguity_instead_of_guessing(self):
+        executable = r"C:\Program Files\Antigravity\resources\bin\language_server.exe"
+
+        def process(pid, token):
+            return {"ProcessId": pid, "ExecutablePath": executable,
+                    "CommandLine": f'"{executable}" --standalone --override_ide_name antigravity '
+                                   f"--csrf_token {token}"}
+
+        result, _, _ = self._windows_discovery(
+            processes=[process(100, "token-a"), process(200, "token-b")],
+            connections=[
+                "  TCP    127.0.0.1:7895         0.0.0.0:0              LISTENING       100",
+                "  TCP    127.0.0.1:7896         0.0.0.0:0              LISTENING       200",
+            ],
+            healthy_ports={7895, 7896},
+        )
+
+        self.assertIsNone(result)
+
+    def test_antigravity_launch_discovers_context_on_windows(self):
+        with tempfile.TemporaryDirectory() as temp:
+            executable = Path(temp) / "language_server.exe"
+            executable.touch()
+            workspace = init_git_repo(Path(temp) / "repo")
+            calls = []
+            response = SimpleNamespace(returncode=0, stdout=json.dumps({"conversation_id": CONVERSATION_ID}))
+            context = {"ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:7895",
+                       "ANTIGRAVITY_CSRF_TOKEN": "ephemeral-csrf-token"}
+            adapter = AntiGravityImplementer(str(executable), str(workspace), "app-gh", "app-git-push",
+                                             runner=lambda args, **kw: (calls.append((args, kw)), response)[1],
+                                             environ={"USERPROFILE": temp})
+            with mock.patch("vccp_runtime.adapters.sys.platform", "win32"), \
+                 mock.patch("vccp_runtime.adapters._discover_antigravity_agentapi_environment",
+                            return_value=context) as discover:
+                result = adapter.launch(LaunchRequest("o/r", 1, "attempt-win", "initial_dispatch"))
+
+            self.assertEqual(result.disposition, LaunchDisposition.CONFIRMED)
+            discover.assert_called_once_with(str(executable))
+            child_env = calls[0][1]["env"]
+            self.assertEqual(child_env["ANTIGRAVITY_LS_ADDRESS"], context["ANTIGRAVITY_LS_ADDRESS"])
+            self.assertEqual(child_env["ANTIGRAVITY_CSRF_TOKEN"], context["ANTIGRAVITY_CSRF_TOKEN"])
+
+    def test_antigravity_launch_prefers_explicit_environment_over_discovery(self):
+        with tempfile.TemporaryDirectory() as temp:
+            executable = Path(temp) / "language_server.exe"
+            executable.touch()
+            workspace = init_git_repo(Path(temp) / "repo")
+            calls = []
+            response = SimpleNamespace(returncode=0, stdout=json.dumps({"conversation_id": CONVERSATION_ID}))
+            explicit = {"ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:60001",
+                        "ANTIGRAVITY_CSRF_TOKEN": "explicit-token"}
+            for platform in ("darwin", "win32"):
+                adapter = AntiGravityImplementer(str(executable), str(workspace), "app-gh", "app-git-push",
+                                                 runner=lambda args, **kw: (calls.append((args, kw)), response)[1],
+                                                 environ=dict(explicit))
+                with mock.patch("vccp_runtime.adapters.sys.platform", platform), \
+                     mock.patch("vccp_runtime.adapters._discover_antigravity_agentapi_environment") as discover:
+                    result = adapter.launch(LaunchRequest("o/r", 1, f"attempt-explicit-{platform}",
+                                                          "initial_dispatch"))
+                self.assertEqual(result.disposition, LaunchDisposition.CONFIRMED)
+                discover.assert_not_called()
+
+            child_env = calls[0][1]["env"]
+            self.assertEqual(child_env["ANTIGRAVITY_LS_ADDRESS"], explicit["ANTIGRAVITY_LS_ADDRESS"])
+            self.assertEqual(child_env["ANTIGRAVITY_CSRF_TOKEN"], explicit["ANTIGRAVITY_CSRF_TOKEN"])
+
+    def test_antigravity_launch_never_invokes_agentapi_without_discoverable_context_on_windows(self):
+        with tempfile.TemporaryDirectory() as temp:
+            executable = Path(temp) / "language_server.exe"
+            executable.touch()
+            workspace = init_git_repo(Path(temp) / "repo")
+            calls = []
+            adapter = AntiGravityImplementer(str(executable), str(workspace), "app-gh", "app-git-push",
+                                             runner=lambda *a, **kw: calls.append(a),
+                                             environ={"USERPROFILE": temp})
+            with mock.patch("vccp_runtime.adapters.sys.platform", "win32"), \
+                 mock.patch("vccp_runtime.adapters._discover_antigravity_agentapi_environment",
+                            return_value=None):
+                result = adapter.launch(LaunchRequest("o/r", 1, "attempt-win-missing", "initial_dispatch"))
+
+            self.assertEqual(result.disposition, LaunchDisposition.DEFINITELY_NOT_STARTED)
+            self.assertEqual(calls, [])
+
     def test_guard_failure_prevents_agentapi_invocation(self):
         calls = []
         class FailedGuard:
