@@ -649,13 +649,18 @@ class _GuardedProvider:
 _CSRF_FLAG = "--csrf_token"
 
 
-def _csrf_token_from(arguments: list[str]) -> str | None:
+def _flag_value(arguments: list[str], flag: str) -> str | None:
+    """Return the value of ``--flag value`` or ``--flag=value``, else None."""
     for index, argument in enumerate(arguments):
-        if argument.startswith(f"{_CSRF_FLAG}="):
+        if argument.startswith(f"{flag}="):
             return argument.partition("=")[2] or None
-        if argument == _CSRF_FLAG and index + 1 < len(arguments):
+        if argument == flag and index + 1 < len(arguments):
             return arguments[index + 1] or None
     return None
+
+
+def _csrf_token_from(arguments: list[str]) -> str | None:
+    return _flag_value(arguments, _CSRF_FLAG)
 
 
 def _antigravity_endpoint_is_healthy(address: str) -> bool:
@@ -747,6 +752,10 @@ def _windows_antigravity_candidates(executable: str) -> set[tuple[str, str]]:
             if str(Path(executable_path).expanduser().resolve()).casefold() != target:
                 continue
         arguments = [argument.strip('"') for argument in shlex.split(command, posix=False)]
+        # The same executable also serves other IDE modes; only the AntiGravity
+        # instance answers this AgentAPI, so the flag value matters, not its presence.
+        if _flag_value(arguments, "--override_ide_name") != "antigravity":
+            continue
         csrf_token = _csrf_token_from(arguments)
         if not csrf_token:
             continue

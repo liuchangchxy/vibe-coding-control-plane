@@ -624,6 +624,21 @@ class AdapterTests(unittest.TestCase):
 
         self.assertIsNone(result)
 
+    def test_windows_discovery_ignores_other_ide_modes_of_the_same_executable(self):
+        executable = r"C:\Program Files\Antigravity\resources\bin\language_server.exe"
+        result, _, _ = self._windows_discovery(
+            processes=[{
+                "ProcessId": 9001,
+                "ExecutablePath": executable,
+                "CommandLine": f'"{executable}" --standalone --override_ide_name some_other_ide '
+                               f'--csrf_token other-token',
+            }],
+            connections=["  TCP    127.0.0.1:7895         0.0.0.0:0              LISTENING       9001"],
+            healthy_ports={7895},
+        )
+
+        self.assertIsNone(result)
+
     def test_windows_discovery_reports_ambiguity_instead_of_guessing(self):
         executable = r"C:\Program Files\Antigravity\resources\bin\language_server.exe"
 

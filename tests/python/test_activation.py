@@ -230,6 +230,8 @@ class ActivationTests(unittest.TestCase):
         result = self._qualify(config=config, antigravity_context=False)
 
         self.assertEqual(result["status"], "ready")
+
+    def test_readiness_accepts_sdk_reviewer_without_claude_cli_executable(self):
         config = dict(self.config, providers=[
             {"key": "antigravity", "type": "antigravity", "executable": str(self.executable)},
             {"key": "claude_agent_sdk", "type": "claude_agent_sdk"},
