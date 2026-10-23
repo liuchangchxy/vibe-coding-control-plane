@@ -88,7 +88,7 @@ def qualify_activation(manifest: dict, local_config: dict, repo: str, environ=No
             blockers.append(f"{provider_type} provider requires a configured executable")
         elif not Path(executable).expanduser().is_file():
             blockers.append(f"required executable is unavailable: {provider_type}")
-        elif provider_type == "antigravity" and sys.platform in {"darwin", "win32"}:
+        elif provider_type == "antigravity":
             # An AntiGravity launch reaches AgentAPI through a CSRF-protected loopback
             # listener. Without that context a launch can only return UNKNOWN, so it is
             # machine readiness, not a launch-time surprise.
