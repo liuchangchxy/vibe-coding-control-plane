@@ -377,7 +377,8 @@ class ProductionWiringTests(unittest.TestCase):
                   "workspace": str(self.workspace), "owner_id": "owner",
                   "antigravity_executable": "language_server.exe",
                   "app_gh_executable": "app-gh.exe", "app_git_push_executable": "app-git-push.exe",
-                  "github_read_token_env": "TOKEN"}
+                  "github_read_token_env": "TOKEN",
+                  "project_config_root": str(Path(self.temp.name) / "projects")}
         return {**config, **overrides}
 
     def agent_runner(self, args, **kwargs):
@@ -398,7 +399,8 @@ class ProductionWiringTests(unittest.TestCase):
 
     def test_configured_provider_list_is_used_in_order(self):
         configured = self.legacy_config(providers=[
-            {"key": "antigravity", "type": "antigravity", "executable": "language_server.exe"}])
+            {"key": "antigravity", "type": "antigravity", "executable": "language_server.exe",
+             "project_config_root": str(Path(self.temp.name) / "projects")}])
         wired = build_runtime(PRODUCTION_MANIFEST, configured, api=self.api,
                               writer=self.writer, runner=self.agent_runner)
         self.assertEqual(wired.router.primary, "antigravity")
