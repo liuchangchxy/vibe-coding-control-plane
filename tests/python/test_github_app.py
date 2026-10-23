@@ -70,6 +70,8 @@ class FakeTransport:
         if url.endswith(f"/repos/{REPO}/issues/7/labels"):
             self.issue_labels.update(payload["labels"])
             return 200, [{"name": name} for name in sorted(self.issue_labels)]
+        if url.endswith(f"/repos/{REPO}/issues/7/comments"):
+            return 201, {"id": 501, "body": payload["body"]}
         if url.endswith(f"/repos/{REPO}/pulls"):
             return 201, {"number": 44}
         raise AssertionError((method, url))
@@ -332,6 +334,24 @@ class GitHubAppWriterTests(unittest.TestCase):
             self.writer.replace_labels("owner/other", 7, ["agent-ready"], [])
         with self.assertRaises(GitHubAppIdentityError):
             self.writer.replace_labels(REPO, 7, ["ordinary-label"], [])
+        self.assertEqual(len(self.transport.calls), before)
+
+    def test_writer_posts_one_bounded_comment_and_rejects_unsafe_bodies(self):
+        comment_id = self.writer.comment_issue(
+            REPO, 7, "VCCP stopped: needs-human\nReason: reviewer_insufficient_evidence")
+
+        self.assertEqual(comment_id, 501)
+        request = self.transport.calls[-1]
+        self.assertEqual((request[0], request[1]), ("POST", f"https://api.github.com/repos/{REPO}/issues/7/comments"))
+        self.assertEqual(request[3], {"body": "VCCP stopped: needs-human\n"
+                                              "Reason: reviewer_insufficient_evidence"})
+        before = len(self.transport.calls)
+        for body in ("", "   ", "x" * 6001):
+            with self.subTest(length=len(body)):
+                with self.assertRaises(ValueError):
+                    self.writer.comment_issue(REPO, 7, body)
+        with self.assertRaises(GitHubAppIdentityError):
+            self.writer.comment_issue("owner/other", 7, "hello")
         self.assertEqual(len(self.transport.calls), before)
 
     def test_writer_limits_pr_creation_to_enrolled_issue_and_base(self):

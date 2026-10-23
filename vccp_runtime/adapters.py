@@ -48,6 +48,52 @@ _CLAUDE_SESSION_ENVIRONMENT = frozenset({
 _CLAUDE_BACKGROUND_SETTINGS = json.dumps({"worktree": {"bgIsolation": "none"}})
 _CLAUDE_BACKGROUND_HANDLE = re.compile(r"backgrounded\s+\S*\s*([0-9a-f]{8})\b")
 
+# A terminal stop leaves one short Issue comment so a person can see why automation
+# halted. It is a summary, never a transcript, and never carries host detail.
+_MAX_COMMENT_CHARS = 6000
+_MAX_COMMENT_SUMMARY_CHARS = 500
+_REDACTED = "[redacted]"
+_SECRET_PATTERNS = (
+    re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----", re.DOTALL),
+    re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._\-]{16,}\b", re.IGNORECASE),
+)
+# Host filesystem locations are irrelevant to a reader of GitHub and are the most
+# likely way a local absolute path would leak into a public comment.
+_PATH_PATTERNS = (
+    re.compile(r"[A-Za-z]:[\\/][^\s\"'`<>|]*"),
+    re.compile(r"(?<![\w/])/(?:home|Users)/[^\s\"'`<>|]*"),
+)
+
+
+def redact_terminal_text(value, limit: int = _MAX_COMMENT_SUMMARY_CHARS) -> str:
+    """Flatten one terminal reason into a short, host-independent GitHub-safe line."""
+    text = " ".join(str(value or "").split())
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub(_REDACTED, text)
+    for pattern in _PATH_PATTERNS:
+        text = pattern.sub(_REDACTED, text)
+    text = " ".join(text.split())
+    if len(text) > limit:
+        text = text[:max(0, limit - 1)].rstrip() + "…"
+    return text
+
+
+def render_terminal_stop_comment(label: str, reason: str, summary: str = "",
+                                 pr_number: int | None = None,
+                                 head_sha: str | None = None) -> str:
+    """Render the fixed shape of a terminal-stop comment."""
+    lines = [f"VCCP stopped: {redact_terminal_text(label, 64)}",
+             f"Reason: {redact_terminal_text(reason, 128)}"]
+    cleaned = redact_terminal_text(summary, _MAX_COMMENT_SUMMARY_CHARS)
+    if cleaned:
+        lines.append(f"Summary: {cleaned}")
+    if isinstance(pr_number, int) and pr_number > 0:
+        lines.append(f"PR: #{pr_number}")
+    if isinstance(head_sha, str) and re.fullmatch(r"[0-9a-fA-F]{40}", head_sha):
+        lines.append(f"Head: {head_sha.lower()}")
+    return "\n".join(lines)
+
 
 class GitHubAPI:
     """GitHub REST/GraphQL reads using a short-lived App token in production."""
@@ -216,6 +262,26 @@ class GitHubAppWriter:
             return False
         verified_status, verified = self.provider.request("GET", path, repo)
         return verified_status == 200 and verified.get("number") == issue and verified.get("state") == "closed"
+
+    def comment_issue(self, repo: str, issue: int, body: str):
+        """Post one bounded human-readable Issue comment; return its id or None.
+
+        This is a courtesy summary for a person reading GitHub, never the ledger. The
+        caller decides whether a comment is owed; this method only refuses to write an
+        empty or oversized body and verifies the write landed.
+        """
+        if self.provider is None or repo.casefold() != self.target_repository:
+            raise GitHubAppIdentityError("controlled Issue comment requires the enrolled GitHub App provider")
+        if not isinstance(issue, int) or issue < 1:
+            raise ValueError("controlled Issue identity is invalid")
+        if not isinstance(body, str) or not body.strip() or len(body) > _MAX_COMMENT_CHARS:
+            raise ValueError("controlled Issue comment body is outside the bounded size")
+        owner, name = repo.split("/", 1)
+        status, created = self.provider.request(
+            "POST", f"/repos/{owner}/{name}/issues/{issue}/comments", repo, {"body": body})
+        if status not in (200, 201) or not isinstance(created, dict) or not isinstance(created.get("id"), int):
+            return None
+        return created["id"]
 
 
 class GitHubWorkflowAdapter:
@@ -539,6 +605,16 @@ class GitHubWorkflowAdapter:
         after = self._facts(repo, issue_number)
         return not after.active_labels
 
+    def post_terminal_stop_summary(self, repo, issue_number, label, reason, summary="",
+                                   pr_number=None, head_sha=None):
+        """Post one short terminal-stop comment and return its id, or None.
+
+        Deduplication belongs to the durable ledger, not here: this method only renders
+        and writes the summary the caller decided is owed.
+        """
+        body = render_terminal_stop_comment(label, reason, summary, pr_number, head_sha)
+        return self.writer.comment_issue(repo, issue_number, body)
+
 
 def generic_prompt(request: LaunchRequest, workspace: str, policy: dict,
                    app_gh: str, app_git_push: str) -> str:
@@ -575,6 +651,24 @@ def generic_prompt(request: LaunchRequest, workspace: str, policy: dict,
             cause_guidance = (
                 "This repair was admitted for an exact-head CI failure; inspect the configured required "
                 "checks on the supplied head and address the explicitly attributed implementation failure. ")
+        elif request.repair_cause_type == "evidence_remediation":
+            feedback = (request.review_feedback or "").strip()
+            cause_guidance = (
+                "This is not a code defect. The Reviewer could not decide a Frozen Spec acceptance "
+                "criterion because runtime evidence was missing or unusable, and classified the gap as one "
+                "the Implementer can close inside the Frozen scope already in force. Supply that evidence "
+                f"for the existing PR at exact head {request.expected_head_sha}; do not widen product scope, "
+                "change the acceptance criteria, or treat this as a CHANGES_REQUESTED review."
+                + (f" Reviewer note:\n<reviewer-evidence-note>\n{feedback}\n</reviewer-evidence-note>" if feedback else "")
+                + " When a runtime test or deployment is the evidence, record one fenced block per "
+                  "environment in the PR body:\n```vccp-runtime-evidence\n"
+                  '{"expected_revision": "<full 40-hex sha of the head under review>", '
+                  '"tested_revision": "<full sha of the revision actually exercised>", '
+                  '"target": "<where it ran>", "image_digest": "<optional>"}\n```\n'
+                  "tested_revision must be the revision actually exercised. Evidence from a different "
+                  "revision cannot satisfy a criterion that requires the current one. If the missing "
+                  "evidence needs a human credential or a human choice of environment, say so instead of "
+                  "fabricating it. ")
         else:
             feedback = (request.review_feedback or "").strip()
             cause_guidance = (

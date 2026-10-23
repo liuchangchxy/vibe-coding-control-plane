@@ -370,14 +370,19 @@ class ReviewerAgentTests(unittest.TestCase):
     def test_insufficient_evidence_maps_to_blocked_and_never_to_rejection(self):
         result = {"decision": "INSUFFICIENT_EVIDENCE",
                   "summary": "Criterion 2 cannot be decided: no browser evidence was supplied.",
-                  "findings": []}
+                  "findings": [], "remediation": "human"}
 
         self.assertEqual(ClaudeAgentSDKReviewer._to_review(result), {
             "event": "BLOCKED",
-            "body": "Criterion 2 cannot be decided: no browser evidence was supplied."})
+            "body": "Criterion 2 cannot be decided: no browser evidence was supplied.",
+            "remediation": "human"})
         self.assertFalse(ClaudeAgentSDKReviewer._to_review(
             {**result, "findings": [{"severity": "blocking", "file": "code.py",
                                      "line": 1, "description": "Regression."}]}))
+        # The gap owner is part of the contract: an unclassified gap cannot be routed.
+        self.assertFalse(ClaudeAgentSDKReviewer._to_review(
+            {key: value for key, value in result.items() if key != "remediation"}))
+        self.assertFalse(ClaudeAgentSDKReviewer._to_review({**result, "remediation": "nobody"}))
 
     def test_malformed_structured_output_fails_with_session_provenance(self):
         with tempfile.TemporaryDirectory() as temp:

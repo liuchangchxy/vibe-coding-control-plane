@@ -36,6 +36,17 @@ If GitHub label restoration is interrupted, rerun the same command only while it
 
 It records the authorization and restores the Issue's matching active coordination label. It can run while the resident Runner is active because it makes no dispatch and relies on SQLite transactions plus GitHub compare-and-set. The normal Runner then dispatches the exact cause; the authorization command itself never launches an Implementer.
 
+### Resuming the Reviewer after a human supplied evidence
+
+A `reviewer_insufficient_evidence` stop has its own explicit entry point. It is deliberately not `--authorize-repair-continuation`, which means "reopen an exhausted repair budget" and would dispatch the Implementer:
+
+```powershell
+python -m vccp_runtime.runner --manifest <manifest> --runtime-config <runtime-config> --repo OWNER/REPO --resume-review-after-evidence --issue ISSUE --pr PR --head-sha FULL_40_CHAR_SHA --authorize-evidence-resume-for FULL_40_CHAR_SHA
+```
+
+It is accepted only when the durable lifecycle row is `NEEDS_HUMAN` with a `reviewer_insufficient_evidence` outcome at that exact head, the Reviewer execution for that head is a `COMPLETED` `BLOCKED` conclusion, the PR is still open at that head, and the Frozen Issue is still valid. It records the human's identity and authorization in the durable ledger, restores the coordination label, and re-runs the Reviewer for the same PR and exact head. It never launches the Implementer and never creates a PR. If the head has changed, the authorization is refused so the ordinary exact-head flow handles the new head. Consumed authorizations are never reused.
+
+
 Dispatcher admits a candidate only when the workflow is valid, its cause is recognized, the exact current SHA matches the cause, that logical head has not already consumed a repair, budget remains, and no terminal/cancellation blocker exists. Logical repair identity is `repair:<repo>:pr:<pr_number>:head:<failed_or_rejected_head_sha>`. Replayed observations for a head cannot create duplicate logical repairs. Repairs continue on the same linked PR and implementation branch. Stale CI failures and reviews cannot authorize work against a newer SHA. Exceeding the budget transitions to `needs-human`.
 
 Only positively attributed implementation failures within the Frozen Spec may be candidates for automatic CI repair. Confirmed infrastructure failure is `infra-blocked`; ambiguous or insufficient evidence is `needs-human`. A generic GitHub `failure` conclusion does not establish implementation causation. Schema-v2 consumers may explicitly list `implementation_failure_conclusions` and `infrastructure_failure_conclusions` per required check; omitted or conflicting attribution fails closed.
@@ -71,6 +82,28 @@ Before formal review, verify all of the following from current GitHub state:
 The Runtime observes exact-head checks before Local Reviewer execution. Stale heads receive no approval. The local Reviewer model operates on a disposable exact-head workspace and has no GitHub write tools; the VCCP host alone submits GitHub reviews and enables native Auto-merge.
 
 A Reviewer decision has three channels. `findings` are blocking defects that violate the Frozen Spec; they alone authorize a Reviewer-caused repair. `siblings` record an independent defect caused by the same confirmed error pattern; they are written into the exact-head review body for later human triage and never block the PR, create Issues, or authorize repair. Out-of-scope observations are omitted. `INSUFFICIENT_EVIDENCE` carries no findings and stops the automated flow instead of forcing an approval or rejection.
+
+`INSUFFICIENT_EVIDENCE` also names who can close the gap through `remediation`:
+
+- `agent` — the missing evidence is something the Implementer can supply inside the Frozen Spec already in force, for example a deploy step the spec authorized but the Implementer did not run. The Runtime admits an `evidence_remediation` repair against the same PR, branch, and exact head. This is not a code defect, so no `CHANGES_REQUESTED` review is fabricated, and the Reviewer execution remains the durable cause record.
+- `human` — the gap needs a human credential, a human choice of target environment, an external authorization or policy decision, or a clarification of an ambiguous Frozen Spec. The Issue stops at `needs-human`.
+
+A gap whose class cannot be determined is treated as `human`: the Runtime never guesses in the direction of more automation. An `agent` gap whose durable Reviewer execution is absent or not a `BLOCKED` conclusion is also not admitted; it becomes a visible `needs-human` stop instead of a silent loop.
+
+## Runtime evidence metadata
+
+An Implementer may declare runtime evidence in a fenced `vccp-runtime-evidence` block in the PR body:
+
+```json
+{"expected_revision": "<full 40-char SHA>", "tested_revision": "<full 40-char SHA>",
+ "target": "<where it ran>", "image_digest": "<optional>"}
+```
+
+The Runtime parses these blocks and gives the Reviewer one verdict per item against the exact head under review: `accepted=yes` only when `tested_revision` equals `expected_revision` and `expected_revision` is the exact PR head. Evidence whose `tested_revision` differs cannot satisfy a Frozen Spec criterion that requires verification of the current revision. This is metadata only; it creates no gate, artifact store, or deployment system, and it never overrides the Frozen Spec.
+
+## Terminal stops are visible
+
+Every Runtime-created transition into `needs-human` or `infra-blocked` also leaves exactly one short Issue comment: the label, a stable reason code, a bounded summary, the PR number, and the exact head SHA. The comment is a courtesy summary for a human reader; SQLite remains the durable ledger. Secrets, tokens, and host filesystem paths are redacted, and no transcript is ever posted. A durable notice row keyed by repository, Issue, label, reason, and head prevents a restart, a repeated reconcile, or a replayed stop from posting the same summary twice; a failed write is retried once on the next pass.
 
 ## Same-PR repair
 
