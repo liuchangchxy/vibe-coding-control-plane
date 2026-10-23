@@ -379,10 +379,19 @@ class ReviewerAgentTests(unittest.TestCase):
         self.assertFalse(ClaudeAgentSDKReviewer._to_review(
             {**result, "findings": [{"severity": "blocking", "file": "code.py",
                                      "line": 1, "description": "Regression."}]}))
-        # The gap owner is part of the contract: an unclassified gap cannot be routed.
-        self.assertFalse(ClaudeAgentSDKReviewer._to_review(
-            {key: value for key, value in result.items() if key != "remediation"}))
-        self.assertFalse(ClaudeAgentSDKReviewer._to_review({**result, "remediation": "nobody"}))
+        # A gap that arrives without a usable class is normalized to `human` rather than
+        # failing the whole Reviewer execution: the stop must stay explainable.
+        self.assertEqual(ClaudeAgentSDKReviewer._to_review(
+            {key: value for key, value in result.items() if key != "remediation"}), {
+            "event": "BLOCKED",
+            "body": "Criterion 2 cannot be decided: no browser evidence was supplied.",
+            "remediation": "human"})
+        self.assertEqual(ClaudeAgentSDKReviewer._to_review({**result, "remediation": "nobody"}), {
+            "event": "BLOCKED",
+            "body": "Criterion 2 cannot be decided: no browser evidence was supplied.",
+            "remediation": "human"})
+        agent = ClaudeAgentSDKReviewer._to_review({**result, "remediation": "agent"})
+        self.assertEqual(agent["remediation"], "agent")
 
     def test_malformed_structured_output_fails_with_session_provenance(self):
         with tempfile.TemporaryDirectory() as temp:

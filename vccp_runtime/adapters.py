@@ -668,7 +668,12 @@ def generic_prompt(request: LaunchRequest, workspace: str, policy: dict,
                   "tested_revision must be the revision actually exercised. Evidence from a different "
                   "revision cannot satisfy a criterion that requires the current one. If the missing "
                   "evidence needs a human credential or a human choice of environment, say so instead of "
-                  "fabricating it. ")
+                  "fabricating it. "
+                + (f" This repair may finish without a new commit. When the evidence is complete and no "
+                   f"code change is needed, run `{request.evidence_command} --note \"<what you ran, "
+                   f"where, and the exact revisions>\"` once; the Runtime then re-runs the Reviewer at the "
+                   f"unchanged head. Do not create an empty commit and do not describe completion in prose."
+                   if request.evidence_command else ""))
         else:
             feedback = (request.review_feedback or "").strip()
             cause_guidance = (
@@ -868,7 +873,8 @@ class AntiGravityImplementer(_GuardedProvider):
         except Exception:
             # A missing/failed guard proves the external AgentAPI command was never invoked.
             return LaunchResult(LaunchDisposition.DEFINITELY_NOT_STARTED)
-        request = __import__("dataclasses").replace(request, completion_command=guard.completion_command)
+        request = __import__("dataclasses").replace(request, completion_command=guard.completion_command,
+                                                 evidence_command=guard.evidence_command)
         prompt = generic_prompt(request, self.workspace, self._policy, app_gh_command, guard.git_push_command)
         try:
             result = self.runner([self.executable, "agentapi", "new-conversation", prompt],
@@ -1010,7 +1016,8 @@ class ClaudeCodeImplementer(_GuardedProvider):
         except Exception:
             # A missing/failed guard proves the external Claude command was never invoked.
             return LaunchResult(LaunchDisposition.DEFINITELY_NOT_STARTED)
-        request = __import__("dataclasses").replace(request, completion_command=guard.completion_command)
+        request = __import__("dataclasses").replace(request, completion_command=guard.completion_command,
+                                                 evidence_command=guard.evidence_command)
         prompt = generic_prompt(request, self.workspace, self._policy, app_gh_command, guard.git_push_command)
         command = [self.executable, "--bg", prompt, "--permission-mode", self.permission_mode,
                    "--settings", _CLAUDE_BACKGROUND_SETTINGS]
@@ -1056,6 +1063,7 @@ class WorkspaceGuard:
     environment: dict[str, str]
     github_command: str | None = None
     completion_command: str | None = None
+    evidence_command: str | None = None
 
 
 class WorkspaceWriteGuard:
@@ -1130,6 +1138,7 @@ class WorkspaceWriteGuard:
                 github_wrapper = root / ("app-gh.cmd" if windows else "app-gh")
                 wrapper = root / ("app-git-push.cmd" if windows else "app-git-push")
                 completion_wrapper = root / ("complete-no-change.cmd" if windows else "complete-no-change")
+                evidence_wrapper = root / ("complete-evidence.cmd" if windows else "complete-evidence")
                 command = f'"{python}" -m vccp_runtime.controlled_cli --context "{context_path}"'
                 if windows:
                     env_prefix = f'set "PYTHONPATH={runtime_root}"\r\n'
@@ -1140,14 +1149,18 @@ class WorkspaceWriteGuard:
                                        f'{command} git-push %*\r\nexit /b %ERRORLEVEL%\r\n', encoding="utf-8")
                     completion_wrapper.write_text(f'@echo off\r\nsetlocal\r\n{env_prefix}'
                                                   f'{command} complete-no-change\r\nexit /b %ERRORLEVEL%\r\n', encoding="utf-8")
+                    evidence_wrapper.write_text(f'@echo off\r\nsetlocal\r\n{env_prefix}'
+                                                f'{command} complete-evidence %*\r\nexit /b %ERRORLEVEL%\r\n', encoding="utf-8")
                 else:
                     github_wrapper.write_text("#!/bin/sh\nexec " + command + ' app-gh "$@"\n', encoding="utf-8")
                     wrapper.write_text("#!/bin/sh\nVCCP_CONTROLLED_PUSH=1 export VCCP_CONTROLLED_PUSH\n"
                                        "exec " + command + ' git-push "$@"\n', encoding="utf-8")
                     completion_wrapper.write_text("#!/bin/sh\nexec " + command + " complete-no-change\n", encoding="utf-8")
+                    evidence_wrapper.write_text("#!/bin/sh\nexec " + command + ' complete-evidence "$@"\n', encoding="utf-8")
                     github_wrapper.chmod(0o700)
                     wrapper.chmod(0o700)
                     completion_wrapper.chmod(0o700)
+                    evidence_wrapper.chmod(0o700)
                     hook.chmod(0o700)
                 github_command = str(github_wrapper)
             else:
@@ -1198,7 +1211,8 @@ class WorkspaceWriteGuard:
             if launch_context is not None:
                 env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
             return WorkspaceGuard(str(wrapper), env, github_command,
-                                  str(completion_wrapper) if launch_context is not None else None)
+                                  str(completion_wrapper) if launch_context is not None else None,
+                                  str(evidence_wrapper) if launch_context is not None else None)
         except Exception:
             if not config_written:
                 import shutil
@@ -1423,6 +1437,7 @@ def build_runtime(manifest: dict, local_config: dict, api=None, writer=None,
             settings.get("project_config_root"),
         ) if settings.get("type") == ANTIGRAVITY_PROVIDER else reviewer_factory(
             None, api, manifest, workspace, review_root,
+            evidence_note=core.store.evidence_note,
         )
         user_provider = GitHubUserReviewerProvider(target_repo, identity)
         reviewer_writer = LocalReviewerWriter(user_provider, workflow, target_repo, identity, manifest)

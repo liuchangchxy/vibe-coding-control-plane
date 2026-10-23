@@ -374,13 +374,17 @@ test("schema, generated manifest, onboarding guide, contract, and Reviewer promp
   // A stop must be explainable on GitHub, recoverable, and must not hand agent-fixable
   // evidence gaps to a human.
   assert.match(contract, /leaves exactly one short Issue comment/);
+  assert.match(contract, /next regular Runner cycle retries it with backoff/);
   assert.match(contract, /`agent` — the missing evidence is something the Implementer can supply/);
   assert.match(contract, /`human` — the gap needs a human credential/);
   assert.match(contract, /resume-review-after-evidence/);
   assert.match(contract, /never launches the Implementer and never creates a PR/);
+  assert.match(contract, /complete-evidence --note/);
   assert.match(contract, /tested_revision/);
   assert.match(reviewer, /Also requires `remediation`/);
-  assert.match(reviewer, /accepted=no/);
+  assert.match(reviewer, /revision_match=no/);
+  assert.match(reviewer, /does not prove that a test ran/);
+  assert.match(reviewer, /when you omit `remediation`/i);
   for (const text of [template, onboarding, contract, reviewer]) {
     assert.doesNotMatch(text, /three formal `?REQUEST_CHANGES`? repair rounds/i);
   }

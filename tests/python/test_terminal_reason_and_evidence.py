@@ -8,7 +8,8 @@ from types import SimpleNamespace
 
 from vccp_runtime.adapters import generic_prompt
 from vccp_runtime import runner
-from vccp_runtime.core import LaunchDisposition, LaunchResult, RuntimeCore, WorkflowSnapshot
+from vccp_runtime.core import (LaunchDisposition, LaunchResult, RepairCandidate, RuntimeCore,
+                               WorkflowSnapshot)
 from vccp_runtime.evidence import (evaluate_runtime_evidence, parse_runtime_evidence,
                                    render_evidence_section)
 from vccp_runtime.lifecycle import LifecycleDriver
@@ -59,14 +60,23 @@ class FakeWorkflow:
         self.transitions = []
         self.restored = []
         self.fail_publish = 0
+        self.fail_transition = False
+        self.ready = []
 
     def observe(self, repo, issue):
         return self.snapshots[(repo, issue)]
 
+    def discover_ready(self, repo):
+        return list(self.ready)
+
+    def discover_active(self, repo):
+        return [issue for (key, issue) in self.snapshots if key == repo]
+
     def transition_coordination_state(self, repo, issue, expected_state, new_state,
                                       expected_revision):
         current = self.snapshots[(repo, issue)]
-        if current.revision != expected_revision or current.coordination_state != expected_state:
+        if (self.fail_transition or current.revision != expected_revision
+                or current.coordination_state != expected_state):
             return False
         terminal = (new_state,) if new_state in {"infra-blocked", "needs-human"} else ()
         self.snapshots[(repo, issue)] = replace(
@@ -199,18 +209,78 @@ class TerminalReasonTests(LifecycleCase):
                                                  "reviewer_insufficient_evidence", HEAD)
         self.assertEqual(notice["comment_id"], 1001)
 
-    def test_failed_comment_write_is_retried_once_and_then_recorded(self):
+    def test_failed_comment_write_stays_pending_and_a_later_cycle_retries_it(self):
         self.workflow.fail_publish = 1
 
         self.assertIsNone(self.core.publish_terminal_stop(
             REPO, ISSUE, "needs-human", "reviewer_insufficient_evidence", "missing evidence",
             PR, HEAD, 100))
-        self.assertIsNone(self.core.store.terminal_notice(
-            REPO, ISSUE, "needs-human", "reviewer_insufficient_evidence", HEAD))
-        self.assertEqual(self.core.publish_terminal_stop(
-            REPO, ISSUE, "needs-human", "reviewer_insufficient_evidence", "missing evidence",
-            PR, HEAD, 101), 1001)
+        pending = self.core.store.terminal_notice(
+            REPO, ISSUE, "needs-human", "reviewer_insufficient_evidence", HEAD)
+        self.assertIsNotNone(pending)
+        self.assertIsNone(pending["comment_id"])
+        self.assertEqual(pending["attempts"], 1)
+
+        # The normal Runner cycle retries it; the first retry waits out the backoff.
+        backoff = self.core.retry_pending_terminal_notices(REPO, now=150)
+        self.assertEqual(backoff["items"][0]["status"], "backoff")
+        self.assertEqual(self.workflow.posted, [])
+        retried = self.core.retry_pending_terminal_notices(REPO, now=221)
+        self.assertEqual(retried["items"][0]["status"], "published")
         self.assertEqual(len(self.workflow.posted), 1)
+        self.assertEqual(self.workflow.posted[0]["reason"], "reviewer_insufficient_evidence")
+        self.assertEqual(self.core.store.terminal_notice(
+            REPO, ISSUE, "needs-human", "reviewer_insufficient_evidence", HEAD)["comment_id"], 1001)
+        # Once published, the row is never retried again.
+        self.assertEqual(self.core.retry_pending_terminal_notices(REPO, now=1000)["items"], [])
+        self.assertEqual(len(self.workflow.posted), 1)
+
+    def test_a_pending_notice_is_retried_by_the_ordinary_runner_cycle(self):
+        self.workflow.fail_publish = 1
+        self.core.publish_terminal_stop(REPO, ISSUE, "infra-blocked", "recovery_timeout",
+                                        "recovery stopped", PR, HEAD, 100)
+        runtime = SimpleNamespace(core=self.core, lifecycle=self.driver(),
+                                  workflow=self.workflow, implementer=self.implementer)
+
+        cycle = runner.run_once(runtime, REPO, "owner", now=300)
+
+        self.assertEqual(cycle["terminal_notices"]["items"][0]["status"], "published")
+        self.assertEqual([entry["reason"] for entry in self.workflow.posted],
+                         ["recovery_timeout"])
+
+    def test_a_failed_label_transition_never_publishes_a_fake_stop(self):
+        self.workflow.fail_transition = True
+
+        result = self.driver(FakeReviewer({"status": "reviewer_insufficient_evidence",
+                                           "summary": "needs a person", "remediation": "human"}
+                                          )).advance_once(REPO, "owner", 100)
+
+        self.assertEqual(result["items"][0]["status"], "needs-human")
+        self.assertFalse(result["items"][0]["transitioned"])
+        self.assertEqual(self.workflow.posted, [])
+        self.assertEqual(self.workflow.observe(REPO, ISSUE).terminal_labels, ())
+
+    def test_the_implementer_watchdog_stop_carries_a_reason(self):
+        attempt = self.core.store.attempts_for_repo(REPO)[0]
+        self.assertEqual(attempt["phase"], "PR_BOUND")
+        repair = self.core.store.admit_repair(
+            RepairCandidate(REPO, ISSUE, PR, HEAD, "implement/7", "implementation_failure",
+                            "ci:x", "owner"),
+            300, 3, 900)
+        self.assertEqual(repair["status"], "admitted")
+        self.core.store.mark_phase(repair["attempt_id"], "LAUNCH_CONFIRMED", outcome="confirmed",
+                                   execution_id="exec-9", implementer_provider=PROVIDER,
+                                   implementer_progress_timeout=60)
+        row = self.core.store.attempt(repair["attempt_id"])
+
+        result = self.core.observe_implementer_progress(REPO, now=row["progress_deadline_at"] + 1)
+
+        self.assertEqual(result["items"][0]["status"], "implementer_stalled")
+        self.assertEqual(len(self.workflow.posted), 1)
+        posted = self.workflow.posted[0]
+        self.assertEqual((posted["label"], posted["reason"]),
+                         ("infra-blocked", "implementer_progress_stalled"))
+        self.assertEqual((posted["pr"], posted["head"]), (PR, HEAD))
 
 
 class EvidenceGapRoutingTests(LifecycleCase):
@@ -448,6 +518,113 @@ class ReviewerResumeTests(LifecycleCase):
         self.assertIsNone(self.core.store.reviewer_execution(REPO, PR, HEAD_B))
 
 
+class SameHeadEvidenceCompletionTests(LifecycleCase):
+    """An evidence gap can close without a new commit and must not wait for a push."""
+
+    def _durable_agent_block(self, remediation="agent", body="Missing deploy evidence."):
+        self.core.store.claim_reviewer_execution(REPO, PR, HEAD, PROVIDER, now=50)
+        self.core.store.update_reviewer_execution(
+            REPO, PR, HEAD, "COMPLETED", "exec",
+            outcome=json.dumps({"event": "BLOCKED", "body": body,
+                                "remediation": remediation}), now=51)
+
+    def _launch_evidence_repair(self, summary="Missing deploy evidence."):
+        self._durable_agent_block()
+        reviewer = FakeReviewer({"status": "reviewer_insufficient_evidence",
+                                 "summary": summary, "remediation": "agent"})
+        routed = self.driver(reviewer).advance_once(REPO, "owner", 100)
+        self.assertEqual(routed["items"][0]["trigger"], "evidence_remediation")
+        repair = [row for row in self.core.store.attempts_for_repo(REPO)
+                  if row["kind"] == "repair"][0]
+        self.assertEqual((repair["phase"], repair["expected_head_sha"]),
+                         ("LAUNCH_CONFIRMED", HEAD))
+        return reviewer, repair
+
+    def _complete(self, repair, note="deploy re-run at " + HEAD):
+        self.assertTrue(self.core.store.record_evidence_completion(
+            repair["attempt_id"], PROVIDER, repair["execution_id"],
+            json.dumps({"head": HEAD, "status": ""}), evidence_reference=note))
+
+    def test_evidence_completed_without_a_new_commit_reruns_the_reviewer_at_the_same_head(self):
+        _reviewer, repair = self._launch_evidence_repair()
+        self._complete(repair)
+
+        # The recovery pass settles the completion before any repair-push wait can fire.
+        reconciled = self.core.reconcile_once(REPO, "owner", 120)
+        statuses = [item.get("status") for item in reconciled["items"]]
+        self.assertIn("evidence_completed", statuses)
+        self.assertNotIn("waiting_for_repair_push", statuses)
+        self.assertNotIn("repair_head_timeout", statuses)
+        bound = self.core.store.attempt(repair["attempt_id"])
+        self.assertEqual((bound["phase"], bound["resulting_head_sha"]), ("PR_BOUND", HEAD))
+        self.assertEqual(self.core.store.reviewer_execution(REPO, PR, HEAD)["state"],
+                         "EVIDENCE_RESUME_AUTHORIZED")
+        self.assertEqual(self.core.store.evidence_note(REPO, PR, HEAD), "deploy re-run at " + HEAD)
+
+        # The same exact head is re-reviewed; no new head, no second Implementer launch.
+        review_agent = FakeReviewAgent()
+        local = LocalReviewerDriver(
+            self.core.store, review_agent,
+            LocalReviewerWriter(FakeGitHubProvider(), self.workflow, REPO,
+                                "liuchangchxy", MANIFEST),
+            PROVIDER)
+        cycle = self.driver(local).advance_once(REPO, "owner", 130)
+
+        item = cycle["items"][0]
+        self.assertEqual(item["status"], "WAITING_REVIEW")
+        self.assertEqual(item["reviewer"]["status"], "reviewer_running")
+        self.assertEqual(review_agent.launches, [(REPO, ISSUE, PR, HEAD)])
+        self.assertEqual(self.workflow.observe(REPO, ISSUE).pr_head_sha, HEAD)
+        self.assertEqual(len(self.implementer.launches), 2)
+        self.assertEqual(self.workflow.posted, [])
+
+    def test_the_completion_receipt_is_idempotent_and_keeps_the_latest_note(self):
+        _reviewer, repair = self._launch_evidence_repair()
+        self._complete(repair, note="first note")
+        self._complete(repair, note="second note")
+
+        self.assertEqual(self.core.store.evidence_note(REPO, PR, HEAD), "second note")
+        self.assertEqual(len(self.core.store.evidence_receipts(REPO)), 1)
+
+    def test_a_gap_that_survives_its_own_remediation_stops_for_a_human(self):
+        reviewer, repair = self._launch_evidence_repair()
+        self._complete(repair)
+        self.core.reconcile_once(REPO, "owner", 120)
+
+        result = self.driver(reviewer).advance_once(REPO, "owner", 140)
+
+        self.assertEqual(result["items"][0]["status"], "needs-human")
+        self.assertEqual(len(self.workflow.posted), 1)
+        self.assertEqual(self.workflow.posted[0]["reason"],
+                         "evidence_remediation_did_not_close_gap")
+
+    def test_completion_is_refused_when_the_durable_gap_requires_a_human(self):
+        _reviewer, repair = self._launch_evidence_repair()
+        self._durable_agent_block(remediation="human", body="Needs a maintainer credential.")
+        self._complete(repair)
+
+        reconciled = self.core.reconcile_once(REPO, "owner", 120)
+
+        refused = [item for item in reconciled["items"]
+                   if item.get("status") == "evidence_completion_refused"]
+        self.assertEqual(len(refused), 1)
+        self.assertEqual(refused[0]["reason"], "gap_requires_a_human")
+        self.assertEqual(self.core.store.attempt(repair["attempt_id"])["phase"], "LAUNCH_CONFIRMED")
+        self.assertEqual(self.core.store.reviewer_execution(REPO, PR, HEAD)["state"], "COMPLETED")
+
+    def test_completion_is_deferred_when_the_head_moved(self):
+        _reviewer, repair = self._launch_evidence_repair()
+        self._complete(repair)
+        self.workflow.snapshots[(REPO, ISSUE)] = snapshot(pr_head_sha=HEAD_B)
+
+        reconciled = self.core.reconcile_once(REPO, "owner", 120)
+
+        deferred = [item for item in reconciled["items"]
+                    if item.get("status") == "evidence_completion_deferred"]
+        self.assertEqual(len(deferred), 1)
+        self.assertEqual(self.core.store.reviewer_execution(REPO, PR, HEAD)["state"], "COMPLETED")
+
+
 class RuntimeEvidenceTests(unittest.TestCase):
     def test_mismatched_tested_revision_never_satisfies_exact_head_acceptance(self):
         text = ("PR body\n```vccp-runtime-evidence\n"
@@ -458,14 +635,16 @@ class RuntimeEvidenceTests(unittest.TestCase):
         verdicts = evaluate_runtime_evidence(parse_runtime_evidence(text), HEAD)
 
         self.assertEqual(len(verdicts), 1)
-        self.assertFalse(verdicts[0]["accepted"])
+        self.assertFalse(verdicts[0]["revision_match"])
         self.assertEqual(verdicts[0]["reason"], "tested_revision_differs_from_expected")
         rendered = render_evidence_section(verdicts, HEAD)
-        self.assertIn("accepted=no", rendered)
+        self.assertIn("revision_match=no", rendered)
         self.assertIn("tested_revision_differs_from_expected", rendered)
         self.assertIn("cannot satisfy that criterion", rendered)
 
-    def test_matching_tested_revision_is_accepted_and_missing_fields_are_unusable(self):
+    def test_matching_tested_revision_is_only_a_revision_match(self):
+        # A declaration that lines up proves nothing about execution or outcome, so the
+        # verdict is named for the revision comparison and never for acceptance.
         text = ("```vccp-runtime-evidence\n"
                 '{"expected_revision": "' + HEAD + '", "tested_revision": "' + HEAD + '", '
                 '"target": "fnos host A"}\n```\n'
@@ -475,10 +654,15 @@ class RuntimeEvidenceTests(unittest.TestCase):
 
         verdicts = evaluate_runtime_evidence(parse_runtime_evidence(text), HEAD)
 
-        self.assertTrue(verdicts[0]["accepted"])
-        self.assertFalse(verdicts[1]["accepted"])
+        self.assertTrue(verdicts[0]["revision_match"])
+        self.assertNotIn("accepted", verdicts[0])
+        self.assertFalse(verdicts[1]["revision_match"])
         self.assertTrue(verdicts[1]["reason"].startswith("missing_"))
         self.assertEqual(verdicts[2]["reason"], "malformed_json")
+        rendered = render_evidence_section(verdicts, HEAD)
+        self.assertIn("revision_match=yes", rendered)
+        self.assertIn("does not prove that a test ran", rendered)
+        self.assertNotIn("accepted=", rendered)
 
     def test_reviewer_prompt_carries_the_verdicts_for_the_exact_head(self):
         api = SimpleNamespace(get=lambda path: (
@@ -501,7 +685,52 @@ class RuntimeEvidenceTests(unittest.TestCase):
 
         self.assertIn("<runtime-evidence>", prompt)
         self.assertIn("expected_revision_is_not_the_exact_head", prompt)
-        self.assertIn("accepted=no", prompt)
+        self.assertIn("revision_match=no", prompt)
+
+    def test_implementer_evidence_note_is_labeled_as_a_declaration(self):
+        api = SimpleNamespace(get=lambda path: (
+            {"body": "Frozen spec."} if path.endswith(f"/issues/{ISSUE}") else
+            {"number": PR, "title": "Change", "state": "open", "draft": False,
+             "head": {"sha": HEAD}, "base": {"ref": "main"},
+             "user": {"login": "builder[bot]"}, "body": "No block."}
+            if path.endswith(f"/pulls/{PR}") else
+            [{"filename": "a.py", "status": "modified", "additions": 1, "deletions": 0,
+              "patch": "+x"}] if f"/pulls/{PR}/files?" in path else []))
+        with tempfile.TemporaryDirectory() as root:
+            contract = Path(root) / "contract.md"
+            contract.write_text("Review the exact head.", encoding="utf-8")
+            task = _ReviewerTask(api, MANIFEST, contract,
+                                 SimpleNamespace(prepare=lambda repo, pr, head: Path(root)),
+                                 evidence_note=lambda repo, pr, head: "Ran the deploy at " + head)
+
+            _, prompt = task.build(REPO, ISSUE, PR, HEAD)
+
+        self.assertIn("<implementer-evidence-note>", prompt)
+        self.assertIn("Ran the deploy at " + HEAD, prompt)
+        self.assertIn("does not prove that anything ran or passed", prompt)
+
+    def test_a_failing_evidence_note_lookup_never_blocks_the_review(self):
+        def boom(repo, pr, head):
+            raise RuntimeError("store unavailable")
+        api = SimpleNamespace(get=lambda path: (
+            {"body": "Frozen spec."} if path.endswith(f"/issues/{ISSUE}") else
+            {"number": PR, "title": "Change", "state": "open", "draft": False,
+             "head": {"sha": HEAD}, "base": {"ref": "main"},
+             "user": {"login": "builder[bot]"}, "body": "No block."}
+            if path.endswith(f"/pulls/{PR}") else
+            [{"filename": "a.py", "status": "modified", "additions": 1, "deletions": 0,
+              "patch": "+x"}] if f"/pulls/{PR}/files?" in path else []))
+        with tempfile.TemporaryDirectory() as root:
+            contract = Path(root) / "contract.md"
+            contract.write_text("Review the exact head.", encoding="utf-8")
+            task = _ReviewerTask(api, MANIFEST, contract,
+                                 SimpleNamespace(prepare=lambda repo, pr, head: Path(root)),
+                                 evidence_note=boom)
+
+            _, prompt = task.build(REPO, ISSUE, PR, HEAD)
+
+        self.assertNotIn("<implementer-evidence-note>", prompt)
+        self.assertIn("Review the exact head.", prompt)
 
 
 class ResumeCommandTests(unittest.TestCase):

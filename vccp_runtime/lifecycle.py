@@ -60,7 +60,7 @@ class LifecycleDriver:
             self.core.store.local_terminal(row["attempt_id"], "TERMINAL_UNRESOLVED", now)
         self.core.store.set_lifecycle(repo, issue, label.upper().replace("-", "_"),
                                       snapshot.pr_head_sha or "", now, 1, outcome)
-        if transitioned:
+        if transitioned or self.core._terminal_label_observed(repo, issue, label):
             self._summarize_terminal_stop(repo, issue, snapshot, label, now, outcome)
         return {"issue": issue, "status": label, "transitioned": transitioned, "outcome": outcome}
 
@@ -93,6 +93,16 @@ class LifecycleDriver:
                     repo, issue, snapshot.pr_number, head, snapshot.pr_branch,
                     "evidence_remediation", f"reviewer-evidence:{digest}", owner_id, summary or None)
                 dispatch = self.core.dispatch_repair(candidate)
+                # The same exact gap was already routed once and its remediation already
+                # finished, yet the Reviewer still cannot decide. Re-dispatching would loop
+                # forever, so the stop becomes visible instead.
+                duplicate = (self.core.store.receipt(dispatch["attempt_id"])
+                             if dispatch.get("status") == "duplicate" and dispatch.get("attempt_id")
+                             else None)
+                if duplicate is not None and duplicate.get("source") == "evidence_remediation":
+                    return self._terminal(repo, issue, snapshot, "needs-human", now,
+                                          "evidence_remediation_did_not_close_gap"
+                                          + (f": {summary}" if summary else ""))
                 # Any admitted attempt counts as routed, including a duplicate replay and
                 # a launch whose outcome the next reconcile pass must resolve.
                 if (dispatch.get("needs_human") or dispatch.get("attempt_id")

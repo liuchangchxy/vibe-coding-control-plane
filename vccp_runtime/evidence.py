@@ -12,6 +12,11 @@ no deployment framework are involved. It exists so the Reviewer is told plainly 
 revision that was actually exercised is not the revision under review. Evidence whose
 ``tested_revision`` differs from ``expected_revision`` — or whose ``expected_revision`` is
 not the exact PR head — cannot satisfy a criterion that requires the current revision.
+
+The verdict is called ``revision_match`` on purpose. Every field in the block is the
+Implementer's own declaration, so a match proves only that the declared revisions agree
+with the exact head. It never proves that a test ran, that it passed, or that the declared
+target was the one exercised; the Reviewer still has to judge the real evidence.
 """
 from __future__ import annotations
 
@@ -61,14 +66,15 @@ def _normalize(raw) -> dict:
 def evaluate_runtime_evidence(items: list[dict], review_head: str) -> list[dict]:
     """Judge each declared item against the exact head under review.
 
-    ``accepted`` is the only field a Reviewer may treat as satisfying a criterion that
-    requires verification of the current revision.
+    ``revision_match`` is the only field a Reviewer may read as "the declared revisions
+    line up with the exact head". It is a statement about declarations, not about whether
+    the run happened or passed.
     """
     verdicts = []
     head = str(review_head or "").casefold()
     for item in items or []:
         if not item.get("valid"):
-            verdicts.append({**item, "accepted": False,
+            verdicts.append({**item, "revision_match": False,
                              "reason": item.get("reason") or "invalid_evidence"})
             continue
         expected_matches_head = str(item["expected_revision"]).casefold() == head
@@ -79,7 +85,7 @@ def evaluate_runtime_evidence(items: list[dict], review_head: str) -> list[dict]
         else:
             reason = "ok"
         verdicts.append({**item, "expected_matches_head": expected_matches_head,
-                         "accepted": reason == "ok", "reason": reason})
+                         "revision_match": reason == "ok", "reason": reason})
     return verdicts
 
 
@@ -96,13 +102,17 @@ def render_evidence_section(verdicts: list[dict], review_head: str) -> str:
                          "tested_revision, and target.")
             continue
         lines.append(
-            f"{index}. accepted={'yes' if item['accepted'] else 'no'}; "
+            f"{index}. revision_match={'yes' if item['revision_match'] else 'no'}; "
             f"expected_revision={item['expected_revision']}; "
             f"tested_revision={item['tested_revision']}; target={item['target']}"
             + (f"; image_digest={item['image_digest']}" if item.get("image_digest") else "")
             + f"; reason={item['reason']}")
     lines.append(
-        "If the Frozen Spec requires verification of the current revision, evidence with "
-        "accepted=no cannot satisfy that criterion. Say so explicitly; do not approve on "
-        "the strength of a test that exercised a different revision.")
+        "Every field above is the Implementer's own declaration. revision_match=yes means "
+        "only that the declared revisions agree with the exact head; it does not prove that "
+        "a test ran, that it passed, or that the declared target was the one exercised. "
+        "Judge the actual runtime, browser, or test evidence yourself. If the Frozen Spec "
+        "requires verification of the current revision, evidence with revision_match=no "
+        "cannot satisfy that criterion; say so explicitly and do not approve on the strength "
+        "of a test that exercised a different revision.")
     return "<runtime-evidence>\n" + "\n".join(lines) + "\n</runtime-evidence>\n\n"

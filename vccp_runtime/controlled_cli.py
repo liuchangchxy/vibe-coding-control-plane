@@ -68,6 +68,10 @@ def _parser():
     push.add_argument("--branch", required=True)
     push.add_argument("--expected-sha", required=True)
     commands.add_parser("complete-no-change")
+    evidence = commands.add_parser("complete-evidence")
+    evidence.add_argument("--note", default="",
+                          help="what evidence was supplied, recorded for the Reviewer as the "
+                               "Implementer's own declaration")
     return parser
 
 
@@ -108,6 +112,33 @@ def run(argv=None) -> int:
             if not store.record_completion(context["attempt_id"], attempt["implementer_provider"],
                                            attempt["execution_id"], evidence):
                 raise GitHubAppError("attempt provenance does not authorize completion")
+            return 0
+        if args.command == "complete-evidence":
+            # A same-head evidence remediation closes without a push, so this command is the
+            # durable "done" signal. It is scoped to one evidence-remediation repair attempt
+            # and refuses once that attempt has pushed anything.
+            if not context.get("attempt_id") or not context.get("provider") or not context.get("database_path"):
+                raise GitHubAppError("evidence completion is not authorized for this attempt")
+            store = _Store(context["database_path"])
+            attempt = store.attempt(context["attempt_id"])
+            if (not attempt or attempt["repo"] != repo.casefold()
+                    or attempt["implementer_provider"] != context.get("provider")
+                    or attempt["kind"] != "repair"
+                    or attempt["cause_type"] != "evidence_remediation"):
+                raise GitHubAppError("attempt provenance does not authorize evidence completion")
+            if store.has_controlled_push(context["attempt_id"]):
+                raise GitHubAppError("evidence completion is unavailable after controlled push")
+            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=context["workspace"],
+                                  check=True, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace").stdout.strip()
+            status = subprocess.run(["git", "status", "--porcelain=v1", "--untracked-files=all", "--", "."],
+                                    cwd=context["workspace"], check=True, capture_output=True,
+                                    text=True, encoding="utf-8", errors="replace").stdout
+            evidence = json.dumps({"head": head, "status": status}, sort_keys=True)
+            if not store.record_evidence_completion(context["attempt_id"], attempt["implementer_provider"],
+                                                    attempt["execution_id"], evidence,
+                                                    evidence_reference=args.note):
+                raise GitHubAppError("attempt provenance does not authorize evidence completion")
             return 0
         if args.command == "app-gh":
             labels = context.get("coordination_labels") or []
