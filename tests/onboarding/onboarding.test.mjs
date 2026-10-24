@@ -380,11 +380,15 @@ test("schema, generated manifest, onboarding guide, contract, and Reviewer promp
   assert.match(contract, /resume-review-after-evidence/);
   assert.match(contract, /never launches the Implementer and never creates a PR/);
   assert.match(contract, /complete-evidence --note/);
+  assert.match(contract, /implementer-evidence-submission/);
+  assert.match(contract, /cannot edit an existing PR body/);
   assert.match(contract, /tested_revision/);
   assert.match(reviewer, /Also requires `remediation`/);
   assert.match(reviewer, /revision_match=no/);
   assert.match(reviewer, /does not prove that a test ran/);
   assert.match(reviewer, /when you omit `remediation`/i);
+  assert.match(reviewer, /implementer-evidence-submission/);
+  assert.match(reviewer, /never that anything ran or passed/);
   for (const text of [template, onboarding, contract, reviewer]) {
     assert.doesNotMatch(text, /three formal `?REQUEST_CHANGES`? repair rounds/i);
   }

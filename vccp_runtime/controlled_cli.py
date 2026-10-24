@@ -69,9 +69,12 @@ def _parser():
     push.add_argument("--expected-sha", required=True)
     commands.add_parser("complete-no-change")
     evidence = commands.add_parser("complete-evidence")
-    evidence.add_argument("--note", default="",
-                          help="what evidence was supplied, recorded for the Reviewer as the "
-                               "Implementer's own declaration")
+    # The note is the Implementer's evidence submission, so it must be substantial enough to
+    # carry a declaration. Empty or trivial notes are refused rather than silently recorded:
+    # a receipt with nothing in it would re-run the Reviewer with no new information.
+    evidence.add_argument("--note", required=True,
+                          help="the evidence submission the Reviewer will read: what was run, "
+                               "the observed result, and the exact revisions involved")
     return parser
 
 
@@ -134,10 +137,13 @@ def run(argv=None) -> int:
             status = subprocess.run(["git", "status", "--porcelain=v1", "--untracked-files=all", "--", "."],
                                     cwd=context["workspace"], check=True, capture_output=True,
                                     text=True, encoding="utf-8", errors="replace").stdout
+            note = (args.note or "").strip()
+            if len(note) < 20:
+                raise GitHubAppError("the evidence submission is too short to be a declaration")
             evidence = json.dumps({"head": head, "status": status}, sort_keys=True)
             if not store.record_evidence_completion(context["attempt_id"], attempt["implementer_provider"],
                                                     attempt["execution_id"], evidence,
-                                                    evidence_reference=args.note):
+                                                    evidence_reference=note):
                 raise GitHubAppError("attempt provenance does not authorize evidence completion")
             return 0
         if args.command == "app-gh":

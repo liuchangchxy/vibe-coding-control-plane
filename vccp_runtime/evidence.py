@@ -17,6 +17,12 @@ The verdict is called ``revision_match`` on purpose. Every field in the block is
 Implementer's own declaration, so a match proves only that the declared revisions agree
 with the exact head. It never proves that a test ran, that it passed, or that the declared
 target was the one exercised; the Reviewer still has to judge the real evidence.
+
+A declaration can reach the Reviewer by two routes. The original one is a fenced block in
+the PR body. The second is the ``complete-evidence`` receipt: an Implementer that closes an
+evidence gap without touching the tree stores the same kind of declaration through the
+controlled CLI, and the Runtime hands it to the next Reviewer at that unchanged head. Both
+routes are rendered as declarations and neither is treated as host-verified evidence.
 """
 from __future__ import annotations
 
@@ -89,12 +95,17 @@ def evaluate_runtime_evidence(items: list[dict], review_head: str) -> list[dict]
     return verdicts
 
 
-def render_evidence_section(verdicts: list[dict], review_head: str) -> str:
-    """Render the reviewer-facing verdicts, empty when the PR declares no evidence."""
+def render_evidence_section(verdicts: list[dict], review_head: str, source: str = "") -> str:
+    """Render the reviewer-facing verdicts, empty when the PR declares no evidence.
+
+    ``source`` names where the declarations came from, so the Reviewer can tell a PR-body
+    block from a same-head ``complete-evidence`` receipt. Both are declarations.
+    """
     if not verdicts:
         return ""
-    lines = [f"Runtime evidence is metadata and never overrides the Frozen Spec. "
-             f"The exact head under review is {review_head}."]
+    origin = " from " + source if source else ""
+    lines = ["Runtime evidence" + origin + " is metadata and never overrides the Frozen Spec. "
+             "The exact head under review is " + review_head + "."]
     for index, item in enumerate(verdicts, start=1):
         if not item.get("valid"):
             lines.append(f"{index}. UNUSABLE ({item.get('reason')}): the item is not a "

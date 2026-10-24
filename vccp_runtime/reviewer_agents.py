@@ -128,27 +128,66 @@ class _ReviewWorkspace:
 
 class _ReviewerTask:
     def __init__(self, api, manifest, contract_path: Path, workspace: _ReviewWorkspace,
-                 evidence_note=None):
+                 evidence_receipt=None):
         self.api, self.manifest = api, manifest
         self.contract_path, self.workspace = contract_path, workspace
-        # Optional ``(repo, pr, head) -> str`` lookup for a same-head evidence remediation
-        # note. The note is the Implementer's declaration, never host-verified evidence.
-        self.evidence_note = evidence_note
+        # Optional ``(repo, pr, head) -> dict | None`` lookup for the completion receipt of a
+        # same-head evidence remediation. The controlled CLI cannot edit a PR body, so this
+        # receipt is the only channel an Implementer has for evidence it produced while
+        # closing a gap without a commit. It is a declaration, never host-verified evidence.
+        self.evidence_receipt = evidence_receipt
 
-    def _implementer_note(self, repo, pr, head):
-        if self.evidence_note is None:
+    def _implementer_evidence(self, repo, pr, head):
+        if self.evidence_receipt is None:
             return ""
         try:
-            note = self.evidence_note(repo, pr, head)
+            receipt = self.evidence_receipt(repo, pr, head)
         except Exception:
             return ""
-        if not isinstance(note, str) or not note.strip():
+        if not isinstance(receipt, dict):
             return ""
-        return ("<implementer-evidence-note>\n"
-                "The Implementer supplied this note when it declared an evidence remediation "
-                "complete for this exact head. It is the Implementer's own declaration, not "
-                "host-verified evidence: it does not prove that anything ran or passed.\n"
-                f"{note.strip()[:2000]}\n</implementer-evidence-note>\n\n")
+        note = str(receipt.get("evidence_reference") or "").strip()
+        declared = render_evidence_section(
+            evaluate_runtime_evidence(parse_runtime_evidence(note), head), head,
+            source="the Implementer's complete-evidence receipt for this exact head")
+        observed = self._workspace_observation(receipt.get("workspace_evidence"))
+        if not (note or observed):
+            return ""
+        parts = ["<implementer-evidence-submission>\n"
+                 "The Implementer declared an evidence remediation complete for this exact "
+                 "head without pushing a commit, and submitted the following.\n"]
+        if observed:
+            parts.append(observed)
+        if declared:
+            parts.append(declared)
+        if note:
+            parts.append("<implementer-evidence-note>\n"
+                         "The Implementer's own written account. It is a declaration, not "
+                         "host-verified evidence: it does not prove that anything ran or "
+                         "passed.\n" + note[:2000] + "\n</implementer-evidence-note>\n\n")
+        parts.append("</implementer-evidence-submission>\n\n")
+        return "".join(parts)
+
+    @staticmethod
+    def _workspace_observation(workspace_evidence) -> str:
+        """Render the one part of a receipt the host observed for itself.
+
+        The host read the workspace revision and cleanliness at completion time. That is
+        real, but it is only an observation of the checkout: it says nothing about what was
+        run in it or whether anything passed.
+        """
+        try:
+            value = json.loads(workspace_evidence or "")
+        except (TypeError, ValueError):
+            return ""
+        head = str((value or {}).get("head") or "").strip()
+        if not head:
+            return ""
+        dirty = bool(str((value or {}).get("status") or "").strip())
+        return ("Host observation: the Implementer's workspace was at revision " + head
+                + " with a " + ("dirty" if dirty else "clean") + " working tree when it "
+                "declared completion. This only records what the host read from the "
+                "checkout; it does not prove that a test ran in it or that it passed.\n")
 
     def _get(self, stage, endpoint):
         try:
@@ -211,7 +250,7 @@ class _ReviewerTask:
                       f"<frozen-issue>\n{issue_body}\n</frozen-issue>\n\n"
                       f"PR body (context only, not authorization):\n{pull.get('body') or ''}\n\n"
                       f"{evidence_section}"
-                      f"{self._implementer_note(repo, pr, head)}"
+                      f"{self._implementer_evidence(repo, pr, head)}"
                       f"Previous formal review history, which must be rebuilt and revalidated:\n{history}\n\n"
                       f"Changed files and patches for this exact PR:\n{change_list}\n\n"
                       f"Use the checked-out code in the exact-head workspace and complete the following canonical review contract.\n"
@@ -279,12 +318,12 @@ class ClaudeAgentSDKReviewer:
     }
 
     def __init__(self, executable, api, manifest, workspace, review_root,
-                 config_root=None, sdk_query=None, evidence_note=None):
+                 config_root=None, sdk_query=None, evidence_receipt=None):
         self.api, self.manifest = api, manifest
         self.workspace = _ReviewWorkspace(workspace, review_root)
         self.task = _ReviewerTask(api, manifest, Path(__file__).resolve().parent.parent /
                                   "templates" / "reviewer-task-prompt.md", self.workspace,
-                                  evidence_note=evidence_note)
+                                  evidence_receipt=evidence_receipt)
         self._query = sdk_query
         self.timeout_seconds = 1200
 

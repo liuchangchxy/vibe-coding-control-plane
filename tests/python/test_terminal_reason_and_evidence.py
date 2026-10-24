@@ -1,12 +1,15 @@
 """Terminal stop visibility, evidence-gap routing, and exact-head reviewer resume."""
 import json
+import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from vccp_runtime.adapters import generic_prompt
+from vccp_runtime import controlled_cli
 from vccp_runtime import runner
 from vccp_runtime.core import (LaunchDisposition, LaunchResult, RepairCandidate, RuntimeCore,
                                WorkflowSnapshot)
@@ -599,7 +602,8 @@ class SameHeadEvidenceCompletionTests(LifecycleCase):
         self.assertEqual((bound["phase"], bound["resulting_head_sha"]), ("PR_BOUND", HEAD))
         self.assertEqual(self.core.store.reviewer_execution(REPO, PR, HEAD)["state"],
                          "EVIDENCE_RESUME_AUTHORIZED")
-        self.assertEqual(self.core.store.evidence_note(REPO, PR, HEAD), "deploy re-run at " + HEAD)
+        self.assertEqual(self.core.store.evidence_receipt(REPO, PR, HEAD)["evidence_reference"],
+                         "deploy re-run at " + HEAD)
 
         # The same exact head is re-reviewed; no new head, no second Implementer launch.
         review_agent = FakeReviewAgent()
@@ -618,12 +622,92 @@ class SameHeadEvidenceCompletionTests(LifecycleCase):
         self.assertEqual(len(self.implementer.launches), 2)
         self.assertEqual(self.workflow.posted, [])
 
+    def test_the_controlled_cli_submits_the_evidence_the_reviewer_then_reads(self):
+        """The whole channel: the CLI is the Implementer's only way to hand over new evidence."""
+        _reviewer, repair = self._launch_evidence_repair()
+        workspace = Path(self.temp.name) / "implementer-workspace"
+        workspace.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+        subprocess.run(["git", "config", "user.email", "impl@example.invalid"], cwd=workspace, check=True)
+        subprocess.run(["git", "config", "user.name", "Implementer"], cwd=workspace, check=True)
+        (workspace / "app.txt").write_text("frozen head")
+        subprocess.run(["git", "add", "app.txt"], cwd=workspace, check=True)
+        subprocess.run(["git", "commit", "-qm", "frozen head"], cwd=workspace, check=True)
+        landed = subprocess.run(["git", "rev-parse", "HEAD"], cwd=workspace, check=True,
+                                capture_output=True, text=True,
+                                encoding="utf-8", errors="replace").stdout.strip()
+        evidence = ("Deploy re-run on the fnos host." + "\n" + "```vccp-runtime-evidence" + "\n"
+                    + json.dumps(dict(expected_revision=HEAD, tested_revision=HEAD,
+                                      target="fnos host A"))
+                    + "\n" + "```" + "\n" + "Startup smoke passed on the deployed build.")
+        context_path = Path(self.temp.name) / "context.json"
+        context_path.write_text(json.dumps(dict(
+            repo=REPO, workspace=str(workspace), database_path=str(self.db),
+            attempt_id=repair["attempt_id"], provider=PROVIDER,
+            github_app=dict(app_id="123",
+                            credential_source=dict(type="posix_file",
+                                                   path=str(workspace / "cred"))))),
+            encoding="utf-8")
+
+        with mock.patch.object(controlled_cli, "_provider", return_value=object()):
+            exit_code = controlled_cli.run(["--context", str(context_path),
+                                            "complete-evidence", "--note", evidence])
+
+        self.assertEqual(exit_code, 0)
+        with mock.patch.object(controlled_cli, "_provider", return_value=object()):
+            refused = controlled_cli.run(["--context", str(context_path),
+                                          "complete-evidence",
+                                          "--note", "ran it"])
+        self.assertEqual(refused, 2)
+        # No commit was created: the exact head under review is untouched.
+        self.assertEqual(self.workflow.observe(REPO, ISSUE).pr_head_sha, HEAD)
+        receipt = self.core.store.evidence_receipt(REPO, PR, HEAD)
+        self.assertEqual(receipt["evidence_reference"], evidence)
+
+        self.core.reconcile_once(REPO, "owner", 120)
+        task = _ReviewerTask(
+            SimpleNamespace(get=lambda path: (
+                dict(body="Frozen spec.") if path.endswith("/issues/" + str(ISSUE)) else
+                dict(number=PR, title="Change", state="open", draft=False,
+                     head=dict(sha=HEAD), base=dict(ref="main"),
+                     user=dict(login="builder[bot]"), body="")
+                if path.endswith("/pulls/" + str(PR)) else
+                [dict(filename="a.py", status="modified", additions=1, deletions=0, patch="+x")]
+                if "/pulls/" + str(PR) + "/files?" in path else [])),
+            MANIFEST, Path(self.temp.name) / "contract.md",
+            SimpleNamespace(prepare=lambda repo, pr, head: Path(self.temp.name)),
+            evidence_receipt=self.core.store.evidence_receipt)
+        (Path(self.temp.name) / "contract.md").write_text("Review the exact head.",
+                                                          encoding="utf-8")
+
+        _, prompt = task.build(REPO, ISSUE, PR, HEAD)
+
+        self.assertIn("<implementer-evidence-submission>", prompt)
+        self.assertIn("revision_match=yes", prompt)
+        self.assertIn("expected_revision=" + HEAD, prompt)
+        self.assertIn("fnos host A", prompt)
+        self.assertIn("Startup smoke passed on the deployed build.", prompt)
+        # The host observed the real checkout; the declaration named the review head.
+        self.assertIn("workspace was at revision " + landed, prompt)
+        self.assertNotIn("expected_revision=" + landed, prompt)
+
+    def test_a_completion_is_refused_when_the_receipt_has_no_provenance(self):
+        _reviewer, repair = self._launch_evidence_repair()
+
+        self.assertFalse(self.core.store.record_evidence_completion(
+            repair["attempt_id"], "other_provider",
+            repair["execution_id"], json.dumps(dict(head=HEAD, status="")),
+            evidence_reference="deploy re-run"))
+        self.assertIsNone(self.core.store.evidence_receipt(REPO, PR, HEAD))
+        self.assertEqual(self.core.store.attempt(repair["attempt_id"])["phase"],
+                         "LAUNCH_CONFIRMED")
     def test_the_completion_receipt_is_idempotent_and_keeps_the_latest_note(self):
         _reviewer, repair = self._launch_evidence_repair()
         self._complete(repair, note="first note")
         self._complete(repair, note="second note")
 
-        self.assertEqual(self.core.store.evidence_note(REPO, PR, HEAD), "second note")
+        self.assertEqual(self.core.store.evidence_receipt(REPO, PR, HEAD)["evidence_reference"],
+                         "second note")
         self.assertEqual(len(self.core.store.evidence_receipts(REPO)), 1)
 
     def test_a_gap_that_survives_its_own_remediation_stops_for_a_human(self):
@@ -727,7 +811,7 @@ class RuntimeEvidenceTests(unittest.TestCase):
         self.assertIn("expected_revision_is_not_the_exact_head", prompt)
         self.assertIn("revision_match=no", prompt)
 
-    def test_implementer_evidence_note_is_labeled_as_a_declaration(self):
+    def _task(self, root, receipt):
         api = SimpleNamespace(get=lambda path: (
             {"body": "Frozen spec."} if path.endswith(f"/issues/{ISSUE}") else
             {"number": PR, "title": "Change", "state": "open", "draft": False,
@@ -736,40 +820,60 @@ class RuntimeEvidenceTests(unittest.TestCase):
             if path.endswith(f"/pulls/{PR}") else
             [{"filename": "a.py", "status": "modified", "additions": 1, "deletions": 0,
               "patch": "+x"}] if f"/pulls/{PR}/files?" in path else []))
+        contract = Path(root) / "contract.md"
+        contract.write_text("Review the exact head.", encoding="utf-8")
+        return _ReviewerTask(api, MANIFEST, contract,
+                             SimpleNamespace(prepare=lambda repo, pr, head: Path(root)),
+                             evidence_receipt=receipt)
+
+    def test_a_completion_receipt_reaches_the_reviewer_as_its_new_evidence(self):
+        # The controlled writer cannot edit a PR body, so a same-head completion must carry
+        # its own evidence through its receipt or the Reviewer re-reads the stale body.
+        note = ("Deploy re-run on the fnos host." + "\n" + "```vccp-runtime-evidence" + "\n"
+                + json.dumps(dict(expected_revision=HEAD, tested_revision=HEAD,
+                                    target="fnos host A"))
+                + "\n" + "```" + "\n" + "Every acceptance check passed.")
+        receipt = dict(evidence_reference=note,
+                       workspace_evidence=json.dumps(dict(head=HEAD, status="")))
         with tempfile.TemporaryDirectory() as root:
-            contract = Path(root) / "contract.md"
-            contract.write_text("Review the exact head.", encoding="utf-8")
-            task = _ReviewerTask(api, MANIFEST, contract,
-                                 SimpleNamespace(prepare=lambda repo, pr, head: Path(root)),
-                                 evidence_note=lambda repo, pr, head: "Ran the deploy at " + head)
+            _, prompt = self._task(root, lambda repo, pr, head: receipt).build(
+                REPO, ISSUE, PR, HEAD)
 
-            _, prompt = task.build(REPO, ISSUE, PR, HEAD)
-
+        self.assertIn("<implementer-evidence-submission>", prompt)
+        self.assertIn("revision_match=yes", prompt)
+        self.assertIn("complete-evidence receipt for this exact head", prompt)
+        self.assertIn("workspace was at revision " + HEAD, prompt)
         self.assertIn("<implementer-evidence-note>", prompt)
-        self.assertIn("Ran the deploy at " + HEAD, prompt)
         self.assertIn("does not prove that anything ran or passed", prompt)
+        self.assertIn("does not prove that a test ran in it or that it passed", prompt)
 
-    def test_a_failing_evidence_note_lookup_never_blocks_the_review(self):
+    def test_a_receipt_without_a_declared_block_is_not_rendered_as_matching_evidence(self):
+        # A receipt carries the Implementer's words whatever they are, but only a fenced
+        # block is a declaration the Reviewer may read as revision_match. Free prose is
+        # passed through as prose, never promoted into a matching evidence verdict.
+        note = "I ran the tests and they passed."
+        receipt = dict(evidence_reference=note,
+                       workspace_evidence=json.dumps(dict(head=HEAD, status=" M a.py")))
+        with tempfile.TemporaryDirectory() as root:
+            _, prompt = self._task(root, lambda repo, pr, head: receipt).build(
+                REPO, ISSUE, PR, HEAD)
+
+        self.assertIn("<implementer-evidence-submission>", prompt)
+        self.assertIn("<implementer-evidence-note>", prompt)
+        self.assertIn(note, prompt)
+        self.assertNotIn("<runtime-evidence>", prompt)
+        self.assertNotIn("revision_match", prompt)
+        self.assertIn("workspace was at revision " + HEAD, prompt)
+        self.assertIn("with a dirty working tree", prompt)
+
+
+    def test_a_failing_evidence_receipt_lookup_never_blocks_the_review(self):
         def boom(repo, pr, head):
             raise RuntimeError("store unavailable")
-        api = SimpleNamespace(get=lambda path: (
-            {"body": "Frozen spec."} if path.endswith(f"/issues/{ISSUE}") else
-            {"number": PR, "title": "Change", "state": "open", "draft": False,
-             "head": {"sha": HEAD}, "base": {"ref": "main"},
-             "user": {"login": "builder[bot]"}, "body": "No block."}
-            if path.endswith(f"/pulls/{PR}") else
-            [{"filename": "a.py", "status": "modified", "additions": 1, "deletions": 0,
-              "patch": "+x"}] if f"/pulls/{PR}/files?" in path else []))
         with tempfile.TemporaryDirectory() as root:
-            contract = Path(root) / "contract.md"
-            contract.write_text("Review the exact head.", encoding="utf-8")
-            task = _ReviewerTask(api, MANIFEST, contract,
-                                 SimpleNamespace(prepare=lambda repo, pr, head: Path(root)),
-                                 evidence_note=boom)
+            _, prompt = self._task(root, boom).build(REPO, ISSUE, PR, HEAD)
 
-            _, prompt = task.build(REPO, ISSUE, PR, HEAD)
-
-        self.assertNotIn("<implementer-evidence-note>", prompt)
+        self.assertNotIn("<implementer-evidence-submission>", prompt)
         self.assertIn("Review the exact head.", prompt)
 
 

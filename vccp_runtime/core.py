@@ -747,24 +747,27 @@ class _Store:
             ).fetchall()
             return [dict(row) for row in rows]
 
-    def evidence_note(self, repo: str, pr_number: int, head_sha: str):
-        """Return the Implementer's own note for the latest completed evidence remediation.
+    def evidence_receipt(self, repo: str, pr_number: int, head_sha: str):
+        """The latest completed evidence-remediation receipt for one exact head.
 
-        This is a declaration, never verified evidence: it is passed to the Reviewer labeled
-        as such so a same-head re-review has something to judge instead of the unchanged PR
-        body the gap was reported against.
+        The controlled CLI cannot edit a PR body, so this receipt is the only durable
+        channel an Implementer has for evidence it produces while closing a gap without a
+        commit. It stays a declaration: the receipt records who declared what, never that
+        the declared run happened.
         """
         normalized_head = head_sha.casefold() if isinstance(head_sha, str) else ""
         with closing(self._connect()) as connection:
             row = connection.execute(
-                "SELECT receipt.evidence_reference FROM completion_receipts receipt "
+                "SELECT receipt.evidence_reference, receipt.workspace_evidence, "
+                "receipt.created_at, attempt.repair_ordinal "
+                "FROM completion_receipts receipt "
                 "JOIN attempts attempt ON attempt.attempt_id=receipt.attempt_id "
                 "WHERE receipt.repo=? AND attempt.pr_number=? AND attempt.expected_head_sha=? "
-                "AND receipt.source='evidence_remediation' AND receipt.evidence_reference IS NOT NULL "
+                "AND receipt.source='evidence_remediation' "
                 "ORDER BY receipt.created_at DESC, attempt.repair_ordinal DESC LIMIT 1",
                 (_repo_key(repo), pr_number, normalized_head),
             ).fetchone()
-            return row["evidence_reference"] if row else None
+            return dict(row) if row else None
 
     def begin_controlled_push(self, attempt_id: str, repo: str, provider: str,
                               destination_ref: str, expected_sha: str, now: float | None = None):

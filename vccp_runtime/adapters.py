@@ -660,20 +660,34 @@ def generic_prompt(request: LaunchRequest, workspace: str, policy: dict,
                 f"for the existing PR at exact head {request.expected_head_sha}; do not widen product scope, "
                 "change the acceptance criteria, or treat this as a CHANGES_REQUESTED review."
                 + (f" Reviewer note:\n<reviewer-evidence-note>\n{feedback}\n</reviewer-evidence-note>" if feedback else "")
-                + " When a runtime test or deployment is the evidence, record one fenced block per "
-                  "environment in the PR body:\n```vccp-runtime-evidence\n"
-                  '{"expected_revision": "<full 40-hex sha of the head under review>", '
-                  '"tested_revision": "<full sha of the revision actually exercised>", '
-                  '"target": "<where it ran>", "image_digest": "<optional>"}\n```\n'
-                  "tested_revision must be the revision actually exercised. Evidence from a different "
-                  "revision cannot satisfy a criterion that requires the current one. If the missing "
-                  "evidence needs a human credential or a human choice of environment, say so instead of "
-                  "fabricating it. "
-                + (f" This repair may finish without a new commit. When the evidence is complete and no "
-                   f"code change is needed, run `{request.evidence_command} --note \"<what you ran, "
-                   f"where, and the exact revisions>\"` once; the Runtime then re-runs the Reviewer at the "
-                   f"unchanged head. Do not create an empty commit and do not describe completion in prose."
-                   if request.evidence_command else ""))
+                + (f" This repair may finish without a new commit, and the controlled writer cannot "
+                   f"edit an existing PR body, so do not try to record the evidence there. When the "
+                   f"evidence is complete, submit it by running `{request.evidence_command} --note "
+                   "\"<your evidence submission>\"` once. That note is the only channel the Reviewer "
+                   f"reads at this unchanged head, so it must carry the whole declaration. For every "
+                   f"environment you tested, include one fenced block of exactly this shape:\n"
+                   "```vccp-runtime-evidence\n"
+                   '{"expected_revision": "<full 40-hex sha of the head under review>", '
+                   '"tested_revision": "<full sha of the revision actually exercised>", '
+                   '"target": "<where it ran>", "image_digest": "<optional>"}\n```\n'
+                   "Then one short paragraph stating what you actually ran, the observed result, and "
+                   "the exact revisions involved. tested_revision must be the revision actually "
+                   "exercised; evidence from a different revision cannot satisfy a criterion that "
+                   "requires the current one. Never claim a run you did not perform: the Reviewer "
+                   "weighs this as a claim, and a fabricated result is worse than a missing one. If "
+                   "the missing evidence needs a human credential or a human choice of environment, "
+                   "say so instead of inventing a result. Do not create an empty commit and do not "
+                   "describe completion only in prose."
+                   if request.evidence_command else
+                   " When a runtime test or deployment is the evidence, record one fenced block per "
+                   "environment in the PR body:\n```vccp-runtime-evidence\n"
+                   '{"expected_revision": "<full 40-hex sha of the head under review>", '
+                   '"tested_revision": "<full sha of the revision actually exercised>", '
+                   '"target": "<where it ran>", "image_digest": "<optional>"}\n```\n'
+                   "tested_revision must be the revision actually exercised. Evidence from a "
+                   "different revision cannot satisfy a criterion that requires the current one. If "
+                   "the missing evidence needs a human credential or a human choice of environment, "
+                   "say so instead of fabricating it. "))
         else:
             feedback = (request.review_feedback or "").strip()
             cause_guidance = (
@@ -1437,7 +1451,7 @@ def build_runtime(manifest: dict, local_config: dict, api=None, writer=None,
             settings.get("project_config_root"),
         ) if settings.get("type") == ANTIGRAVITY_PROVIDER else reviewer_factory(
             None, api, manifest, workspace, review_root,
-            evidence_note=core.store.evidence_note,
+            evidence_receipt=core.store.evidence_receipt,
         )
         user_provider = GitHubUserReviewerProvider(target_repo, identity)
         reviewer_writer = LocalReviewerWriter(user_provider, workflow, target_repo, identity, manifest)
