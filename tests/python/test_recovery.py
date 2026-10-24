@@ -65,6 +65,27 @@ class RecoveryImplementer:
         return self.activity
 
 
+class UnpersistedAttemptStore:
+    """Durably lose the claim's own attempt row, the way issue #29's ledger did.
+
+    ``create_initial_attempt`` still reports success, so the claim path believes it holds
+    an attempt whose row nothing can read back. Every other store operation is the real one.
+    """
+
+    def __init__(self, real, database_path):
+        self._real, self._db = real, str(database_path)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def create_initial_attempt(self, repo, issue, owner, ttl, recovery_timeout):
+        created = self._real.create_initial_attempt(repo, issue, owner, ttl, recovery_timeout)
+        with closing(sqlite3.connect(self._db)) as connection:
+            connection.execute("DELETE FROM attempts WHERE repo=? AND issue_number=?", (repo, issue))
+            connection.commit()
+        return created
+
+
 class RecoveryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -639,6 +660,55 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(result["items"], [])
         self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "agent-ready")
         self.assertFalse(self.implementer.requests)
+
+    # --- the claim may only move the Issue once its own attempt is readable -----------
+    def test_normal_claim_persists_a_rereadable_attempt_before_agent_working(self):
+        observed_states = []
+        original = self.workflow.transition_coordination_state
+
+        def record_state(repo, issue_number, expected_state, new_state, expected_revision):
+            # The transition is the moment GitHub learns the Issue is claimed, so the
+            # attempt must already be durable and readable from a separate connection.
+            observed_states.append(
+                [row["phase"] for row in RuntimeCore(
+                    self.db, MANIFEST, self.workflow, self.implementer
+                ).store.attempts_for_repo("acme/alpha")])
+            return original(repo, issue_number, expected_state, new_state, expected_revision)
+
+        self.workflow.transition_coordination_state = record_state
+        result = self.start()
+
+        self.assertEqual(result["status"], "launched")
+        self.assertEqual(observed_states, [["CLAIM_INTENT"]])
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "agent-working")
+
+    def test_claim_whose_attempt_is_not_persisted_never_reaches_agent_working(self):
+        self.core.store = UnpersistedAttemptStore(self.core.store, self.db)
+
+        result = self.core.dispatch_initial("acme/alpha", 7, "owner")
+
+        self.assertEqual(result["status"], "claim_failed")
+        self.assertEqual(self.workflow.transitions, [])
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "agent-ready")
+        self.assertEqual(self.implementer.requests, [])
+
+    def test_unpersisted_claim_leaves_a_retryable_issue_and_no_orphan(self):
+        self.core.store = UnpersistedAttemptStore(self.core.store, self.db)
+        self.core.dispatch_initial("acme/alpha", 7, "owner")
+        self.core.store = self.core.store._real
+
+        # The Issue never left agent-ready, so there is no active flow for the next pass
+        # to mistake for an orphan: recovery reports nothing and terminalizes nothing.
+        reconciliation = self.core.reconcile_once("acme/alpha", "owner")
+        self.assertEqual(reconciliation["items"], [])
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "agent-ready")
+
+        # The claim was given back, so the same owner can claim the Issue on a later pass.
+        retry = self.core.dispatch_initial("acme/alpha", 7, "owner")
+        self.assertEqual(retry["status"], "launched")
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "agent-working")
+        self.assertEqual(len(self.implementer.requests), 1)
+        self.assertEqual(self.core.store.attempt(retry["attempt_id"])["phase"], "LAUNCH_CONFIRMED")
 
     def test_two_consumers_in_shared_db_remain_isolated_during_reconcile(self):
         self.start()

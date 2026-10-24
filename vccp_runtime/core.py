@@ -640,11 +640,62 @@ class _Store:
             connection.close()
 
     def bind_noop_authorization(self, attempt_id: str, authorized: bool, digest: str | None, baseline: str):
+        """Bind launch authorization to the claim's own attempt; report whether it landed.
+
+        The return value, not the stored value, is what proves the row was really there:
+        ``no_change_authorized`` defaults to 0, so re-reading it cannot distinguish a
+        successful bind from an attempt that was never persisted at all.
+        """
         with closing(self._connect()) as connection:
-            connection.execute("UPDATE attempts SET no_change_authorized=?,frozen_spec_digest=?,workspace_baseline=? WHERE attempt_id=? "
-                               "AND phase='CLAIM_INTENT'",
-                               (int(authorized), digest if authorized else None, baseline, attempt_id))
+            cursor = connection.execute(
+                "UPDATE attempts SET no_change_authorized=?,frozen_spec_digest=?,workspace_baseline=? WHERE attempt_id=? "
+                "AND phase='CLAIM_INTENT'",
+                (int(authorized), digest if authorized else None, baseline, attempt_id))
+            bound = cursor.rowcount == 1
             connection.commit()
+            return bound
+
+    def confirmed_initial_attempt(self, attempt_id: str, repo: str, issue: int):
+        """Re-read a just-created initial attempt through a fresh connection.
+
+        Returns the durable row only when the exact attempt this claim created is
+        readable again, still owns the claim phase, and belongs to this repository and
+        Issue. ``None`` means the claim was never persisted, so it must not be allowed
+        to consume the Issue's coordination label.
+        """
+        row = self.attempt(attempt_id)
+        if (row is None or row["repo"] != repo or row["issue_number"] != issue
+                or row["kind"] != "initial_dispatch" or row["phase"] != "CLAIM_INTENT"):
+            return None
+        return row
+
+    def abandon_unconfirmed_initial(self, attempt_id: str, repo: str, issue: int, token: str,
+                                    now: float | None = None):
+        """Give back a claim whose initial attempt could not be confirmed as persisted.
+
+        The Issue has not moved to agent-working, so nothing on GitHub changes: the
+        half-written attempt is failed, and the claim's lease is released either way so
+        the same owner can claim the Issue again on the next pass.
+        """
+        delivered = time.time() if now is None else float(now)
+        connection = self.transaction()
+        try:
+            row = connection.execute("SELECT 1 FROM attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
+            if row is not None:
+                connection.execute(
+                    "UPDATE attempts SET phase='CLAIM_FAILED',launch_outcome='attempt_not_persisted',"
+                    "updated_at=?,phase_entered_at=?,deadline_at=NULL WHERE attempt_id=?",
+                    (delivered, delivered, attempt_id),
+                )
+            connection.execute("DELETE FROM leases WHERE repo=? AND issue_number=? AND token=?",
+                               (repo, issue, token))
+            connection.commit()
+            return row is not None
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def record_completion(self, attempt_id: str, provider: str, execution_id: str,
                           workspace_evidence: str, source: str = "implementer",
@@ -2218,12 +2269,19 @@ class RuntimeCore:
                                                             self.recovery_timeout_seconds)
         if created is None:
             return {"status": reason}
-        attempt_id, _token = created
+        attempt_id, token = created
+        # The claim owns this Issue from here on, but GitHub must not learn that until the
+        # attempt that authorizes the work is provably on disk. agent-working with no
+        # readable attempt is exactly the state the next reconcile pass can only report as
+        # an orphan, so an unconfirmed claim is given back while the Issue is still
+        # agent-ready, which is the one state the runtime can claim again from.
+        if self.store.confirmed_initial_attempt(attempt_id, repo_key, issue_number) is None:
+            self.store.abandon_unconfirmed_initial(attempt_id, repo_key, issue_number, token)
+            return {"status": "claim_failed", "outcome": "attempt_not_persisted",
+                    "attempt_id": attempt_id}
         baseline = self._workspace_baseline(self.workspace_path)
-        self.store.bind_noop_authorization(attempt_id, observed.allow_no_change,
-                                           observed.frozen_spec_digest, baseline)
-        bound_attempt = self.store.attempt(attempt_id)
-        if not bound_attempt or bound_attempt["no_change_authorized"] != int(observed.allow_no_change):
+        if not self.store.bind_noop_authorization(attempt_id, observed.allow_no_change,
+                                                  observed.frozen_spec_digest, baseline):
             self.store.mark_phase(attempt_id, "CLAIM_FAILED", outcome="authorization_binding_failed")
             return {"status": "claim_failed", "attempt_id": attempt_id}
 
