@@ -764,7 +764,8 @@ class _Store:
                 "JOIN attempts attempt ON attempt.attempt_id=receipt.attempt_id "
                 "WHERE receipt.repo=? AND attempt.pr_number=? AND attempt.expected_head_sha=? "
                 "AND receipt.source='evidence_remediation' "
-                "ORDER BY receipt.created_at DESC, attempt.repair_ordinal DESC LIMIT 1",
+                "ORDER BY receipt.created_at DESC, attempt.repair_ordinal DESC, "
+                "receipt.rowid DESC LIMIT 1",
                 (_repo_key(repo), pr_number, normalized_head),
             ).fetchone()
             return dict(row) if row else None
