@@ -1,6 +1,7 @@
 """One-shot exact-head CI, formal Review, and native merge observation."""
 from __future__ import annotations
 
+import hashlib
 import time
 import re
 
@@ -59,7 +60,57 @@ class LifecycleDriver:
             self.core.store.local_terminal(row["attempt_id"], "TERMINAL_UNRESOLVED", now)
         self.core.store.set_lifecycle(repo, issue, label.upper().replace("-", "_"),
                                       snapshot.pr_head_sha or "", now, 1, outcome)
+        if transitioned or self.core._terminal_label_observed(repo, issue, label):
+            self._summarize_terminal_stop(repo, issue, snapshot, label, now, outcome)
         return {"issue": issue, "status": label, "transitioned": transitioned, "outcome": outcome}
+
+    def _summarize_terminal_stop(self, repo, issue, snapshot, label, now, outcome):
+        """Leave one short GitHub comment explaining a newly reached terminal stop.
+
+        Only the pass that actually moved the Issue into ``label`` writes, so the comment
+        describes a state GitHub already shows. Deduplication and the retry-once rule live
+        in the durable notice ledger inside ``RuntimeCore.publish_terminal_stop``.
+        """
+        reason, _, summary = str(outcome or "").partition(": ")
+        self.core.publish_terminal_stop(repo, issue, label, reason.strip(), summary.strip(),
+                                        snapshot.pr_number, snapshot.pr_head_sha, now)
+
+    def _evidence_gap_route(self, repo, issue, snapshot, head, summary, remediation,
+                            owner_id, now):
+        """Send an agent-fixable evidence gap back to the same PR, else stop for a human.
+
+        The Implementer already owns the PR and branch, so this reuses the ordinary repair
+        admission (same PR, same head, existing budget) instead of inventing a second
+        dispatch path. A gap is not a code defect, so no ``CHANGES_REQUESTED`` is written.
+        """
+        if remediation == "agent" and snapshot.pr_branch:
+            flow = self.core.store.flow(repo, issue)
+            if (flow and flow.get("trusted") and flow.get("repair_budget_known")
+                    and flow.get("pr_number") in (None, snapshot.pr_number)
+                    and snapshot.coordination_state == "agent-working"):
+                digest = hashlib.sha256(f"{head}\n{summary}".encode("utf-8")).hexdigest()[:16]
+                candidate = RepairCandidate(
+                    repo, issue, snapshot.pr_number, head, snapshot.pr_branch,
+                    "evidence_remediation", f"reviewer-evidence:{digest}", owner_id, summary or None)
+                dispatch = self.core.dispatch_repair(candidate)
+                # The same exact gap was already routed once and its remediation already
+                # finished, yet the Reviewer still cannot decide. Re-dispatching would loop
+                # forever, so the stop becomes visible instead.
+                duplicate = (self.core.store.receipt(dispatch["attempt_id"])
+                             if dispatch.get("status") == "duplicate" and dispatch.get("attempt_id")
+                             else None)
+                if duplicate is not None and duplicate.get("source") == "evidence_remediation":
+                    return self._terminal(repo, issue, snapshot, "needs-human", now,
+                                          "evidence_remediation_did_not_close_gap"
+                                          + (f": {summary}" if summary else ""))
+                # Any admitted attempt counts as routed, including a duplicate replay and
+                # a launch whose outcome the next reconcile pass must resolve.
+                if (dispatch.get("needs_human") or dispatch.get("attempt_id")
+                        or dispatch.get("status") == "lease_held"):
+                    return {"trigger": "evidence_remediation", **dispatch}
+        return self._terminal(repo, issue, snapshot, "needs-human", now,
+                              "reviewer_insufficient_evidence"
+                              + (f": {summary}" if summary else ""))
 
     def _set_waiting(self, repo, issue, phase, head, now):
         duration = self.timeouts[_PHASES[phase][0]]
@@ -406,12 +457,14 @@ class LifecycleDriver:
                 result["reviewer"] = self.local_reviewer.advance(
                     repo_key, issue, snapshot.pr_number, head)
                 if result["reviewer"].get("status") == "reviewer_insufficient_evidence":
-                    # The Reviewer could not decide an acceptance criterion. Only a human
-                    # can supply the missing evidence; no repair is authorized by this.
-                    summary = " ".join(str(result["reviewer"].get("summary") or "").split())[:500]
-                    results.append(self._terminal(
-                        repo_key, issue, snapshot, "needs-human", current,
-                        "reviewer_insufficient_evidence" + (f": {summary}" if summary else "")))
+                    # The Reviewer could not decide an acceptance criterion. Who can close
+                    # the gap decides the route: the same PR Implementer stays inside the
+                    # Frozen Spec, while anything only a person can supply stops for a human.
+                    summary = " ".join(str(result["reviewer"].get("summary") or "").split())[:2000]
+                    route = self._evidence_gap_route(repo_key, issue, snapshot, head, summary,
+                                                     result["reviewer"].get("remediation"), owner_id,
+                                                     current)
+                    results.append({"issue": issue, **route})
                     continue
                 if self._reviewer_approved_exact_head(result["reviewer"], head):
                     # The Reviewer submitted APPROVE into this very pass, so GitHub can

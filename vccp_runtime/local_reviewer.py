@@ -295,6 +295,73 @@ class LocalReviewerDriver:
                     "head_sha": normalized_head}
         return self.advance(repo, issue, pr, normalized_head)
 
+    def resume_after_evidence(self, repo: str, issue: int, pr: int, head: str,
+                              authorization_head: str):
+        """Re-run the Reviewer for the same PR and exact head after a human supplies evidence.
+
+        This is not a repair continuation: the Implementer is never launched, no new PR is
+        created, and the Reviewer execution is reused rather than replaced. Consent is
+        durable, so a crash after the label is restored still resumes exactly once.
+        """
+        normalized_head = head.casefold() if isinstance(head, str) else ""
+        if (not normalized_head or not isinstance(authorization_head, str)
+                or authorization_head.casefold() != normalized_head):
+            return {"status": "reviewer_resume_rejected", "reason": "authorization_or_head_mismatch",
+                    "head_sha": normalized_head or head}
+        record = self.store.reviewer_execution(repo, pr, normalized_head)
+        if (not record or record.get("state") != "COMPLETED"
+                or record.get("provider") != self.provider_key):
+            return {"status": "reviewer_resume_rejected", "reason": "execution_not_reviewable",
+                    "head_sha": normalized_head}
+        try:
+            base = self.writer.workflow.observe(repo, issue)
+            self.writer._pull_request(repo, pr, normalized_head)
+        except Exception as error:
+            return {"status": "reviewer_resume_rejected", "reason": "github_preconditions_unavailable",
+                    "head_sha": normalized_head, "exception_type": type(error).__name__}
+        if (not base.issue_open or not base.pr_open or not base.frozen_spec
+                or base.canceled or base.pr_number != pr or base.pr_linked_issue != issue
+                or (base.pr_head_sha or "").casefold() != normalized_head):
+            return {"status": "reviewer_resume_rejected", "reason": "preconditions_changed",
+                    "head_sha": normalized_head}
+        try:
+            identity = self.writer.provider.verify_identity()
+        except Exception as error:
+            return {"status": "reviewer_resume_rejected", "reason": "operator_identity_unverified",
+                    "head_sha": normalized_head, "exception_type": type(error).__name__}
+        operator = str((identity or {}).get("login") or "").strip()
+        if not operator:
+            return {"status": "reviewer_resume_rejected", "reason": "operator_identity_unverified",
+                    "head_sha": normalized_head}
+        authorized, reason = self.store.authorize_evidence_resume(
+            repo, issue, pr, normalized_head, operator)
+        if not authorized:
+            return {"status": "reviewer_resume_rejected", "reason": reason,
+                    "head_sha": normalized_head}
+        try:
+            restored = self.writer.workflow.restore_repair_coordination_state(
+                repo, issue, "agent-working", base.revision)
+        except Exception:
+            restored = False
+        if not restored:
+            return {"status": "reviewer_resume_rejected", "reason": "coordination_restore_failed",
+                    "head_sha": normalized_head}
+        try:
+            self.writer._snapshot(repo, issue, pr, normalized_head)
+            self.writer._pull_request(repo, pr, normalized_head)
+        except Exception as error:
+            try:
+                # Put the fence back on the restored revision so the stop stays visible
+                # and the durable authorization can be retried later.
+                fresh = self.writer.workflow.observe(repo, issue)
+                self.writer.workflow.transition_coordination_state(
+                    repo, issue, "agent-working", "needs-human", fresh.revision)
+            except Exception:
+                pass
+            return {"status": "reviewer_resume_rejected", "reason": "exact_head_preconditions_changed",
+                    "head_sha": normalized_head, "exception_type": type(error).__name__}
+        return self.advance(repo, issue, pr, normalized_head)
+
     @staticmethod
     def _retry_evidence_matches(evidence: dict, failed_execution_id: str | None) -> bool:
         if not isinstance(evidence, dict):
@@ -468,6 +535,11 @@ class LocalReviewerDriver:
                     failed_execution_id=record.get("execution_id"))
                 if not claimed:
                     return {"status": "reviewer_retry_claim_lost", "head_sha": head}
+            elif record["state"] == "EVIDENCE_RESUME_AUTHORIZED":
+                record, claimed = self.store.claim_authorized_evidence_resume(
+                    repo, pr, head, self.provider_key)
+                if not claimed:
+                    return {"status": "reviewer_evidence_resume_claim_lost", "head_sha": head}
             else:
                 return self._continue_existing(repo, issue, pr, head, record)
         if claimed:
@@ -605,11 +677,18 @@ class LocalReviewerDriver:
             # The Reviewer could not decide an acceptance criterion from available evidence.
             # That is neither approval nor a rejection the Implementer could repair. The
             # result is stored in replayable form so a restart reports the same conclusion.
-            replay = json.dumps({"event": "BLOCKED", "body": body if isinstance(body, str) else ""},
+            # `remediation` says who can close the gap; a missing class is preserved as such
+            # so the caller can refuse to guess in the human direction.
+            remediation = result.get("remediation")
+            if remediation not in {"agent", "human"}:
+                remediation = None
+            replay = json.dumps({"event": "BLOCKED", "body": body if isinstance(body, str) else "",
+                                 **({"remediation": remediation} if remediation else {})},
                                 ensure_ascii=False, separators=(",", ":"))
             self.store.update_reviewer_execution(repo, pr, head, "COMPLETED", outcome=replay)
             return {"status": "reviewer_insufficient_evidence", "head_sha": head,
-                    "summary": body if isinstance(body, str) else ""}
+                    "summary": body if isinstance(body, str) else "",
+                    "remediation": remediation}
         if event not in {"APPROVE", "REQUEST_CHANGES"} or not isinstance(body, str) or not body.strip():
             self.store.update_reviewer_execution(repo, pr, head, "FAILED",
                                                  outcome="invalid_reviewer_decision")

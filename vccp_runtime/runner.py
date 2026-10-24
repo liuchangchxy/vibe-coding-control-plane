@@ -195,6 +195,9 @@ def main(argv=None):
     mode.add_argument("--continuous", action="store_true")
     mode.add_argument("--retry-reviewer", action="store_true",
                       help="one manually authorized retry of a failed exact-head Claude Reviewer")
+    mode.add_argument("--resume-review-after-evidence", action="store_true",
+                      help="re-run the Reviewer at the same exact head after a human supplies "
+                           "the evidence a reviewer_insufficient_evidence stop was missing")
     mode.add_argument("--authorize-repair-continuation", action="store_true",
                       help="authorize one exact-head repair after BUDGET_EXHAUSTED")
     parser.add_argument("--issue", type=int, help="Frozen Issue number for the selected recovery action")
@@ -202,12 +205,27 @@ def main(argv=None):
     parser.add_argument("--head-sha", help="exact full PR head SHA for the selected recovery action")
     parser.add_argument("--authorize-reviewer-retry-for", metavar="SHA",
                         help="explicitly authorize retry for this exact full SHA")
+    parser.add_argument("--authorize-evidence-resume-for", metavar="SHA",
+                        help="explicitly authorize re-review after a missing-evidence stop "
+                             "for this exact full SHA")
     parser.add_argument("--authorized-by", help="human maintainer identity recorded in the repair ledger")
     parser.add_argument("--legacy-maintenance-override",
                         help="JSON string or file path for a maintainer's exact-flow legacy override")
     parser.add_argument("--poll-interval", type=float, default=30.0)
     args = parser.parse_args(argv)
     retry_values = (args.issue, args.pr, args.head_sha, args.authorize_reviewer_retry_for)
+    if args.resume_review_after_evidence:
+        if (args.issue is None or args.pr is None or args.head_sha is None
+                or args.authorize_evidence_resume_for is None):
+            parser.error("--resume-review-after-evidence requires --issue, --pr, --head-sha, and "
+                         "--authorize-evidence-resume-for")
+        if (not re.fullmatch(r"[0-9a-fA-F]{40}", args.head_sha)
+                or args.authorize_evidence_resume_for.casefold() != args.head_sha.casefold()):
+            parser.error("evidence resume authorization must repeat the exact full --head-sha")
+        if args.issue < 1 or args.pr < 1:
+            parser.error("--issue and --pr must be positive integers")
+    elif args.authorize_evidence_resume_for is not None:
+        parser.error("--authorize-evidence-resume-for requires --resume-review-after-evidence")
     if args.retry_reviewer:
         if any(value is None for value in retry_values):
             parser.error("--retry-reviewer requires --issue, --pr, --head-sha, and "
@@ -217,7 +235,9 @@ def main(argv=None):
             parser.error("reviewer retry authorization must repeat the exact full --head-sha")
         if args.issue < 1 or args.pr < 1:
             parser.error("--issue and --pr must be positive integers")
-    elif any(value is not None for value in retry_values) and not args.authorize_repair_continuation:
+    elif (any(value is not None for value in retry_values)
+          and not args.authorize_repair_continuation
+          and not args.resume_review_after_evidence):
         parser.error("reviewer retry arguments require --retry-reviewer")
     if args.authorize_repair_continuation:
         if (args.issue is None or args.pr is None or args.head_sha is None
@@ -297,6 +317,19 @@ def main(argv=None):
                     return 0
                 if result.get("status") in {"reviewer_retry_rejected", "reviewer_retry_claim_lost"}:
                     return 2
+                return 1
+            if args.resume_review_after_evidence:
+                if runtime.local_reviewer is None:
+                    parser.error("configured runtime has no Local Reviewer")
+                result = runtime.local_reviewer.resume_after_evidence(
+                    args.repo, args.issue, args.pr, args.head_sha,
+                    authorization_head=args.authorize_evidence_resume_for)
+                print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+                if result.get("status") == "reviewer_resume_rejected":
+                    return 2
+                if result.get("status") in {"reviewer_running", "review_decision_submitted",
+                                            "reviewer_insufficient_evidence", "formal_review_exists"}:
+                    return 0
                 return 1
             if args.continuous:
                 run_continuous(runtime, args.repo, local["owner_id"], args.poll_interval,

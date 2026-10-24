@@ -63,8 +63,11 @@ class FakeAPI:
 
 
 class FakeWriter:
-    def __init__(self): self.calls = []; self.success = True
+    def __init__(self): self.calls = []; self.success = True; self.comments = []
     def replace_labels(self, *args): self.calls.append(args); return self.success
+    def comment_issue(self, repo, issue, body):
+        self.comments.append((repo, issue, body))
+        return 900 + len(self.comments)
 
 
 class MutatingWriter(FakeWriter):
@@ -430,6 +433,40 @@ class AdapterTests(unittest.TestCase):
             self.assertIn("--add-label", commands.app_edits[0])
             self.assertIn("infra-blocked", commands.app_edits[0])
             self.assertFalse(commands.agent_launches)
+
+    def test_terminal_stop_summary_is_rendered_short_and_free_of_host_detail(self):
+        api = FakeAPI(); writer = FakeWriter()
+        adapter = GitHubWorkflowAdapter(api, writer, MANIFEST)
+
+        comment_id = adapter.post_terminal_stop_summary(
+            "o/r", 1, "needs-human", "reviewer_insufficient_evidence",
+            "  Deploy failed at C:\\Users\\chang\\work\\easy-exam and token ghp_" + "A" * 36
+            + " leaked.  ",
+            pr_number=12, head_sha=SHA.upper())
+
+        self.assertEqual(comment_id, 901)
+        repo, issue, body = writer.comments[0]
+        self.assertEqual((repo, issue), ("o/r", 1))
+        lines = body.splitlines()
+        self.assertEqual(lines[0], "VCCP stopped: needs-human")
+        self.assertEqual(lines[1], "Reason: reviewer_insufficient_evidence")
+        self.assertTrue(lines[2].startswith("Summary: Deploy failed at "))
+        self.assertNotIn("C:\\Users", body)
+        self.assertNotIn("ghp_", body)
+        self.assertEqual(lines[3], "PR: #12")
+        self.assertEqual(lines[4], f"Head: {SHA}")
+        self.assertEqual(len(lines), 5)
+
+    def test_terminal_stop_summary_omits_unverifiable_identity_fields(self):
+        api = FakeAPI(); writer = FakeWriter()
+        adapter = GitHubWorkflowAdapter(api, writer, MANIFEST)
+
+        adapter.post_terminal_stop_summary("o/r", 1, "infra-blocked",
+                                           "explicit_infrastructure_failure")
+
+        self.assertEqual(writer.comments[0][2].splitlines(),
+                         ["VCCP stopped: infra-blocked",
+                          "Reason: explicit_infrastructure_failure"])
 
     def test_app_gh_writer_uses_native_issue_edit_arguments(self):
         seen = []

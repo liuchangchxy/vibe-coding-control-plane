@@ -371,6 +371,24 @@ test("schema, generated manifest, onboarding guide, contract, and Reviewer promp
   assert.match(reviewer, /reviewer-task-prompt\.md/);
   assert.match(reviewer, /host supplies a VCCP deploy revision-upgrade PR/);
   assert.match(reviewer, /Do not use it for remove PRs, onboarding PRs/);
+  // A stop must be explainable on GitHub, recoverable, and must not hand agent-fixable
+  // evidence gaps to a human.
+  assert.match(contract, /leaves exactly one short Issue comment/);
+  assert.match(contract, /next regular Runner cycle retries it with backoff/);
+  assert.match(contract, /`agent` — the missing evidence is something the Implementer can supply/);
+  assert.match(contract, /`human` — the gap needs a human credential/);
+  assert.match(contract, /resume-review-after-evidence/);
+  assert.match(contract, /never launches the Implementer and never creates a PR/);
+  assert.match(contract, /complete-evidence --note/);
+  assert.match(contract, /implementer-evidence-submission/);
+  assert.match(contract, /cannot edit an existing PR body/);
+  assert.match(contract, /tested_revision/);
+  assert.match(reviewer, /Also requires `remediation`/);
+  assert.match(reviewer, /revision_match=no/);
+  assert.match(reviewer, /does not prove that a test ran/);
+  assert.match(reviewer, /when you omit `remediation`/i);
+  assert.match(reviewer, /implementer-evidence-submission/);
+  assert.match(reviewer, /never that anything ran or passed/);
   for (const text of [template, onboarding, contract, reviewer]) {
     assert.doesNotMatch(text, /three formal `?REQUEST_CHANGES`? repair rounds/i);
   }

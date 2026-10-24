@@ -21,7 +21,7 @@ MAX_AUTOMATED_REPAIRS = 5
 MAX_REPAIRS_PER_CAUSE = 3
 REPAIRS_PER_CONTINUATION = 1
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
-_REPAIR_CAUSES = {"implementation_failure", "reviewer_rejection"}
+_REPAIR_CAUSES = {"implementation_failure", "reviewer_rejection", "evidence_remediation"}
 
 
 def _ci_cause_is_current(candidate: "RepairCandidate", snapshot: "WorkflowSnapshot") -> bool:
@@ -114,6 +114,9 @@ class RepairCandidate:
     cause_type: str
     cause_id: str
     owner_id: str
+    # Reviewer wording for an evidence gap. A gap is not a code defect, so this is
+    # guidance about the missing evidence rather than a formal CHANGES_REQUESTED body.
+    feedback: str | None = None
 
 
 @dataclass(frozen=True)
@@ -148,6 +151,9 @@ class LaunchRequest:
     frozen_spec_body: str | None = None
     runtime_context: dict | None = None
     completion_command: str | None = None
+    # Same-head evidence completion wrapper: an evidence-remediation repair can finish
+    # without pushing, so the Implementer needs a durable "done" signal of its own.
+    evidence_command: str | None = None
     # Exact-head blocking feedback for a Reviewer-caused repair. The Runtime reads it
     # from GitHub; the Implementer never needs GitHub read access of its own.
     review_feedback: str | None = None
@@ -376,7 +382,35 @@ class _Store:
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS repair_continuations_cause_idx
                     ON repair_continuations(repo, issue_number, pr_number, head_sha, cause_type, cause_id);
-                CREATE INDEX IF NOT EXISTS attempts_flow_idx
+                CREATE TABLE IF NOT EXISTS terminal_notices (
+                    repo TEXT NOT NULL,
+                    issue_number INTEGER NOT NULL,
+                    label TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    head_sha TEXT NOT NULL,
+                    comment_id INTEGER,
+                    summary TEXT,
+                    pr_number INTEGER,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_attempt_at REAL,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY (repo, issue_number, label, reason, head_sha)
+                );
+                CREATE INDEX IF NOT EXISTS terminal_notices_pending_idx
+                    ON terminal_notices(repo, comment_id);
+                CREATE TABLE IF NOT EXISTS reviewer_evidence_resumes (
+                    authorization_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    repo TEXT NOT NULL,
+                    issue_number INTEGER NOT NULL,
+                    pr_number INTEGER NOT NULL,
+                    head_sha TEXT NOT NULL,
+                    authorized_by TEXT NOT NULL,
+                    authorized_at REAL NOT NULL,
+                    previous_outcome TEXT,
+                    consumed_at REAL
+                );
+                CREATE INDEX IF NOT EXISTS reviewer_evidence_resumes_head_idx
+                    ON reviewer_evidence_resumes(repo, issue_number, pr_number, head_sha);                CREATE INDEX IF NOT EXISTS attempts_flow_idx
                     ON attempts(repo, issue_number, kind, repair_ordinal);
                 """
             )
@@ -434,6 +468,12 @@ class _Store:
                 connection.execute("ALTER TABLE repair_continuations ADD COLUMN consumed_at REAL")
             if "legacy_maintenance_override" not in continuation_columns:
                 connection.execute("ALTER TABLE repair_continuations ADD COLUMN legacy_maintenance_override TEXT")
+            notice_columns = {row[1] for row in connection.execute("PRAGMA table_info(terminal_notices)")}
+            for name, declaration in (("summary", "TEXT"), ("pr_number", "INTEGER"),
+                                      ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+                                      ("last_attempt_at", "REAL")):
+                if name not in notice_columns:
+                    connection.execute(f"ALTER TABLE terminal_notices ADD COLUMN {name} {declaration}")
             connection.execute(
                 "UPDATE flows SET repair_count=(SELECT COUNT(*) FROM attempts WHERE attempts.repo=flows.repo "
                 "AND attempts.issue_number=flows.issue_number AND attempts.kind='repair' "
@@ -637,6 +677,98 @@ class _Store:
             raise
         finally:
             connection.close()
+
+    def record_evidence_completion(self, attempt_id: str, provider: str, execution_id: str,
+                                   workspace_evidence: str, now: float | None = None,
+                                   evidence_reference: str | None = None):
+        """Durably record that an evidence-remediation Implementer finished its work.
+
+        Unlike a no-op receipt this does not authorize closing the Issue and does not
+        require a frozen-spec digest, because the attempt is a repair against an existing
+        PR. It only proves the same attempt, provider, and execution finished without a
+        controlled push; the head is unchanged by definition. ``authorization_digest``
+        holds ``evidence:<head>`` so the receipt is self-describing.
+        """
+        connection = self.transaction()
+        try:
+            row = connection.execute(
+                "SELECT repo,issue_number,kind,cause_type,phase,launch_outcome,implementer_provider,"
+                "execution_id,expected_head_sha FROM attempts WHERE attempt_id=?", (attempt_id,),
+            ).fetchone()
+            if (row is None or row["kind"] != "repair" or row["cause_type"] != "evidence_remediation"
+                    or row["phase"] != "LAUNCH_CONFIRMED" or row["launch_outcome"] != "confirmed"
+                    or row["implementer_provider"] != provider or row["execution_id"] != execution_id
+                    or not _SHA_RE.fullmatch(row["expected_head_sha"] or "")):
+                connection.rollback()
+                return False
+            if connection.execute("SELECT 1 FROM controlled_pushes WHERE attempt_id=? LIMIT 1",
+                                  (attempt_id,)).fetchone():
+                connection.rollback()
+                return False
+            digest = "evidence:" + row["expected_head_sha"].lower()
+            prior = connection.execute(
+                "SELECT provider,execution_id,source,authorization_digest,workspace_evidence "
+                "FROM completion_receipts WHERE attempt_id=?", (attempt_id,)).fetchone()
+            if prior is not None:
+                same = (prior["provider"] == provider and prior["execution_id"] == execution_id
+                        and prior["source"] == "evidence_remediation"
+                        and prior["authorization_digest"] == digest)
+                if same and evidence_reference and evidence_reference.strip():
+                    # Re-running the same completion only refines the Implementer's own note;
+                    # the receipt's identity (attempt, provider, execution, head) never changes.
+                    connection.execute(
+                        "UPDATE completion_receipts SET evidence_reference=? WHERE attempt_id=? "
+                        "AND source='evidence_remediation'",
+                        (evidence_reference.strip()[:2000], attempt_id))
+                connection.commit()
+                return same
+            connection.execute(
+                "INSERT OR IGNORE INTO completion_receipts(attempt_id,repo,issue_number,provider,"
+                "execution_id,source,authorization_digest,workspace_evidence,evidence_reference,"
+                "evidence_digest,created_at) VALUES(?,?,?,?,?,'evidence_remediation',?,?,?,NULL,?)",
+                (attempt_id, row["repo"], row["issue_number"], provider, execution_id, digest,
+                 workspace_evidence, (evidence_reference or "")[:2000] or None,
+                 time.time() if now is None else float(now)),
+            )
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def evidence_receipts(self, repo: str):
+        """All durable evidence-remediation completion receipts for one repository."""
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT * FROM completion_receipts WHERE repo=? AND source='evidence_remediation' "
+                "ORDER BY created_at, attempt_id", (_repo_key(repo),),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def evidence_receipt(self, repo: str, pr_number: int, head_sha: str):
+        """The latest completed evidence-remediation receipt for one exact head.
+
+        The controlled CLI cannot edit a PR body, so this receipt is the only durable
+        channel an Implementer has for evidence it produces while closing a gap without a
+        commit. It stays a declaration: the receipt records who declared what, never that
+        the declared run happened.
+        """
+        normalized_head = head_sha.casefold() if isinstance(head_sha, str) else ""
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT receipt.evidence_reference, receipt.workspace_evidence, "
+                "receipt.created_at, attempt.repair_ordinal "
+                "FROM completion_receipts receipt "
+                "JOIN attempts attempt ON attempt.attempt_id=receipt.attempt_id "
+                "WHERE receipt.repo=? AND attempt.pr_number=? AND attempt.expected_head_sha=? "
+                "AND receipt.source='evidence_remediation' "
+                "ORDER BY receipt.created_at DESC, attempt.repair_ordinal DESC, "
+                "receipt.rowid DESC LIMIT 1",
+                (_repo_key(repo), pr_number, normalized_head),
+            ).fetchone()
+            return dict(row) if row else None
 
     def begin_controlled_push(self, attempt_id: str, repo: str, provider: str,
                               destination_ref: str, expected_sha: str, now: float | None = None):
@@ -1325,6 +1457,78 @@ class _Store:
                                      (_repo_key(repo), issue)).fetchone()
             return dict(row) if row else None
 
+    def terminal_notice(self, repo: str, issue: int, label: str, reason: str, head_sha: str):
+        """Return the recorded terminal-stop notice for this exact decision, if any."""
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM terminal_notices WHERE repo=? AND issue_number=? AND label=? "
+                "AND reason=? AND head_sha=?",
+                (_repo_key(repo), issue, label, reason, (head_sha or "").casefold()),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def record_terminal_notice(self, repo: str, issue: int, label: str, reason: str,
+                               head_sha: str, comment_id: int | None, now: float | None = None,
+                               summary: str = "", pr_number: int | None = None):
+        """Remember that this exact terminal decision was already summarized on GitHub.
+
+        The row is the idempotency proof: a restart or a repeated reconcile finds it and
+        skips the write instead of posting a second comment. Insert-then-read keeps a
+        concurrent double observation from producing two comments. A row with a NULL
+        ``comment_id`` is a pending notice: the terminal state is already durable, but the
+        GitHub summary has not landed yet and a later cycle must retry it.
+        """
+        timestamp = time.time() if now is None else float(now)
+        connection = self.transaction()
+        try:
+            inserted = connection.execute(
+                "INSERT OR IGNORE INTO terminal_notices"
+                "(repo,issue_number,label,reason,head_sha,comment_id,summary,pr_number,attempts,"
+                "last_attempt_at,created_at) VALUES(?,?,?,?,?,?,?,?,0,NULL,?)",
+                (_repo_key(repo), issue, label, reason, (head_sha or "").casefold(),
+                 comment_id, summary, pr_number, timestamp),
+            )
+            connection.commit()
+            return inserted.rowcount == 1
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def pending_terminal_notices(self, repo: str | None = None):
+        """Return every confirmed terminal stop whose GitHub summary is still unwritten."""
+        query = ("SELECT * FROM terminal_notices WHERE comment_id IS NULL"
+                 + (" AND repo=?" if repo is not None else "") + " ORDER BY created_at, rowid")
+        with closing(self._connect()) as connection:
+            rows = connection.execute(query, (_repo_key(repo),) if repo is not None else ()).fetchall()
+            return [dict(row) for row in rows]
+
+    def defer_terminal_notice(self, repo: str, issue: int, label: str, reason: str,
+                              head_sha: str, now: float | None = None):
+        """Count one failed publish attempt while keeping the notice pending for retry."""
+        timestamp = time.time() if now is None else float(now)
+        with closing(self._connect()) as connection:
+            cursor = connection.execute(
+                "UPDATE terminal_notices SET attempts=attempts+1,last_attempt_at=? "
+                "WHERE repo=? AND issue_number=? AND label=? AND reason=? AND head_sha=? "
+                "AND comment_id IS NULL",
+                (timestamp, _repo_key(repo), issue, label, reason, (head_sha or "").casefold()),
+            )
+            connection.commit()
+            return cursor.rowcount == 1
+
+    def attach_terminal_notice_comment(self, repo: str, issue: int, label: str, reason: str,
+                                       head_sha: str, comment_id: int):
+        with closing(self._connect()) as connection:
+            cursor = connection.execute(
+                "UPDATE terminal_notices SET comment_id=? WHERE repo=? AND issue_number=? "
+                "AND label=? AND reason=? AND head_sha=? AND comment_id IS NULL",
+                (comment_id, _repo_key(repo), issue, label, reason, (head_sha or "").casefold()),
+            )
+            connection.commit()
+            return cursor.rowcount == 1
+
     def reviewer_execution(self, repo: str, pr_number: int, head_sha: str):
         with closing(self._connect()) as connection:
             row = connection.execute(
@@ -1472,6 +1676,251 @@ class _Store:
             )
             return cursor.rowcount == 1
 
+    def authorize_evidence_resume(self, repo: str, issue_number: int, pr_number: int,
+                                  head_sha: str, authorized_by: str, now: float | None = None):
+        """Record one human decision to re-review the same exact head after a stop.
+
+        This is deliberately narrower than repair authorization: it never creates an
+        attempt, never launches the Implementer, and only re-arms the Reviewer execution
+        that already exists for this head. The whole change is one transaction so a
+        crash can neither arm the Reviewer without a ledger entry nor record consent
+        without reopening the flow.
+        """
+        normalized_head = head_sha.casefold() if isinstance(head_sha, str) else ""
+        if (not _SHA_RE.fullmatch(normalized_head)
+                or not isinstance(issue_number, int) or issue_number < 1
+                or not isinstance(pr_number, int) or pr_number < 1
+                or not isinstance(authorized_by, str) or not authorized_by.strip()
+                or len(authorized_by) > 128):
+            return False, "invalid_authorization"
+        repo_key = _repo_key(repo)
+        timestamp = time.time() if now is None else float(now)
+        connection = self.transaction()
+        try:
+            state = connection.execute(
+                "SELECT phase,head_sha,outcome FROM lifecycle WHERE repo=? AND issue_number=?",
+                (repo_key, issue_number),
+            ).fetchone()
+            if (state is None or state["phase"] != "NEEDS_HUMAN"
+                    or (state["head_sha"] or "").casefold() != normalized_head
+                    or not str(state["outcome"] or "").startswith("reviewer_insufficient_evidence")):
+                connection.rollback()
+                return False, "not_an_evidence_stop_for_this_head"
+            execution = connection.execute(
+                "SELECT state,outcome FROM reviewer_executions WHERE repo=? AND pr_number=? AND head_sha=?",
+                (repo_key, pr_number, normalized_head),
+            ).fetchone()
+            if execution is None or execution["state"] != "COMPLETED" or not self._blocked_outcome(
+                    execution["outcome"]):
+                connection.rollback()
+                return False, "reviewer_execution_not_blocked_at_this_head"
+            prior = connection.execute(
+                "SELECT consumed_at FROM reviewer_evidence_resumes WHERE repo=? AND issue_number=? "
+                "AND pr_number=? AND head_sha=? ORDER BY authorization_id DESC LIMIT 1",
+                (repo_key, issue_number, pr_number, normalized_head),
+            ).fetchone()
+            if prior is not None and prior["consumed_at"] is None:
+                connection.commit()
+                return True, "already_authorized"
+            attempt = connection.execute(
+                "SELECT attempt_id FROM attempts WHERE repo=? AND issue_number=? AND pr_number=? "
+                "AND phase='TERMINAL_UNRESOLVED' ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+                (repo_key, issue_number, pr_number),
+            ).fetchone()
+            if attempt is None:
+                connection.rollback()
+                return False, "no_stopped_attempt_to_reopen"
+            flow = connection.execute(
+                "SELECT pr_number FROM flows WHERE repo=? AND issue_number=?",
+                (repo_key, issue_number),
+            ).fetchone()
+            if flow is not None and flow["pr_number"] not in (None, pr_number):
+                connection.rollback()
+                return False, "flow_bound_to_another_pr"
+            connection.execute(
+                "INSERT INTO reviewer_evidence_resumes"
+                "(repo,issue_number,pr_number,head_sha,authorized_by,authorized_at,previous_outcome,consumed_at)"
+                " VALUES(?,?,?,?,?,?,?,NULL)",
+                (repo_key, issue_number, pr_number, normalized_head, authorized_by.strip(),
+                 timestamp, execution["outcome"]),
+            )
+            connection.execute(
+                "UPDATE reviewer_executions SET state='EVIDENCE_RESUME_AUTHORIZED',updated_at=? "
+                "WHERE repo=? AND pr_number=? AND head_sha=? AND state='COMPLETED'",
+                (timestamp, repo_key, pr_number, normalized_head),
+            )
+            connection.execute(
+                "UPDATE attempts SET phase='PR_BOUND',updated_at=?,phase_entered_at=? "
+                "WHERE attempt_id=? AND phase='TERMINAL_UNRESOLVED'",
+                (timestamp, timestamp, attempt["attempt_id"]),
+            )
+            connection.execute(
+                "UPDATE flows SET trusted=1,initial_confirmed=1 WHERE repo=? AND issue_number=? "
+                "AND repair_budget_known=1",
+                (repo_key, issue_number),
+            )
+            connection.commit()
+            return True, "authorized"
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _blocked_outcome(outcome) -> bool:
+        try:
+            value = json.loads(outcome or "")
+        except (TypeError, ValueError):
+            return False
+        return isinstance(value, dict) and value.get("event") == "BLOCKED"
+
+    def claim_authorized_evidence_resume(self, repo: str, pr_number: int, head_sha: str,
+                                         provider: str, now: float | None = None):
+        """Consume one authorization and re-arm the existing Reviewer execution."""
+        normalized_head = head_sha.casefold() if isinstance(head_sha, str) else ""
+        if not normalized_head:
+            return None, False
+        repo_key = _repo_key(repo)
+        timestamp = time.time() if now is None else float(now)
+        connection = self.transaction()
+        try:
+            authorization = connection.execute(
+                "SELECT * FROM reviewer_evidence_resumes WHERE repo=? AND pr_number=? AND head_sha=? "
+                "AND consumed_at IS NULL ORDER BY authorization_id DESC LIMIT 1",
+                (repo_key, pr_number, normalized_head),
+            ).fetchone()
+            if authorization is None:
+                connection.rollback()
+                return None, False
+            cursor = connection.execute(
+                "UPDATE reviewer_executions SET state='STARTING',execution_id=NULL,started_at=?,updated_at=?,"
+                " outcome=NULL WHERE repo=? AND pr_number=? AND head_sha=? AND provider=? "
+                "AND state='EVIDENCE_RESUME_AUTHORIZED'",
+                (timestamp, timestamp, repo_key, pr_number, normalized_head, provider),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                return None, False
+            connection.execute(
+                "UPDATE reviewer_evidence_resumes SET consumed_at=? WHERE authorization_id=? "
+                "AND consumed_at IS NULL", (timestamp, authorization["authorization_id"]),
+            )
+            row = connection.execute(
+                "SELECT * FROM reviewer_executions WHERE repo=? AND pr_number=? AND head_sha=?",
+                (repo_key, pr_number, normalized_head),
+            ).fetchone()
+            connection.commit()
+            return dict(row), True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def finish_evidence_remediation(self, attempt_id: str, head_sha: str, authorized_by: str,
+                                    now: float | None = None):
+        """Close one same-head evidence remediation and re-arm the Reviewer for that head.
+
+        One transaction covers all four facts, so no crash can leave an attempt bound to a
+        PR without the Reviewer authorized (or the reverse): the attempt's own completion
+        receipt, the unchanged exact head, the durable ``BLOCKED`` cause classified as
+        ``agent``, and the resume authorization. No Implementer relaunch and no new PR are
+        involved; the head is deliberately allowed to be identical.
+        """
+        normalized_head = head_sha.casefold() if isinstance(head_sha, str) else ""
+        if (not _SHA_RE.fullmatch(normalized_head)
+                or not isinstance(authorized_by, str) or not authorized_by.strip()):
+            return False, "invalid_authorization"
+        timestamp = time.time() if now is None else float(now)
+        connection = self.transaction()
+        try:
+            attempt = connection.execute(
+                "SELECT repo,issue_number,pr_number,branch,expected_head_sha,phase,kind,cause_type "
+                "FROM attempts WHERE attempt_id=?", (attempt_id,),
+            ).fetchone()
+            if (attempt is None or attempt["kind"] != "repair"
+                    or attempt["cause_type"] != "evidence_remediation"
+                    or attempt["phase"] != "LAUNCH_CONFIRMED"):
+                connection.rollback()
+                return False, "attempt_not_awaiting_evidence_completion"
+            repo_key = attempt["repo"]
+            if ((attempt["expected_head_sha"] or "").casefold() != normalized_head
+                    or attempt["pr_number"] is None or not attempt["branch"]):
+                connection.rollback()
+                return False, "head_changed_since_the_gap_was_routed"
+            receipt = connection.execute(
+                "SELECT source FROM completion_receipts WHERE attempt_id=?", (attempt_id,),
+            ).fetchone()
+            if receipt is None or receipt["source"] != "evidence_remediation":
+                connection.rollback()
+                return False, "evidence_completion_missing"
+            if connection.execute("SELECT 1 FROM controlled_pushes WHERE attempt_id=? LIMIT 1",
+                                  (attempt_id,)).fetchone():
+                # A pushed head is a normal code repair: the new head goes through exact-head
+                # CI and review instead of a same-head evidence resume.
+                connection.rollback()
+                return False, "head_was_pushed_by_this_attempt"
+            execution = connection.execute(
+                "SELECT state,outcome FROM reviewer_executions WHERE repo=? AND pr_number=? AND head_sha=?",
+                (repo_key, attempt["pr_number"], normalized_head),
+            ).fetchone()
+            if execution is None or execution["state"] != "COMPLETED" or not self._blocked_outcome(
+                    execution["outcome"]):
+                connection.rollback()
+                return False, "durable_blocked_cause_missing"
+            try:
+                blocked = json.loads(execution["outcome"] or "")
+            except (TypeError, ValueError):
+                blocked = None
+            if not isinstance(blocked, dict) or blocked.get("remediation") != "agent":
+                # A human-classified gap must never be turned into automated work by a
+                # stale attempt: the durable Reviewer conclusion wins over the report.
+                connection.rollback()
+                return False, "gap_requires_a_human"
+            connection.execute(
+                "INSERT INTO reviewer_evidence_resumes"
+                "(repo,issue_number,pr_number,head_sha,authorized_by,authorized_at,previous_outcome,consumed_at)"
+                " VALUES(?,?,?,?,?,?,?,NULL)",
+                (repo_key, attempt["issue_number"], attempt["pr_number"], normalized_head,
+                 authorized_by.strip(), timestamp, execution["outcome"]),
+            )
+            armed = connection.execute(
+                "UPDATE reviewer_executions SET state='EVIDENCE_RESUME_AUTHORIZED',updated_at=? "
+                "WHERE repo=? AND pr_number=? AND head_sha=? AND state='COMPLETED'",
+                (timestamp, repo_key, attempt["pr_number"], normalized_head),
+            )
+            if armed.rowcount != 1:
+                raise RuntimeError("reviewer execution changed during evidence completion")
+            bound = connection.execute(
+                "UPDATE attempts SET phase='PR_BOUND',resulting_head_sha=?,phase_entered_at=?,"
+                "deadline_at=NULL,updated_at=? WHERE attempt_id=? AND phase='LAUNCH_CONFIRMED'",
+                (normalized_head, timestamp, timestamp, attempt_id),
+            )
+            if bound.rowcount != 1:
+                raise RuntimeError("evidence attempt changed during completion")
+            connection.execute(
+                "UPDATE flows SET pr_number=COALESCE(pr_number,?),branch=COALESCE(branch,?) "
+                "WHERE repo=? AND issue_number=?",
+                (attempt["pr_number"], attempt["branch"], repo_key, attempt["issue_number"]),
+            )
+            connection.commit()
+            return True, "evidence_completed"
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def evidence_resume_history(self, repo: str, issue_number: int, pr_number: int):
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT * FROM reviewer_evidence_resumes WHERE repo=? AND issue_number=? AND pr_number=? "
+                "ORDER BY authorization_id",
+                (_repo_key(repo), issue_number, pr_number),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
     def claim_reviewer_resume(self, repo: str, pr_number: int, head_sha: str,
                               execution_id: str, expected_outcome: str,
                               next_outcome: str, now: float | None = None):
@@ -1594,6 +2043,49 @@ class RuntimeCore:
             raise ValueError("implementer_progress_timeout_seconds must be positive")
         self.implementer_progress_timeout_seconds = implementer_progress_timeout_seconds
 
+    def complete_evidence_remediation(self, repo: str, now: float | None = None):
+        """Finish same-head evidence remediations whose Implementer already reported done.
+
+        The completion receipt is the Implementer's durable "I am finished" signal. It does
+        not wait for a pushed commit: an evidence gap can close without touching the tree,
+        so the exact head is allowed to be whatever it already was. Running here, before the
+        receipt filter, keeps a finished attempt from ever being mistaken for an orphan.
+        """
+        current = time.time() if now is None else float(now)
+        items = []
+        for row in self.store.attempts_for_repo(repo):
+            if (row["kind"] != "repair" or row["cause_type"] != "evidence_remediation"
+                    or row["phase"] != "LAUNCH_CONFIRMED"):
+                continue
+            receipt = self.store.receipt(row["attempt_id"])
+            if receipt is None or receipt.get("source") != "evidence_remediation":
+                continue
+            items.append(self._complete_one_evidence_remediation(repo, row, current))
+        return {"status": "evidence_reconciled", "items": items}
+
+    def _complete_one_evidence_remediation(self, repo: str, row: dict, now: float):
+        expected = (row.get("expected_head_sha") or "").casefold()
+        try:
+            snapshot = self.workflow.observe(repo, row["issue_number"])
+        except Exception as error:
+            return {"issue": row["issue_number"], "status": "workflow_unavailable",
+                    "detail": str(error)}
+        if (not snapshot.issue_open or not snapshot.frozen_spec or snapshot.canceled
+                or snapshot.terminal_labels or snapshot.coordination_state != "agent-working"
+                or not snapshot.pr_open or snapshot.pr_number != row["pr_number"]
+                or not snapshot.canonical_relationship_valid or snapshot.canonical_link_count != 1
+                or snapshot.open_linked_pr_count != 1
+                or (snapshot.pr_branch or "") != (row["branch"] or "")
+                or (snapshot.pr_head_sha or "").casefold() != expected):
+            return {"issue": row["issue_number"], "status": "evidence_completion_deferred"}
+        completed, reason = self.store.finish_evidence_remediation(
+            row["attempt_id"], expected, "runtime:evidence-remediation", now)
+        if not completed:
+            return {"issue": row["issue_number"], "status": "evidence_completion_refused",
+                    "reason": reason}
+        return {"issue": row["issue_number"], "status": "evidence_completed",
+                "pr": row["pr_number"], "head": expected}
+
     def observe_implementer_progress(self, repo: str, now: float | None = None):
         """Advance durable Implementer activity only when its conversation artifacts advance."""
         current = time.time() if now is None else float(now)
@@ -1628,6 +2120,14 @@ class RuntimeCore:
                         items.append({"issue": row["issue_number"], "status": "implementer_stalled"})
                     else:
                         items.append({"issue": row["issue_number"], "status": "stale_watchdog_evidence"})
+                    if changed or self._terminal_label_observed(repo, row["issue_number"], "infra-blocked"):
+                        # The watchdog stops an in-flight attempt without the lifecycle driver,
+                        # so it owes the same visible reason every other terminal stop owes.
+                        self.publish_terminal_stop(
+                            repo, row["issue_number"], "infra-blocked", "implementer_progress_stalled",
+                            "The Implementer produced no observable progress within "
+                            f"{int(self.implementer_progress_timeout_seconds)}s.",
+                            snapshot.pr_number, snapshot.pr_head_sha, current)
                 except Exception as error:
                     items.append({"issue": row["issue_number"], "status": "workflow_unavailable",
                                   "detail": str(error)})
@@ -1765,6 +2265,10 @@ class RuntimeCore:
             receipt = self.store.receipt(row["attempt_id"])
             if not receipt:
                 continue
+            if row["kind"] == "repair":
+                # A repair receipt proves the repair attempt finished, never that the Issue
+                # may close: repair reconciliation and the Reviewer own what happens next.
+                continue
             if row["phase"] == "SUCCESS_NO_OP":
                 continue
             if self.store.has_controlled_push(row["attempt_id"]):
@@ -1850,6 +2354,95 @@ class RuntimeCore:
             return True
         return json.loads(self._workspace_baseline(self.workspace_path)) == baseline
 
+    @staticmethod
+    def _reviewer_evidence_gap_is_agent(outcome) -> bool:
+        try:
+            value = json.loads(outcome or "")
+        except (TypeError, ValueError):
+            return False
+        return (isinstance(value, dict) and value.get("event") == "BLOCKED"
+                and value.get("remediation") == "agent")
+
+    def publish_terminal_stop(self, repo: str, issue_number: int, label: str, reason: str,
+                              summary: str = "", pr_number: int | None = None,
+                              head_sha: str | None = None, now: float | None = None):
+        """Leave one bounded GitHub comment for a confirmed terminal stop.
+
+        The caller must already have confirmed the terminal state. The durable ledger stays
+        authoritative; the comment is only the human-visible summary. The notice row is
+        written *before* the attempt, so a failed write leaves a pending row that
+        ``retry_pending_terminal_notices`` picks up on a later cycle instead of losing the
+        reason forever. A row that already carries a comment id is never rewritten, so a
+        restart or a repeated reconcile cannot duplicate a summary that landed.
+        """
+        publisher = getattr(self.workflow, "post_terminal_stop_summary", None)
+        if publisher is None:
+            return None
+        normalized_reason = str(reason or "").strip()
+        if not normalized_reason:
+            return None
+        head = (head_sha or "").casefold()
+        timestamp = time.time() if now is None else float(now)
+        repo_key = _repo_key(repo)
+        self.store.record_terminal_notice(repo_key, issue_number, label, normalized_reason,
+                                          head, None, timestamp, summary, pr_number)
+        notice = self.store.terminal_notice(repo_key, issue_number, label, normalized_reason, head)
+        if notice is None or notice.get("comment_id") is not None:
+            return None
+        return self._publish_terminal_notice(notice, publisher, timestamp)
+
+    def _publish_terminal_notice(self, notice: dict, publisher, now: float):
+        """Attempt one pending notice and preserve it for retry when the write fails."""
+        try:
+            comment_id = publisher(notice["repo"], notice["issue_number"], notice["label"],
+                                   notice["reason"], notice.get("summary") or "",
+                                   notice.get("pr_number"), notice["head_sha"] or None)
+        except Exception:
+            comment_id = None
+        if comment_id is None:
+            self.store.defer_terminal_notice(notice["repo"], notice["issue_number"],
+                                             notice["label"], notice["reason"],
+                                             notice["head_sha"], now)
+            return None
+        self.store.attach_terminal_notice_comment(
+            notice["repo"], notice["issue_number"], notice["label"], notice["reason"],
+            notice["head_sha"], comment_id)
+        return comment_id
+
+    def retry_pending_terminal_notices(self, repo: str | None = None,
+                                       now: float | None = None):
+        """Retry unwritten terminal summaries from earlier cycles, with bounded backoff.
+
+        This rides the existing Runner cycle: no daemon, no timer, no extra queue. A pending
+        row can only exist after the terminal label was already confirmed, so retrying it
+        never invents a stop that did not happen.
+        """
+        publisher = getattr(self.workflow, "post_terminal_stop_summary", None)
+        if publisher is None:
+            return {"status": "not_applicable", "items": []}
+        current = time.time() if now is None else float(now)
+        items = []
+        for notice in self.store.pending_terminal_notices(repo):
+            attempts = int(notice.get("attempts") or 0)
+            last = notice.get("last_attempt_at")
+            backoff = min(3600.0, 60.0 * (2 ** min(attempts, 6)))
+            if last is not None and current - float(last) < backoff:
+                items.append({"issue": notice["issue_number"], "reason": notice["reason"],
+                              "status": "backoff"})
+                continue
+            comment_id = self._publish_terminal_notice(notice, publisher, current)
+            items.append({"issue": notice["issue_number"], "reason": notice["reason"],
+                          "status": "published" if comment_id else "pending"})
+        return {"status": "retried", "items": items}
+
+    def _terminal_label_observed(self, repo: str, issue: int, label: str) -> bool:
+        """Whether GitHub itself already shows the terminal label this stop claims."""
+        try:
+            fresh = self.workflow.observe(repo, issue)
+        except Exception:
+            return False
+        return label in (fresh.terminal_labels or ())
+
     def dispatch_repair(self, candidate: RepairCandidate):
         if candidate.cause_type not in _REPAIR_CAUSES or not isinstance(candidate.cause_id, str) or not candidate.cause_id.strip():
             return {"status": "unsupported_repair_cause"}
@@ -1873,6 +2466,12 @@ class RuntimeCore:
             return {"status": "workflow_unavailable", "detail": str(error)}
         if not self._eligible_repair(observed, candidate):
             return {"status": "stale_or_ineligible_repair"}
+        if candidate.cause_type == "evidence_remediation":
+            # An evidence gap may only reopen the same PR for the same exact Reviewer
+            # conclusion. The Reviewer execution is the durable cause record here.
+            execution = self.store.reviewer_execution(repo, candidate.pr_number, candidate.head_sha)
+            if execution is None or not self._reviewer_evidence_gap_is_agent(execution.get("outcome")):
+                return {"status": "stale_or_ineligible_repair"}
 
         admission = self.store.admit_repair(candidate, self.lease_ttl_seconds, self.config.max_automated_repairs,
                                             self.recovery_timeout_seconds)
@@ -1885,6 +2484,13 @@ class RuntimeCore:
                 )
             except Exception:
                 pass
+            if transitioned or self._terminal_label_observed(repo, candidate.issue_number, "needs-human"):
+                self.publish_terminal_stop(
+                    repo, candidate.issue_number, "needs-human",
+                    "repair_history_or_budget_provenance_unknown",
+                    f"{candidate.cause_type} on PR #{candidate.pr_number} cannot be admitted because "
+                    "repair history or budget provenance is unknown.",
+                    candidate.pr_number, candidate.head_sha)
             return {**admission, "reason": "repair_history_or_budget_provenance_unknown",
                     "needs_human": True, "needs_human_transitioned": transitioned}
         if status == "budget_exhausted":
@@ -1895,6 +2501,12 @@ class RuntimeCore:
                 )
             except Exception:
                 pass
+            if transitioned or self._terminal_label_observed(repo, candidate.issue_number, "needs-human"):
+                self.publish_terminal_stop(
+                    repo, candidate.issue_number, "needs-human", "repair_budget_exhausted",
+                    f"{candidate.cause_type} on PR #{candidate.pr_number} exhausted the automation budget "
+                    f"(global {admission.get('global_limit')}, per-cause {admission.get('category_limit')}).",
+                    candidate.pr_number, candidate.head_sha)
             return {**admission, "needs_human": True, "needs_human_transitioned": transitioned}
         if status != "admitted":
             return admission
@@ -1921,7 +2533,9 @@ class RuntimeCore:
         # _eligible_repair already proved this review is the candidate's cause and is
         # bound to the candidate head, so the body describes the head being repaired.
         review_feedback = (fresh.formal_review_body
-                           if candidate.cause_type == "reviewer_rejection" else None)
+                           if candidate.cause_type == "reviewer_rejection"
+                           else candidate.feedback if candidate.cause_type == "evidence_remediation"
+                           else None)
         launch_request = LaunchRequest(
             repo=repo,
             issue_number=candidate.issue_number,
@@ -2126,6 +2740,9 @@ class RuntimeCore:
         if not isinstance(owner_id, str) or not owner_id.strip():
             return {"status": "invalid_owner", "items": []}
         current_time = time.time() if now is None else float(now)
+        # A same-head evidence completion must be settled before the receipt filter below
+        # hides the finished attempt and it looks orphaned instead.
+        output = self.complete_evidence_remediation(repo_key, current_time)["items"]
         try:
             discovered = self.workflow.discover_active(repo_key)
         except Exception as error:
@@ -2135,7 +2752,6 @@ class RuntimeCore:
                     and self.store.receipt(row["attempt_id"]))]
         issue_numbers = set(discovered)
         issue_numbers.update(row["issue_number"] for row in attempts)
-        output = []
         active_phases = {"CLAIM_INTENT", "CLAIMED", "LAUNCH_INTENT", "LAUNCH_UNKNOWN", "LAUNCH_CONFIRMED"}
         for issue in sorted(issue_numbers):
             try:
@@ -2177,7 +2793,10 @@ class RuntimeCore:
                             and snapshot.open_linked_pr_count == 0:
                         output.append({"issue": issue, "status": "unresolved_claim_contradiction"})
                     else:
-                        self._recovery_terminal(repo_key, issue, snapshot, "needs-human")
+                        self._recovery_terminal(
+                            repo_key, issue, snapshot, "needs-human",
+                            "contradictory_claim_evidence",
+                            "Local launch state contradicts the observed Issue and PR facts.")
                         self.store.local_terminal(latest["attempt_id"], "TERMINAL_UNRESOLVED", current_time)
                         output.append({"issue": issue, "status": "contradictory_claim_evidence"})
                 continue
@@ -2218,7 +2837,9 @@ class RuntimeCore:
             )
             if snapshot.coordination_state == "changes-requested" and not first_review_rejection_pending and (
                     not flow or not flow.get("trusted") or not has_repair_history):
-                self._recovery_terminal(repo_key, issue, snapshot, "needs-human")
+                self._recovery_terminal(
+                    repo_key, issue, snapshot, "needs-human", "untrusted_repair_history",
+                    "Local repair history is not trusted, so no repair can be admitted.")
                 for row in local_fence_attempts:
                     self.store.local_terminal(row["attempt_id"], "TERMINAL_UNRESOLVED", current_time)
                 output.append({"issue": issue, "status": "untrusted_repair_history"})
@@ -2288,7 +2909,10 @@ class RuntimeCore:
                         output.append({"issue": issue, "status": "claim_lost_to_concurrent_claim"})
                     else:
                         terminal = "needs-human"
-                        self._recovery_terminal(repo_key, issue, snapshot, terminal)
+                        self._recovery_terminal(
+                            repo_key, issue, snapshot, terminal,
+                            "stale_or_contradictory_local_history",
+                            "Local attempt history no longer matches the observed PR.")
                         self.store.local_terminal(rows[-1]["attempt_id"], "TERMINAL_UNRESOLVED", current_time)
                         output.append({"issue": issue, "status": "stale_or_contradictory_local_history",
                                        "terminal": terminal})
@@ -2302,12 +2926,16 @@ class RuntimeCore:
                     latest["deadline_at"] = self.store.ensure_deadline(latest["attempt_id"],
                                                                         self.recovery_timeout_seconds)
                 if not snapshot.canonical_relationship_valid:
-                    self._recovery_terminal(repo_key, issue, snapshot, "needs-human")
+                    self._recovery_terminal(
+                        repo_key, issue, snapshot, "needs-human", "ambiguous_relationship",
+                        "The Issue-to-PR relationship could not be established unambiguously.")
                     self.store.local_terminal(latest["attempt_id"], "TERMINAL_UNRESOLVED", current_time)
                     output.append({"issue": issue, "status": "ambiguous_relationship"})
                     continue
                 if snapshot.canonical_link_count > 1 or snapshot.open_linked_pr_count > 1:
-                    self._recovery_terminal(repo_key, issue, snapshot, "needs-human")
+                    self._recovery_terminal(
+                        repo_key, issue, snapshot, "needs-human", "ambiguous_pr",
+                        "More than one linked pull request competes for this Issue.")
                     self.store.local_terminal(latest["attempt_id"], "TERMINAL_UNRESOLVED", current_time)
                     output.append({"issue": issue, "status": "ambiguous_pr"})
                     continue
@@ -2316,13 +2944,17 @@ class RuntimeCore:
                         same_target = (latest["pr_number"] == snapshot.pr_number
                                        and latest["branch"] == snapshot.pr_branch)
                         if not same_target:
-                            self._recovery_terminal(repo_key, issue, snapshot, "needs-human")
+                            self._recovery_terminal(
+                                repo_key, issue, snapshot, "needs-human", "repair_target_changed",
+                                "The repair target PR or branch changed while the repair was in flight.")
                             self.store.local_terminal(latest["attempt_id"], "TERMINAL_UNRESOLVED", current_time)
                             output.append({"issue": issue, "status": "repair_target_changed"})
                             continue
                         if (latest["expected_head_sha"] or "").lower() == snapshot.pr_head_sha.lower():
                             if current_time >= (latest["deadline_at"] or float("inf")):
-                                self._recovery_terminal(repo_key, issue, snapshot, "infra-blocked")
+                                self._recovery_terminal(
+                                    repo_key, issue, snapshot, "infra-blocked", "repair_head_timeout",
+                                    "The repaired head never appeared within the recovery window.")
                                 self.store.local_terminal(latest["attempt_id"], "TERMINAL_UNRESOLVED", current_time)
                                 output.append({"issue": issue, "status": "repair_head_timeout"})
                             else:
@@ -2338,7 +2970,9 @@ class RuntimeCore:
                     continue
                 if current_time >= (latest["deadline_at"] or float("inf")):
                     terminal = "needs-human" if snapshot.coordination_state == "changes-requested" else "infra-blocked"
-                    self._recovery_terminal(repo_key, issue, snapshot, terminal)
+                    self._recovery_terminal(
+                        repo_key, issue, snapshot, terminal, "recovery_timeout",
+                        "The Runtime could not resolve this flow before its recovery deadline.")
                     self.store.local_terminal(latest["attempt_id"], "TERMINAL_UNRESOLVED", current_time)
                     output.append({"issue": issue, "status": "recovery_timeout", "terminal": terminal})
                 else:
@@ -2348,14 +2982,18 @@ class RuntimeCore:
             # No local attempt is authoritative for this active workflow: treat it as orphaned.
             if snapshot.coordination_state == "changes-requested":
                 if not flow or not flow.get("trusted") or not any(r["kind"] == "repair" for r in rows):
-                    self._recovery_terminal(repo_key, issue, snapshot, "needs-human")
+                    self._recovery_terminal(
+                        repo_key, issue, snapshot, "needs-human", "untrusted_repair_history",
+                        "A changes-requested flow has no trusted repair history to continue.")
                     output.append({"issue": issue, "status": "untrusted_repair_history"})
                 else:
                     output.append({"issue": issue, "status": "repair_history_present"})
                 continue
             if not snapshot.canonical_relationship_valid or snapshot.canonical_link_count > 1 \
                     or snapshot.open_linked_pr_count > 1:
-                self._recovery_terminal(repo_key, issue, snapshot, "needs-human")
+                self._recovery_terminal(
+                    repo_key, issue, snapshot, "needs-human", "ambiguous_pr",
+                    "More than one linked pull request competes for this Issue.")
                 output.append({"issue": issue, "status": "ambiguous_pr"})
             elif snapshot.pr_open and snapshot.pr_number is not None and snapshot.pr_branch and snapshot.pr_head_sha:
                 if not self._recovery_pr_still_current(repo_key, issue, snapshot):
@@ -2370,22 +3008,41 @@ class RuntimeCore:
                 output.append({"issue": issue, "status": "orphan_adopted_trusted", "attempt_id": adopted,
                                "pr": snapshot.pr_number})
             else:
-                self._recovery_terminal(repo_key, issue, snapshot, "infra-blocked")
+                self._recovery_terminal(
+                    repo_key, issue, snapshot, "infra-blocked", "orphan_without_pr",
+                    "An active coordination label exists but no pull request is bound to it.")
                 output.append({"issue": issue, "status": "orphan_without_pr"})
         return {"status": "reconciled", "items": output}
 
-    def _recovery_terminal(self, repo: str, issue: int, snapshot: WorkflowSnapshot, target: str):
+    def _recovery_terminal(self, repo: str, issue: int, snapshot: WorkflowSnapshot, target: str,
+                           reason: str = "recovery_terminal", summary: str = ""):
         if snapshot.coordination_state not in {"agent-ready", "agent-working", "changes-requested"}:
             return False
         try:
             fresh = self.workflow.observe(repo, issue)
-            if (fresh.revision != snapshot.revision or fresh.coordination_state != snapshot.coordination_state
-                    or fresh.canceled or fresh.terminal_labels or not fresh.issue_open or not fresh.frozen_spec):
-                return False
-            return self.workflow.transition_coordination_state(
-                repo, issue, fresh.coordination_state, target, fresh.revision)
         except Exception:
             return False
+        if (fresh.revision != snapshot.revision or fresh.coordination_state != snapshot.coordination_state
+                or fresh.canceled or fresh.terminal_labels or not fresh.issue_open or not fresh.frozen_spec):
+            # This pass did not stop the Issue. If the label it wanted is already there, the
+            # terminal state is confirmed and its reason still owes a notice; any other
+            # terminal label belongs to a different stop and must not get this reason.
+            if target in (fresh.terminal_labels or ()):
+                self.publish_terminal_stop(repo, issue, target, reason, summary,
+                                           fresh.pr_number, fresh.pr_head_sha)
+            return False
+        try:
+            transitioned = self.workflow.transition_coordination_state(
+                repo, issue, fresh.coordination_state, target, fresh.revision)
+        except Exception:
+            transitioned = False
+        # The same visible-reason rule applies to recovery stops, not only to lifecycle ones.
+        # The notice is keyed by repository, Issue, label, reason, and head, so a transition
+        # whose write landed while reporting failure still leaves exactly one summary.
+        if transitioned or self._terminal_label_observed(repo, issue, target):
+            self.publish_terminal_stop(repo, issue, target, reason, summary,
+                                       fresh.pr_number, fresh.pr_head_sha)
+        return transitioned
 
     def _recovery_pr_still_current(self, repo: str, issue: int, expected: WorkflowSnapshot):
         try:
