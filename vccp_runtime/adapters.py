@@ -828,8 +828,9 @@ def _antigravity_project_workspaces(data) -> set[Path]:
             continue
         raw_path = unquote(parsed.path, encoding="utf-8")
         if parsed.netloc and parsed.netloc not in {"", "localhost"}:
-            raw_path = f"{parsed.netloc}{raw_path}"
-        if os.name == "nt" and len(raw_path) > 2 and raw_path[0] == "/" and raw_path[2] == ":":
+            raw_path = f"//{parsed.netloc}{raw_path}"
+        # A Windows file URI spells the drive as ``/C:/...``, which is not a path on POSIX.
+        if os.name == "nt" and re.fullmatch(r"/[A-Za-z]:", raw_path[:3]):
             raw_path = raw_path[1:]
         try:
             folders.add(Path(raw_path).resolve())
