@@ -321,11 +321,13 @@ class ProductionFallbackTests(unittest.TestCase):
         return {"database_path": str(Path(self.temp.name) / "runtime.sqlite"),
                 "workspace": str(self.workspace), "owner_id": "owner",
                 "app_gh_executable": "app-gh.exe", "app_git_push_executable": "app-git-push.exe",
-                "github_read_token_env": "TOKEN", **overrides}
+                "github_read_token_env": "TOKEN",
+                "project_config_root": str(Path(self.temp.name) / "projects"), **overrides}
 
     def providers(self):
         return [{"key": ANTIGRAVITY_PROVIDER, "type": ANTIGRAVITY_PROVIDER,
-                 "executable": "language_server.exe"},
+                 "executable": "language_server.exe",
+                 "project_config_root": str(Path(self.temp.name) / "projects")},
                 {"key": CLAUDE_CODE_PROVIDER, "type": CLAUDE_CODE_PROVIDER, "executable": CLAUDE_EXE}]
 
     def wired(self, runner=None):
@@ -397,7 +399,8 @@ class ProviderConfigurationTests(unittest.TestCase):
         return {"database_path": str(Path(self.temp.name) / "db.sqlite"),
                 "workspace": str(self.workspace), "owner_id": "owner",
                 "app_gh_executable": "app-gh.exe", "app_git_push_executable": "push.exe",
-                "github_read_token_env": "TOKEN", **overrides}
+                "github_read_token_env": "TOKEN",
+                "project_config_root": str(Path(self.temp.name) / "projects"), **overrides}
 
     def build(self, local):
         api = FakeGitHub()

@@ -14,6 +14,7 @@ import time
 from typing import Callable
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
+from uuid import UUID
 
 from .core import (LaunchDisposition, LaunchRequest, LaunchResult, RuntimeCore,
                    WorkflowSnapshot)
@@ -799,6 +800,94 @@ def _discover_antigravity_agentapi_environment(executable: str) -> dict[str, str
     return {"ANTIGRAVITY_LS_ADDRESS": address, "ANTIGRAVITY_CSRF_TOKEN": csrf_token}
 
 
+def _antigravity_project_workspaces(data) -> set[Path]:
+    """Return every local folder a persisted project is bound to, when readable.
+
+    A project may carry several resources (a multi-root workspace), so the whole
+    resource list is scanned rather than only the first entry.
+    """
+    if not isinstance(data, dict):
+        return set()
+    resources = data.get("projectResources")
+    if not isinstance(resources, dict):
+        return set()
+    resources = resources.get("resources")
+    if not isinstance(resources, list):
+        return set()
+    folders = set()
+    for resource in resources:
+        if not isinstance(resource, dict):
+            continue
+        git_folder = resource.get("gitFolder")
+        uri = git_folder.get("folderUri") if isinstance(git_folder, dict) else None
+        uri = uri or resource.get("folderUri")
+        if not isinstance(uri, str) or not uri:
+            continue
+        parsed = urlparse(uri)
+        if parsed.scheme != "file":
+            continue
+        raw_path = unquote(parsed.path, encoding="utf-8")
+        if parsed.netloc and parsed.netloc not in {"", "localhost"}:
+            raw_path = f"//{parsed.netloc}{raw_path}"
+        # A Windows file URI spells the drive as ``/C:/...``, which is not a path on POSIX.
+        if os.name == "nt" and re.fullmatch(r"/[A-Za-z]:", raw_path[:3]):
+            raw_path = raw_path[1:]
+        try:
+            folders.add(Path(raw_path).resolve())
+        except (OSError, ValueError):
+            continue
+    return folders
+
+
+def ensure_antigravity_project(workspace: str | Path, project_config_root: str | Path) -> str:
+    """Return the AntiGravity project ID bound to workspace, registering it when absent.
+
+    AntiGravity's AgentAPI requires a project ID but has no project-creation command. Both
+    the App and the CLI persist projects as ``<id>.json`` under the project config root, so
+    the same store contract is used here and shared by the Reviewer and Implementer.
+    """
+    target = Path(workspace).expanduser().resolve()
+    root = Path(project_config_root).expanduser()
+    root.mkdir(parents=True, exist_ok=True)
+
+    for path in sorted(root.glob("*.json")):
+        try:
+            current = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if target not in _antigravity_project_workspaces(current):
+            continue
+        project_id = current.get("id") if isinstance(current, dict) else None
+        if isinstance(project_id, str) and project_id:
+            return project_id
+
+    project_id = str(UUID(bytes=hashlib.sha256(str(target).encode()).digest()[:16], version=4))
+    config_path = root / f"{project_id}.json"
+    expected = {
+        "id": project_id,
+        "name": target.name or str(target),
+        "projectResources": {
+            "resources": [
+                {"gitFolder": {"folderUri": target.as_uri()}},
+            ],
+        },
+    }
+    if config_path.exists():
+        try:
+            current = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            raise ValueError("Antigravity project config is unreadable") from None
+        if target not in _antigravity_project_workspaces(current):
+            raise ValueError("Antigravity project ID conflicts with another workspace")
+        current_id = current.get("id") if isinstance(current, dict) else None
+        if isinstance(current_id, str) and current_id:
+            return current_id
+        config_path.write_text(json.dumps(expected), encoding="utf-8")
+        return project_id
+    config_path.write_text(json.dumps(expected), encoding="utf-8")
+    return project_id
+
+
 class AntiGravityImplementer(_GuardedProvider):
     def __init__(self, executable: str, workspace: str, app_gh: str, app_git_push: str,
                  runner: Callable = subprocess.run, timeout: int = 60, environ=None, write_guard=None,
@@ -820,27 +909,6 @@ class AntiGravityImplementer(_GuardedProvider):
         if not executable or not workspace or (runtime_context is None and (not app_gh or not app_git_push)):
             raise ValueError("language server, workspace, app-gh, and app-git-push are required")
 
-    def _resolve_project_id(self) -> str | None:
-        if not self.project_config_root or not self.project_config_root.is_dir():
-            return None
-        target = Path(self.workspace).resolve()
-        for p in self.project_config_root.glob("*.json"):
-            try:
-                data = json.loads(p.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            resources = data.get("projectResources", {}).get("resources", [])
-            for res in resources:
-                uri = res.get("gitFolder", {}).get("folderUri") or res.get("folderUri")
-                if uri:
-                    parsed = urlparse(uri)
-                    raw_path = unquote(parsed.path, encoding="utf-8")
-                    if len(raw_path) > 2 and raw_path[0] == "/" and raw_path[2] == ":":
-                        raw_path = raw_path[1:]
-                    if Path(raw_path).resolve() == target:
-                        return data.get("id")
-        return None
-
     def launch(self, request):
         env = dict(self.environ)
         for key in list(env):
@@ -854,15 +922,16 @@ class AntiGravityImplementer(_GuardedProvider):
             if context is None:
                 return LaunchResult(LaunchDisposition.DEFINITELY_NOT_STARTED)
             env.update(context)
-        project_id = self._resolve_project_id()
-        if project_id:
-            env["ANTIGRAVITY_PROJECT_ID"] = project_id
-        else:
-            env.pop("ANTIGRAVITY_PROJECT_ID", None)
         try:
             guard, app_gh_command = self._guarded_environment(request, env)
         except Exception:
             # A missing/failed guard proves the external AgentAPI command was never invoked.
+            return LaunchResult(LaunchDisposition.DEFINITELY_NOT_STARTED)
+        try:
+            env["ANTIGRAVITY_PROJECT_ID"] = ensure_antigravity_project(
+                self.workspace, self.project_config_root)
+        except (OSError, ValueError):
+            # Project registration failed before AgentAPI was invoked.
             return LaunchResult(LaunchDisposition.DEFINITELY_NOT_STARTED)
         request = __import__("dataclasses").replace(request, completion_command=guard.completion_command)
         prompt = generic_prompt(request, self.workspace, self._policy, app_gh_command, guard.git_push_command)

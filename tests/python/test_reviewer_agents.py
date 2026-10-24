@@ -8,8 +8,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from vccp_runtime.adapters import ensure_antigravity_project
 from vccp_runtime.github_app import GitHubHTTPError
-from vccp_runtime.reviewer_agents import ClaudeAgentSDKReviewer, ReviewerTaskError, _decision
+from vccp_runtime.reviewer_agents import (AntigravityReviewer, ClaudeAgentSDKReviewer,
+                                          ReviewerTaskError, _decision)
 
 
 SHA = "a" * 40
@@ -131,6 +133,21 @@ class ReviewerAgentTests(unittest.TestCase):
         head = git(source, "rev-parse", "HEAD")
         git(source, "push", "origin", "HEAD:refs/pull/12/head")
         return source, head
+
+    def test_antigravity_reviewer_uses_shared_project_registration(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            projects = root / "projects"
+            provider = AntigravityReviewer("language_server", FakeAPI(), MANIFEST,
+                                           str(workspace), str(root / "reviews"),
+                                           project_config_root=projects)
+
+            project_id = provider._project(workspace)
+
+            self.assertEqual(project_id, ensure_antigravity_project(workspace, projects))
+            self.assertTrue((projects / f"{project_id}.json").is_file())
 
     def test_sdk_review_returns_sdk_session_and_structured_decision_synchronously(self):
         with tempfile.TemporaryDirectory() as temp:
