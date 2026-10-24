@@ -362,6 +362,7 @@ class _Store:
                     previous_execution_id TEXT,
                     previous_started_at REAL NOT NULL,
                     previous_outcome TEXT,
+                    execution_ended_confirmed_at REAL,
                     consumed_at REAL
                 );
                 CREATE TABLE IF NOT EXISTS repair_continuations (
@@ -468,6 +469,10 @@ class _Store:
                 connection.execute("ALTER TABLE repair_continuations ADD COLUMN consumed_at REAL")
             if "legacy_maintenance_override" not in continuation_columns:
                 connection.execute("ALTER TABLE repair_continuations ADD COLUMN legacy_maintenance_override TEXT")
+            retry_columns = {row[1] for row in connection.execute("PRAGMA table_info(reviewer_retry_authorizations)")}
+            if "execution_ended_confirmed_at" not in retry_columns:
+                connection.execute("ALTER TABLE reviewer_retry_authorizations "
+                                   "ADD COLUMN execution_ended_confirmed_at REAL")
             notice_columns = {row[1] for row in connection.execute("PRAGMA table_info(terminal_notices)")}
             for name, declaration in (("summary", "TEXT"), ("pr_number", "INTEGER"),
                                       ("attempts", "INTEGER NOT NULL DEFAULT 0"),
@@ -1564,8 +1569,15 @@ class _Store:
     def authorize_reviewer_retry(self, repo: str, pr_number: int, head_sha: str,
                                  provider: str, authorization_head_sha: str,
                                  authorized_by: str, now: float | None = None,
-                                 failed_execution_id: str | None = None):
-        """Append explicit authorization and atomically arm one FAILED exact-head retry."""
+                                 failed_execution_id: str | None = None,
+                                 execution_ended_confirmed_at: float | None = None):
+        """Append explicit authorization and atomically arm one FAILED exact-head retry.
+
+        ``execution_ended_confirmed_at`` records the moment the operator attested that
+        the failed execution named by ``failed_execution_id`` has ended. It is only set
+        when the persisted outcome cannot itself prove that, so the attestation stays
+        auditable per execution instead of becoming a blanket trust in unknown outcomes.
+        """
         normalized_head = head_sha.casefold() if isinstance(head_sha, str) else ""
         normalized_authorization = (authorization_head_sha.casefold()
                                     if isinstance(authorization_head_sha, str) else "")
@@ -1596,11 +1608,12 @@ class _Store:
             connection.execute(
                 "INSERT INTO reviewer_retry_authorizations"
                 "(repo,pr_number,head_sha,authorized_by,authorization_head_sha,authorized_at,"
-                "previous_state,previous_execution_id,previous_started_at,previous_outcome) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "previous_state,previous_execution_id,previous_started_at,previous_outcome,"
+                "execution_ended_confirmed_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (_repo_key(repo), pr_number, normalized_head, authorized_by.strip(),
                  normalized_authorization, timestamp, row["state"], row["execution_id"],
-                 row["started_at"], row["outcome"]),
+                 row["started_at"], row["outcome"], execution_ended_confirmed_at),
             )
             connection.commit()
             return True
@@ -1652,6 +1665,16 @@ class _Store:
             raise
         finally:
             connection.close()
+
+    def pending_reviewer_retry_authorization(self, repo: str, pr_number: int, head_sha: str):
+        """Latest unconsumed exact-head retry authorization, or None."""
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM reviewer_retry_authorizations WHERE repo=? AND pr_number=? "
+                "AND head_sha=? AND consumed_at IS NULL ORDER BY authorization_id DESC LIMIT 1",
+                (_repo_key(repo), pr_number, head_sha.casefold()),
+            ).fetchone()
+            return dict(row) if row is not None else None
 
     def reviewer_retry_history(self, repo: str, pr_number: int, head_sha: str):
         with closing(self._connect()) as connection:

@@ -712,11 +712,15 @@ class ClaudeAgentSDKReviewer:
         if (failed_outcome.startswith("sdk_execution_state_unknown:")
                 and re.search(r"(?:^|[:\s])stage=claude_agent_sdk_timeout(?:\s|$)", failed_outcome)
                 and re.search(r"(?:^|\s)exception_type=TimeoutError(?:\s|$)", failed_outcome)):
-            # VCCP's own task deadline cancelled the session. The SDK tears a cancelled
-            # session's transport down inside an anyio shield before that deadline surfaces,
-            # so the execution has ended. Older revisions recorded it as unknown.
-            return {"status": "terminal_failed", "execution_id": failed_execution_id,
-                    "state": "failed"}
+            # A VCCP-local task deadline recorded by a revision that still cancelled
+            # through asyncio.wait_for. That cancellation could interrupt the SDK's
+            # shielded teardown at its first await and skip the terminate/kill
+            # escalation, so the outcome string alone does not prove the CLI child was
+            # torn down. Reported as unproven rather than terminal: a retry of this one
+            # execution additionally requires the operator to have ended it and to
+            # attest to that, which the retry gate enforces.
+            return {"status": "unproven_termination", "execution_id": failed_execution_id,
+                    "state": "failed", "exception_type": "ExecutionTerminationUnproven"}
         if failed_outcome.startswith("sdk_not_started:") and failed_execution_id is None:
             return {"status": "none"}
         return {"status": "unobservable", "exception_type": "ExecutionStateUnknown"}

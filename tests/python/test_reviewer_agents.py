@@ -449,9 +449,9 @@ class ReviewerAgentTests(unittest.TestCase):
         self.assertEqual(evidence, {"status": "terminal_failed", "execution_id": "sdk-session",
                                     "state": "failed"})
 
-    def test_retry_session_evidence_recognizes_persisted_vccp_timeout_as_terminal(self):
+    def test_retry_session_evidence_recognizes_new_vccp_timeout_as_terminal(self):
         provider = ClaudeAgentSDKReviewer(None, FakeAPI(), MANIFEST, ".", ".")
-        outcome = ("sdk_execution_state_unknown:stage=claude_agent_sdk_timeout "
+        outcome = ("sdk_terminal_failure:stage=claude_agent_sdk_timeout "
                    "endpoint=none http_status=none exception_type=TimeoutError")
 
         evidence = provider.retry_session_evidence(
@@ -459,6 +459,18 @@ class ReviewerAgentTests(unittest.TestCase):
 
         self.assertEqual(evidence, {"status": "terminal_failed", "execution_id": "sdk-session",
                                     "state": "failed"})
+
+    def test_retry_session_evidence_reports_legacy_vccp_timeout_as_unproven(self):
+        provider = ClaudeAgentSDKReviewer(None, FakeAPI(), MANIFEST, ".", ".")
+        outcome = ("sdk_execution_state_unknown:stage=claude_agent_sdk_timeout "
+                   "endpoint=none http_status=none exception_type=TimeoutError")
+
+        evidence = provider.retry_session_evidence(
+            REPO, 7, 12, SHA, failed_execution_id="sdk-session", failed_outcome=outcome)
+
+        self.assertEqual(evidence, {"status": "unproven_termination",
+                                    "execution_id": "sdk-session", "state": "failed",
+                                    "exception_type": "ExecutionTerminationUnproven"})
 
     def test_retry_session_evidence_keeps_timeouts_from_other_stages_blocked(self):
         provider = ClaudeAgentSDKReviewer(None, FakeAPI(), MANIFEST, ".", ".")

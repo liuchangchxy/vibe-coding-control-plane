@@ -239,8 +239,10 @@ class RuntimeRunnerTests(unittest.TestCase):
             def __enter__(self): events.append("lock"); return self
             def __exit__(self, *_): events.append("release")
         class Reviewer:
-            def retry_failed(self, repo, issue, pr, current_head, authorization_head):
-                events.append(("retry", repo, issue, pr, current_head, authorization_head))
+            def retry_failed(self, repo, issue, pr, current_head, authorization_head,
+                             confirm_execution_ended=False):
+                events.append(("retry", repo, issue, pr, current_head, authorization_head,
+                               confirm_execution_ended))
                 return {"status": "reviewer_running", "execution_id": "claude-session", "head_sha": current_head}
         local = {"database_path": "state.db", "owner_id": "owner", "workspace": ".",
                  "target_repository": "owner/repo", "enrollment": {"authorized_repository": "owner/repo"}}
@@ -259,8 +261,50 @@ class RuntimeRunnerTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertEqual(events, [("identity", "owner/repo", "state.db"), "lock",
-                                  ("retry", "owner/repo", 7, 12, head, head), "release"])
+                                  ("retry", "owner/repo", 7, 12, head, head, False), "release"])
         self.assertEqual(json.loads(output.getvalue())["execution_id"], "claude-session")
+
+    def test_reviewer_retry_cli_forwards_the_execution_ended_attestation(self):
+        head = "a" * 40
+        events = []
+        class Lock:
+            def __init__(self, repo, database): events.append(("identity", repo, database))
+            def __enter__(self): events.append("lock"); return self
+            def __exit__(self, *_): events.append("release")
+        class Reviewer:
+            def retry_failed(self, repo, issue, pr, current_head, authorization_head,
+                             confirm_execution_ended=False):
+                events.append(("retry", repo, issue, pr, current_head, authorization_head,
+                               confirm_execution_ended))
+                return {"status": "reviewer_running", "execution_id": "claude-session", "head_sha": current_head}
+        local = {"database_path": "state.db", "owner_id": "owner", "workspace": ".",
+                 "target_repository": "owner/repo", "enrollment": {"authorized_repository": "owner/repo"}}
+        manifest = {"vccp": {"revision": _checkout_head()}}
+        runtime = type("Runtime", (), {"local_reviewer": Reviewer()})()
+        with patch.object(runner, "_load", side_effect=[manifest, local]), \
+                patch.object(runner, "_runtime_source_revision", return_value=_checkout_head()), \
+                patch.object(runner, "_workspace_repository", return_value="owner/repo"), \
+                patch.object(runner, "RuntimeLock", Lock), \
+                patch.object(runner, "build_runtime", return_value=runtime), \
+                redirect_stdout(StringIO()):
+            result = runner.main(["--manifest", "manifest.yml", "--runtime-config", "runtime.json",
+                                  "--repo", "owner/repo", "--retry-reviewer", "--issue", "7",
+                                  "--pr", "12", "--head-sha", head,
+                                  "--authorize-reviewer-retry-for", head,
+                                  "--confirm-failed-execution-ended"])
+
+        self.assertEqual(result, 0)
+        retries = [event for event in events if isinstance(event, tuple) and event[0] == "retry"]
+        self.assertEqual([retry[-1] for retry in retries], [True])
+
+    def test_execution_ended_attestation_requires_retry_reviewer(self):
+        with patch.object(runner, "_load", side_effect=AssertionError("must reject before loading")), \
+                patch.object(runner, "build_runtime", side_effect=AssertionError("must not build runtime")):
+            with self.assertRaises(SystemExit) as error:
+                runner.main(["--manifest", "manifest.yml", "--runtime-config", "runtime.json",
+                             "--repo", "owner/repo", "--one-cycle",
+                             "--confirm-failed-execution-ended"])
+        self.assertEqual(error.exception.code, 2)
 
     def test_repair_continuation_cli_binds_target_without_stopping_resident_runner(self):
         head = "a" * 40
