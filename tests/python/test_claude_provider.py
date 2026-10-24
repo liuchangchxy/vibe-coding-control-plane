@@ -321,11 +321,13 @@ class ProductionFallbackTests(unittest.TestCase):
         return {"database_path": str(Path(self.temp.name) / "runtime.sqlite"),
                 "workspace": str(self.workspace), "owner_id": "owner",
                 "app_gh_executable": "app-gh.exe", "app_git_push_executable": "app-git-push.exe",
-                "github_read_token_env": "TOKEN", **overrides}
+                "github_read_token_env": "TOKEN",
+                "project_config_root": str(Path(self.temp.name) / "projects"), **overrides}
 
     def providers(self):
         return [{"key": ANTIGRAVITY_PROVIDER, "type": ANTIGRAVITY_PROVIDER,
-                 "executable": "language_server.exe"},
+                 "executable": "language_server.exe",
+                 "project_config_root": str(Path(self.temp.name) / "projects")},
                 {"key": CLAUDE_CODE_PROVIDER, "type": CLAUDE_CODE_PROVIDER, "executable": CLAUDE_EXE}]
 
     def wired(self, runner=None):
@@ -397,7 +399,8 @@ class ProviderConfigurationTests(unittest.TestCase):
         return {"database_path": str(Path(self.temp.name) / "db.sqlite"),
                 "workspace": str(self.workspace), "owner_id": "owner",
                 "app_gh_executable": "app-gh.exe", "app_git_push_executable": "push.exe",
-                "github_read_token_env": "TOKEN", **overrides}
+                "github_read_token_env": "TOKEN",
+                "project_config_root": str(Path(self.temp.name) / "projects"), **overrides}
 
     def build(self, local):
         api = FakeGitHub()
@@ -481,8 +484,14 @@ class ActivationProviderTests(unittest.TestCase):
                                "credential_source": {"type": "windows_dpapi_file",
                                                      "path": str(self.root / "key.dpapi")}}, **overrides}
 
-    def qualify(self, config):
-        with patch("vccp_runtime.activation.DPAPIFileCredentialSource") as source:
+    def qualify(self, config, antigravity_context=None):
+        context = (None if antigravity_context is False else
+                   antigravity_context if antigravity_context is not None else
+                   {"ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:54195",
+                    "ANTIGRAVITY_CSRF_TOKEN": "ephemeral-csrf-token"})
+        with patch("vccp_runtime.activation.DPAPIFileCredentialSource") as source, \
+             patch("vccp_runtime.activation._discover_antigravity_agentapi_environment",
+                   return_value=context):
             source.return_value.load_private_key.return_value = object()
             return qualify_activation(MANIFEST, config, REPO, credential_provider=FakeCredentialProvider(),
                                       api=RepositoryReadAPI(), writer=ReadinessWriter(),
@@ -491,6 +500,13 @@ class ActivationProviderTests(unittest.TestCase):
     def test_legacy_antigravity_only_activation_still_passes(self):
         result = self.qualify(self.config(antigravity_executable=str(self.antigravity_executable)))
         self.assertEqual((result["status"], result["blockers"]), ("ready", []))
+
+    def test_legacy_antigravity_activation_blocks_without_agentapi_context(self):
+        result = self.qualify(self.config(antigravity_executable=str(self.antigravity_executable)),
+                              antigravity_context=False)
+        self.assertEqual(result["status"], "not_ready")
+        self.assertTrue(any("AntiGravity AgentAPI endpoint is not discoverable" in blocker
+                            for blocker in result["blockers"]), result["blockers"])
 
     def test_claude_only_activation_passes_without_antigravity(self):
         result = self.qualify(self.config(providers=[

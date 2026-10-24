@@ -10,7 +10,8 @@ import sys
 import tempfile
 
 from .adapters import (GitHubAPI, GitHubAppWriter, _PROVIDER_ADAPTERS, _configured_providers_for_role,
-                       _make_credential_provider, _workspace_repository, build_runtime)
+                       _discover_antigravity_agentapi_environment, _make_credential_provider,
+                       _workspace_repository, build_runtime)
 from .core import RuntimeConfig
 from .github_app import (DPAPIFileCredentialSource, GitHubAppError,
                          GitHubAppNotInstalled, GitHubAppPermissionError,
@@ -87,6 +88,15 @@ def qualify_activation(manifest: dict, local_config: dict, repo: str, environ=No
             blockers.append(f"{provider_type} provider requires a configured executable")
         elif not Path(executable).expanduser().is_file():
             blockers.append(f"required executable is unavailable: {provider_type}")
+        elif provider_type == "antigravity":
+            # An AntiGravity launch reaches AgentAPI through a CSRF-protected loopback
+            # listener. Without that context a launch can only return UNKNOWN, so it is
+            # machine readiness, not a launch-time surprise.
+            environment = os.environ if environ is None else environ
+            if not (environment.get("ANTIGRAVITY_LS_ADDRESS") and environment.get("ANTIGRAVITY_CSRF_TOKEN")) \
+                    and _discover_antigravity_agentapi_environment(executable) is None:
+                blockers.append("AntiGravity AgentAPI endpoint is not discoverable: "
+                                "start AntiGravity or set ANTIGRAVITY_LS_ADDRESS and ANTIGRAVITY_CSRF_TOKEN")
 
     try:
         reviewer_settings = _configured_providers_for_role(local_config, "reviewer")

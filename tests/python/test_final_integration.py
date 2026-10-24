@@ -159,6 +159,7 @@ class FinalIntegrationAcceptanceTests(unittest.TestCase):
                  "app_gh_executable": "controlled-app-gh.exe",
                  "app_git_push_executable": "controlled-app-git-push.exe",
                  "github_read_token_env": "UNUSED_FAKE_TOKEN",
+                 "project_config_root": str(self.root / "projects"),
                  "recovery_timeout_seconds": 900,
                  "lifecycle_timeouts": {"waiting_ci": 1000, "waiting_review": 1000, "waiting_merge": 1000}}
         return build_runtime(self.manifests[repo], local, api=self.github, writer=self.writer, runner=self.agent)

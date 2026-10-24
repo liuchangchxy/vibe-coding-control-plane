@@ -723,20 +723,8 @@ class AntigravityReviewer:
         raise ValueError("Antigravity AgentAPI endpoint could not be discovered")
 
     def _project(self, workspace):
-        import hashlib
-        from uuid import UUID
-        project_id = str(UUID(bytes=hashlib.sha256(str(workspace).encode()).digest()[:16], version=4))
-        self.project_config_root.mkdir(parents=True, exist_ok=True)
-        file = self.project_config_root / f"{project_id}.json"
-        expected = {"id": project_id, "projectResources": {"resources": [
-            {"gitFolder": {"folderUri": Path(workspace).as_uri()}}]}}
-        if file.exists():
-            try: current = json.loads(file.read_text(encoding="utf-8"))
-            except Exception: raise ValueError("Antigravity Reviewer project config is unreadable") from None
-            if current != expected: raise ValueError("Antigravity Reviewer project ID conflicts with another workspace")
-        else:
-            file.write_text(json.dumps(expected), encoding="utf-8")
-        return project_id
+        from .adapters import ensure_antigravity_project
+        return ensure_antigravity_project(workspace, self.project_config_root)
 
     def launch_review(self, repo, issue, pr, head):
         workspace, prompt = self.task.build(repo, issue, pr, head)

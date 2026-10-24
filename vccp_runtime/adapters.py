@@ -14,6 +14,7 @@ import time
 from typing import Callable
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
+from uuid import UUID
 
 from .core import (LaunchDisposition, LaunchRequest, LaunchResult, RuntimeCore,
                    WorkflowSnapshot)
@@ -759,17 +760,41 @@ class _GuardedProvider:
         return json.dumps({"head": head, "status": status}, sort_keys=True)
 
 
-def _discover_antigravity_agentapi_environment(executable: str) -> dict[str, str] | None:
-    """Find the active macOS Antigravity LS endpoint without persisting its CSRF token."""
-    if sys.platform != "darwin":
-        return None
+_CSRF_FLAG = "--csrf_token"
+
+
+def _flag_value(arguments: list[str], flag: str) -> str | None:
+    """Return the value of ``--flag value`` or ``--flag=value``, else None."""
+    for index, argument in enumerate(arguments):
+        if argument.startswith(f"{flag}="):
+            return argument.partition("=")[2] or None
+        if argument == flag and index + 1 < len(arguments):
+            return arguments[index + 1] or None
+    return None
+
+
+def _csrf_token_from(arguments: list[str]) -> str | None:
+    return _flag_value(arguments, _CSRF_FLAG)
+
+
+def _antigravity_endpoint_is_healthy(address: str) -> bool:
+    try:
+        with urlopen(Request(f"http://{address}/healthz"), timeout=2) as response:
+            health = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return False
+    return getattr(response, "status", 0) == 200 and isinstance(health, dict) \
+        and health.get("status") == "ok"
+
+
+def _darwin_antigravity_candidates(executable: str) -> set[tuple[str, str]]:
     try:
         processes = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True,
                                    text=True, check=False, timeout=5)
     except (OSError, subprocess.TimeoutExpired):
-        return None
+        return set()
     if processes.returncode != 0:
-        return None
+        return set()
 
     contexts = set()
     for line in processes.stdout.splitlines():
@@ -784,14 +809,7 @@ def _discover_antigravity_agentapi_environment(executable: str) -> dict[str, str
         ide_index = arguments.index("--override_ide_name")
         if ide_index + 1 >= len(arguments) or arguments[ide_index + 1] != "antigravity":
             continue
-        csrf_token = None
-        for index, argument in enumerate(arguments):
-            if argument.startswith("--csrf_token="):
-                csrf_token = argument.partition("=")[2]
-                break
-            if argument == "--csrf_token" and index + 1 < len(arguments):
-                csrf_token = arguments[index + 1]
-                break
+        csrf_token = _csrf_token_from(arguments)
         if not csrf_token:
             continue
         try:
@@ -806,20 +824,181 @@ def _discover_antigravity_agentapi_environment(executable: str) -> dict[str, str
         ports = set(re.findall(r"TCP\s+127\.0\.0\.1:(\d+)\s+\(LISTEN\)", listeners.stdout))
         for port in ports:
             address = f"127.0.0.1:{port}"
-            try:
-                with urlopen(Request(f"http://{address}/healthz"), timeout=2) as response:
-                    health = json.loads(response.read().decode("utf-8"))
-            except Exception:
-                continue
-            if getattr(response, "status", 0) == 200 and isinstance(health, dict) \
-                    and health.get("status") == "ok":
+            if _antigravity_endpoint_is_healthy(address):
                 contexts.add((address, csrf_token))
+    return contexts
+
+
+def _windows_antigravity_candidates(executable: str) -> set[tuple[str, str]]:
+    """Find the live Windows AntiGravity LS from its own process command line.
+
+    Windows exposes no ``ps``/``lsof`` pair, so the process table is read through CIM.
+    The command line already carries ``--csrf_token`` and the listening port is held by
+    that same process, so no new configuration is introduced.
+    """
+    script = ("Get-CimInstance Win32_Process -Filter \"Name='language_server.exe'\" | "
+              "Select-Object ProcessId,ExecutablePath,CommandLine | ConvertTo-Json -Compress")
+    try:
+        listing = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                                 capture_output=True, text=True, check=False, timeout=10,
+                                 encoding="oem", errors="replace")
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    if listing.returncode != 0 or not (listing.stdout or "").strip():
+        return set()
+    try:
+        processes = json.loads(listing.stdout)
+    except (TypeError, ValueError):
+        return set()
+    if isinstance(processes, dict):
+        processes = [processes]
+
+    target = str(Path(executable).expanduser().resolve()).casefold() if executable else None
+    contexts = set()
+    for process in processes if isinstance(processes, list) else []:
+        if not isinstance(process, dict):
+            continue
+        command = str(process.get("CommandLine") or "")
+        if "--standalone" not in command or "--override_ide_name" not in command:
+            continue
+        executable_path = process.get("ExecutablePath")
+        if target and isinstance(executable_path, str):
+            if str(Path(executable_path).expanduser().resolve()).casefold() != target:
+                continue
+        arguments = [argument.strip('"') for argument in shlex.split(command, posix=False)]
+        # The same executable also serves other IDE modes; only the AntiGravity
+        # instance answers this AgentAPI, so the flag value matters, not its presence.
+        if _flag_value(arguments, "--override_ide_name") != "antigravity":
+            continue
+        csrf_token = _csrf_token_from(arguments)
+        if not csrf_token:
+            continue
+        pid = process.get("ProcessId")
+        if not isinstance(pid, int):
+            continue
+        try:
+            listeners = subprocess.run(["netstat.exe", "-ano", "-p", "TCP"],
+                                       capture_output=True, text=True, check=False, timeout=10,
+                                       encoding="oem", errors="replace")
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if listeners.returncode != 0:
+            continue
+        for line in (listeners.stdout or "").splitlines():
+            fields = line.split()
+            if len(fields) < 5 or fields[3] != "LISTENING" or fields[4] != str(pid):
+                continue
+            host, _, port = fields[1].rpartition(":")
+            if host not in {"127.0.0.1", "0.0.0.0", "[::1]"} or not port.isdigit():
+                continue
+            address = f"127.0.0.1:{int(port)}"
+            if _antigravity_endpoint_is_healthy(address):
+                contexts.add((address, csrf_token))
+    return contexts
+
+
+def _discover_antigravity_agentapi_environment(executable: str) -> dict[str, str] | None:
+    """Find the active AntiGravity LS endpoint without persisting its CSRF token."""
+    if sys.platform == "darwin":
+        contexts = _darwin_antigravity_candidates(executable)
+    elif sys.platform == "win32":
+        contexts = _windows_antigravity_candidates(executable)
+    else:
+        return None
 
     # Multiple live Antigravity instances are ambiguous; do not choose one by process order.
     if len(contexts) != 1:
         return None
     address, csrf_token = next(iter(contexts))
     return {"ANTIGRAVITY_LS_ADDRESS": address, "ANTIGRAVITY_CSRF_TOKEN": csrf_token}
+
+
+def _antigravity_project_workspaces(data) -> set[Path]:
+    """Return every local folder a persisted project is bound to, when readable.
+
+    A project may carry several resources (a multi-root workspace), so the whole
+    resource list is scanned rather than only the first entry.
+    """
+    if not isinstance(data, dict):
+        return set()
+    resources = data.get("projectResources")
+    if not isinstance(resources, dict):
+        return set()
+    resources = resources.get("resources")
+    if not isinstance(resources, list):
+        return set()
+    folders = set()
+    for resource in resources:
+        if not isinstance(resource, dict):
+            continue
+        git_folder = resource.get("gitFolder")
+        uri = git_folder.get("folderUri") if isinstance(git_folder, dict) else None
+        uri = uri or resource.get("folderUri")
+        if not isinstance(uri, str) or not uri:
+            continue
+        parsed = urlparse(uri)
+        if parsed.scheme != "file":
+            continue
+        raw_path = unquote(parsed.path, encoding="utf-8")
+        if parsed.netloc and parsed.netloc not in {"", "localhost"}:
+            raw_path = f"//{parsed.netloc}{raw_path}"
+        # A Windows file URI spells the drive as ``/C:/...``, which is not a path on POSIX.
+        if os.name == "nt" and re.fullmatch(r"/[A-Za-z]:", raw_path[:3]):
+            raw_path = raw_path[1:]
+        try:
+            folders.add(Path(raw_path).resolve())
+        except (OSError, ValueError):
+            continue
+    return folders
+
+
+def ensure_antigravity_project(workspace: str | Path, project_config_root: str | Path) -> str:
+    """Return the AntiGravity project ID bound to workspace, registering it when absent.
+
+    AntiGravity's AgentAPI requires a project ID but has no project-creation command. Both
+    the App and the CLI persist projects as ``<id>.json`` under the project config root, so
+    the same store contract is used here and shared by the Reviewer and Implementer.
+    """
+    target = Path(workspace).expanduser().resolve()
+    root = Path(project_config_root).expanduser()
+    root.mkdir(parents=True, exist_ok=True)
+
+    for path in sorted(root.glob("*.json")):
+        try:
+            current = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if target not in _antigravity_project_workspaces(current):
+            continue
+        project_id = current.get("id") if isinstance(current, dict) else None
+        if isinstance(project_id, str) and project_id:
+            return project_id
+
+    project_id = str(UUID(bytes=hashlib.sha256(str(target).encode()).digest()[:16], version=4))
+    config_path = root / f"{project_id}.json"
+    expected = {
+        "id": project_id,
+        "name": target.name or str(target),
+        "projectResources": {
+            "resources": [
+                {"gitFolder": {"folderUri": target.as_uri()}},
+            ],
+        },
+    }
+    if config_path.exists():
+        try:
+            current = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            raise ValueError("Antigravity project config is unreadable") from None
+        if target not in _antigravity_project_workspaces(current):
+            raise ValueError("Antigravity project ID conflicts with another workspace")
+        current_id = current.get("id") if isinstance(current, dict) else None
+        if isinstance(current_id, str) and current_id:
+            return current_id
+        config_path.write_text(json.dumps(expected), encoding="utf-8")
+        return project_id
+    config_path.write_text(json.dumps(expected), encoding="utf-8")
+    return project_id
 
 
 class AntiGravityImplementer(_GuardedProvider):
@@ -843,27 +1022,6 @@ class AntiGravityImplementer(_GuardedProvider):
         if not executable or not workspace or (runtime_context is None and (not app_gh or not app_git_push)):
             raise ValueError("language server, workspace, app-gh, and app-git-push are required")
 
-    def _resolve_project_id(self) -> str | None:
-        if not self.project_config_root or not self.project_config_root.is_dir():
-            return None
-        target = Path(self.workspace).resolve()
-        for p in self.project_config_root.glob("*.json"):
-            try:
-                data = json.loads(p.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            resources = data.get("projectResources", {}).get("resources", [])
-            for res in resources:
-                uri = res.get("gitFolder", {}).get("folderUri") or res.get("folderUri")
-                if uri:
-                    parsed = urlparse(uri)
-                    raw_path = unquote(parsed.path, encoding="utf-8")
-                    if len(raw_path) > 2 and raw_path[0] == "/" and raw_path[2] == ":":
-                        raw_path = raw_path[1:]
-                    if Path(raw_path).resolve() == target:
-                        return data.get("id")
-        return None
-
     def launch(self, request):
         env = dict(self.environ)
         for key in list(env):
@@ -871,21 +1029,22 @@ class AntiGravityImplementer(_GuardedProvider):
                 env.pop(key)
         for key in ("ANTIGRAVITY_CONVERSATION_ID", "ANTIGRAVITY_SOURCE_METADATA", "ANTIGRAVITY_TRAJECTORY_ID"):
             env.pop(key, None)
-        if (sys.platform == "darwin" and Path(self.executable).is_file()
+        if (sys.platform in {"darwin", "win32"} and Path(self.executable).is_file()
                 and (not env.get("ANTIGRAVITY_LS_ADDRESS") or not env.get("ANTIGRAVITY_CSRF_TOKEN"))):
             context = _discover_antigravity_agentapi_environment(self.executable)
             if context is None:
                 return LaunchResult(LaunchDisposition.DEFINITELY_NOT_STARTED)
             env.update(context)
-        project_id = self._resolve_project_id()
-        if project_id:
-            env["ANTIGRAVITY_PROJECT_ID"] = project_id
-        else:
-            env.pop("ANTIGRAVITY_PROJECT_ID", None)
         try:
             guard, app_gh_command = self._guarded_environment(request, env)
         except Exception:
             # A missing/failed guard proves the external AgentAPI command was never invoked.
+            return LaunchResult(LaunchDisposition.DEFINITELY_NOT_STARTED)
+        try:
+            env["ANTIGRAVITY_PROJECT_ID"] = ensure_antigravity_project(
+                self.workspace, self.project_config_root)
+        except (OSError, ValueError):
+            # Project registration failed before AgentAPI was invoked.
             return LaunchResult(LaunchDisposition.DEFINITELY_NOT_STARTED)
         request = __import__("dataclasses").replace(request, completion_command=guard.completion_command,
                                                  evidence_command=guard.evidence_command)

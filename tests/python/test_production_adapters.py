@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from vccp_runtime.adapters import (AntiGravityImplementer, GitHubAPI, GitHubAppWriter, GitHubWorkflowAdapter,
-                                   WorkspaceWriteGuard, build_runtime, generic_prompt)
+                                   WorkspaceWriteGuard, build_runtime, ensure_antigravity_project, generic_prompt)
 from vccp_runtime.core import LaunchDisposition, LaunchRequest, RepairCandidate, RuntimeCore
 from vccp_runtime.lifecycle import LifecycleDriver
 from vccp_runtime import runner as runtime_runner
@@ -490,7 +490,8 @@ class AdapterTests(unittest.TestCase):
             adapter = AntiGravityImplementer("language_server.exe", str(workspace), "app-gh", "app-git-push",
                                              environ={"GH_TOKEN": "secret", "GITHUB_APP_TOKEN": "app-secret",
                                                       "KEEP": "yes"},
-                                             write_guard=RecordingGuard())
+                                             write_guard=RecordingGuard(),
+                                             project_config_root=Path(temp) / "projects")
             req = LaunchRequest("o/r", 1, "attempt", "initial_dispatch")
             response = SimpleNamespace(returncode=0, stdout=json.dumps({"response": {
                 "newConversation": {"conversationId": CONVERSATION_ID}}}))
@@ -541,7 +542,8 @@ class AdapterTests(unittest.TestCase):
                        "ANTIGRAVITY_CSRF_TOKEN": "ephemeral-csrf-token"}
             adapter = AntiGravityImplementer(str(executable), str(workspace), "app-gh", "app-git-push",
                                              runner=lambda args, **kw: (calls.append((args, kw)), response)[1],
-                                             environ={"HOME": "/Users/test"})
+                                             environ={"HOME": "/Users/test"},
+                                             project_config_root=Path(temp) / "projects")
             with mock.patch("vccp_runtime.adapters.sys.platform", "darwin"), \
                  mock.patch("vccp_runtime.adapters._discover_antigravity_agentapi_environment",
                             return_value=context) as discover:
@@ -587,6 +589,180 @@ class AdapterTests(unittest.TestCase):
                                   "ANTIGRAVITY_CSRF_TOKEN": "ephemeral-csrf-token"})
         self.assertEqual(len(commands), 2)
         self.assertIn("http://127.0.0.1:54195/healthz", open_url.call_args.args[0].full_url)
+
+    def _windows_discovery(self, processes, connections, healthy_ports=(), executable=None):
+        """Drive _discover_antigravity_agentapi_environment through the Windows process table."""
+        from vccp_runtime.adapters import _discover_antigravity_agentapi_environment
+
+        executable = executable or r"C:\Program Files\Antigravity\resources\bin\language_server.exe"
+        commands = []
+
+        def fake_run(args, **kwargs):
+            commands.append(args)
+            if args[0] == "powershell.exe":
+                return SimpleNamespace(returncode=0, stdout=json.dumps(processes))
+            if args[0] == "netstat.exe":
+                return SimpleNamespace(returncode=0, stdout="\n".join(connections))
+            self.fail(f"unexpected command: {args}")
+
+        def fake_urlopen(request, timeout=0):
+            port = int(request.full_url.rsplit(":", 1)[1].split("/")[0])
+            if port not in healthy_ports:
+                raise OSError("connection refused")
+            class Healthy:
+                status = 200
+                def __enter__(self): return self
+                def __exit__(self, *_): return False
+                def read(self): return b'{"status":"ok"}'
+            return Healthy()
+
+        with mock.patch("vccp_runtime.adapters.sys.platform", "win32"), \
+             mock.patch("vccp_runtime.adapters.subprocess.run", side_effect=fake_run), \
+             mock.patch("vccp_runtime.adapters.urlopen", side_effect=fake_urlopen):
+            return _discover_antigravity_agentapi_environment(executable), commands, executable
+
+    def test_windows_discovery_finds_the_running_language_server(self):
+        executable = r"C:\Program Files\Antigravity\resources\bin\language_server.exe"
+        result, commands, _ = self._windows_discovery(
+            processes=[{
+                "ProcessId": 22328,
+                "ExecutablePath": executable,
+                "CommandLine": f'"{executable}" --standalone --override_ide_name antigravity '
+                               f'--https_server_port 0 --csrf_token ephemeral-csrf-token',
+            }],
+            connections=[
+                "  TCP    127.0.0.1:7894         0.0.0.0:0              LISTENING       22328",
+                "  TCP    127.0.0.1:7895         0.0.0.0:0              LISTENING       22328",
+                "  TCP    127.0.0.1:7895         127.0.0.1:50123        ESTABLISHED     99999",
+            ],
+            healthy_ports={7895},
+        )
+
+        self.assertEqual(result, {"ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:7895",
+                                  "ANTIGRAVITY_CSRF_TOKEN": "ephemeral-csrf-token"})
+        # Only the CIM query and one netstat pass are issued; no ps/lsof on Windows.
+        self.assertEqual([command[0] for command in commands], ["powershell.exe", "netstat.exe"])
+
+    def test_windows_discovery_ignores_other_processes_and_unhealthy_ports(self):
+        executable = r"C:\Program Files\Antigravity\resources\bin\language_server.exe"
+        result, _, _ = self._windows_discovery(
+            processes=[{
+                "ProcessId": 4310,
+                "ExecutablePath": r"C:\Other\language_server.exe",
+                "CommandLine": r'"C:\Other\language_server.exe" --standalone --override_ide_name antigravity '
+                               r"--csrf_token other-token",
+            }, {
+                "ProcessId": 22328,
+                "ExecutablePath": executable,
+                "CommandLine": f'"{executable}" --standalone --override_ide_name antigravity '
+                               f"--csrf_token ephemeral-csrf-token",
+            }],
+            connections=["  TCP    127.0.0.1:7895         0.0.0.0:0              LISTENING       22328"],
+            healthy_ports=set(),
+        )
+
+        self.assertIsNone(result)
+
+    def test_windows_discovery_ignores_other_ide_modes_of_the_same_executable(self):
+        executable = r"C:\Program Files\Antigravity\resources\bin\language_server.exe"
+        result, _, _ = self._windows_discovery(
+            processes=[{
+                "ProcessId": 9001,
+                "ExecutablePath": executable,
+                "CommandLine": f'"{executable}" --standalone --override_ide_name some_other_ide '
+                               f'--csrf_token other-token',
+            }],
+            connections=["  TCP    127.0.0.1:7895         0.0.0.0:0              LISTENING       9001"],
+            healthy_ports={7895},
+        )
+
+        self.assertIsNone(result)
+
+    def test_windows_discovery_reports_ambiguity_instead_of_guessing(self):
+        executable = r"C:\Program Files\Antigravity\resources\bin\language_server.exe"
+
+        def process(pid, token):
+            return {"ProcessId": pid, "ExecutablePath": executable,
+                    "CommandLine": f'"{executable}" --standalone --override_ide_name antigravity '
+                                   f"--csrf_token {token}"}
+
+        result, _, _ = self._windows_discovery(
+            processes=[process(100, "token-a"), process(200, "token-b")],
+            connections=[
+                "  TCP    127.0.0.1:7895         0.0.0.0:0              LISTENING       100",
+                "  TCP    127.0.0.1:7896         0.0.0.0:0              LISTENING       200",
+            ],
+            healthy_ports={7895, 7896},
+        )
+
+        self.assertIsNone(result)
+
+    def test_antigravity_launch_discovers_context_on_windows(self):
+        with tempfile.TemporaryDirectory() as temp:
+            executable = Path(temp) / "language_server.exe"
+            executable.touch()
+            workspace = init_git_repo(Path(temp) / "repo")
+            calls = []
+            response = SimpleNamespace(returncode=0, stdout=json.dumps({"conversation_id": CONVERSATION_ID}))
+            context = {"ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:7895",
+                       "ANTIGRAVITY_CSRF_TOKEN": "ephemeral-csrf-token"}
+            adapter = AntiGravityImplementer(str(executable), str(workspace), "app-gh", "app-git-push",
+                                             runner=lambda args, **kw: (calls.append((args, kw)), response)[1],
+                                             environ={"USERPROFILE": temp},
+                                             project_config_root=Path(temp) / "projects")
+            with mock.patch("vccp_runtime.adapters.sys.platform", "win32"), \
+                 mock.patch("vccp_runtime.adapters._discover_antigravity_agentapi_environment",
+                            return_value=context) as discover:
+                result = adapter.launch(LaunchRequest("o/r", 1, "attempt-win", "initial_dispatch"))
+
+            self.assertEqual(result.disposition, LaunchDisposition.CONFIRMED)
+            discover.assert_called_once_with(str(executable))
+            child_env = calls[0][1]["env"]
+            self.assertEqual(child_env["ANTIGRAVITY_LS_ADDRESS"], context["ANTIGRAVITY_LS_ADDRESS"])
+            self.assertEqual(child_env["ANTIGRAVITY_CSRF_TOKEN"], context["ANTIGRAVITY_CSRF_TOKEN"])
+
+    def test_antigravity_launch_prefers_explicit_environment_over_discovery(self):
+        with tempfile.TemporaryDirectory() as temp:
+            executable = Path(temp) / "language_server.exe"
+            executable.touch()
+            workspace = init_git_repo(Path(temp) / "repo")
+            calls = []
+            response = SimpleNamespace(returncode=0, stdout=json.dumps({"conversation_id": CONVERSATION_ID}))
+            explicit = {"ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:60001",
+                        "ANTIGRAVITY_CSRF_TOKEN": "explicit-token"}
+            for platform in ("darwin", "win32"):
+                adapter = AntiGravityImplementer(str(executable), str(workspace), "app-gh", "app-git-push",
+                                                 runner=lambda args, **kw: (calls.append((args, kw)), response)[1],
+                                                 environ=dict(explicit),
+                                                 project_config_root=Path(temp) / "projects")
+                with mock.patch("vccp_runtime.adapters.sys.platform", platform), \
+                     mock.patch("vccp_runtime.adapters._discover_antigravity_agentapi_environment") as discover:
+                    result = adapter.launch(LaunchRequest("o/r", 1, f"attempt-explicit-{platform}",
+                                                          "initial_dispatch"))
+                self.assertEqual(result.disposition, LaunchDisposition.CONFIRMED)
+                discover.assert_not_called()
+
+            child_env = calls[0][1]["env"]
+            self.assertEqual(child_env["ANTIGRAVITY_LS_ADDRESS"], explicit["ANTIGRAVITY_LS_ADDRESS"])
+            self.assertEqual(child_env["ANTIGRAVITY_CSRF_TOKEN"], explicit["ANTIGRAVITY_CSRF_TOKEN"])
+
+    def test_antigravity_launch_never_invokes_agentapi_without_discoverable_context_on_windows(self):
+        with tempfile.TemporaryDirectory() as temp:
+            executable = Path(temp) / "language_server.exe"
+            executable.touch()
+            workspace = init_git_repo(Path(temp) / "repo")
+            calls = []
+            adapter = AntiGravityImplementer(str(executable), str(workspace), "app-gh", "app-git-push",
+                                             runner=lambda *a, **kw: calls.append(a),
+                                             environ={"USERPROFILE": temp},
+                                             project_config_root=Path(temp) / "projects")
+            with mock.patch("vccp_runtime.adapters.sys.platform", "win32"), \
+                 mock.patch("vccp_runtime.adapters._discover_antigravity_agentapi_environment",
+                            return_value=None):
+                result = adapter.launch(LaunchRequest("o/r", 1, "attempt-win-missing", "initial_dispatch"))
+
+            self.assertEqual(result.disposition, LaunchDisposition.DEFINITELY_NOT_STARTED)
+            self.assertEqual(calls, [])
 
     def test_guard_failure_prevents_agentapi_invocation(self):
         calls = []
@@ -668,7 +844,7 @@ class AdapterTests(unittest.TestCase):
             self.assertNotIn("ANTIGRAVITY_SOURCE_METADATA", env_b)
             self.assertNotIn("ANTIGRAVITY_TRAJECTORY_ID", env_b)
 
-            # Case 3: Unregistered Consumer C -> Must strip ANTIGRAVITY_PROJECT_ID, NOT leak parent VCCP ID
+            # Case 3: Unregistered Consumer C -> registers a fresh project, never reuses the parent VCCP ID
             recorded_calls.clear()
             adapter_c = AntiGravityImplementer(
                 "language_server.exe", str(ws_c), "app-gh", "app-git-push",
@@ -680,10 +856,103 @@ class AdapterTests(unittest.TestCase):
             self.assertEqual(res_c.disposition, LaunchDisposition.CONFIRMED)
             self.assertEqual(recorded_calls[0][1]["cwd"], str(ws_c))
             env_c = recorded_calls[0][1]["env"]
-            self.assertNotIn("ANTIGRAVITY_PROJECT_ID", env_c)
+            project_id_c = env_c.get("ANTIGRAVITY_PROJECT_ID")
+            self.assertIsInstance(project_id_c, str)
+            self.assertTrue(project_id_c)
+            self.assertNotEqual(project_id_c, parent_env["ANTIGRAVITY_PROJECT_ID"])
+            registered_c = json.loads((projects_dir / f"{project_id_c}.json").read_text(encoding="utf-8"))
+            self.assertEqual(registered_c["projectResources"]["resources"][0]["gitFolder"]["folderUri"],
+                             Path(ws_c).resolve().as_uri())
             self.assertNotIn("ANTIGRAVITY_CONVERSATION_ID", env_c)
             self.assertNotIn("ANTIGRAVITY_SOURCE_METADATA", env_c)
             self.assertNotIn("ANTIGRAVITY_TRAJECTORY_ID", env_c)
+
+    def test_antigravity_project_registration_creates_and_reuses(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = init_git_repo(Path(temp) / "consumer")
+            projects = Path(temp) / "projects"
+            project_id = ensure_antigravity_project(workspace, projects)
+            config = projects / f"{project_id}.json"
+            self.assertTrue(config.is_file())
+            registered = json.loads(config.read_text(encoding="utf-8"))
+            self.assertEqual(registered["id"], project_id)
+            self.assertEqual(registered["name"], "consumer")
+            self.assertEqual(registered["projectResources"]["resources"][0]["gitFolder"]["folderUri"],
+                             workspace.resolve().as_uri())
+
+            self.assertEqual(ensure_antigravity_project(str(workspace), projects), project_id)
+            self.assertEqual(json.loads(config.read_text(encoding="utf-8")), registered)
+            self.assertEqual(len(list(projects.glob("*.json"))), 1)
+
+    def test_antigravity_project_registration_reuses_matching_existing_project(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = init_git_repo(Path(temp) / "consumer")
+            projects = Path(temp) / "projects"
+            projects.mkdir()
+            existing = projects / "existing.json"
+            existing.write_text(json.dumps({
+                "id": "existing-project",
+                "name": "consumer",
+                "projectResources": {"resources": [
+                    {"gitFolder": {"folderUri": workspace.resolve().as_uri()}}]},
+            }), encoding="utf-8")
+
+            self.assertEqual(ensure_antigravity_project(workspace, projects), "existing-project")
+            self.assertEqual(list(projects.glob("*.json")), [existing])
+
+    def test_antigravity_project_registration_reuses_project_matching_a_later_resource(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = init_git_repo(Path(temp) / "consumer")
+            sibling = Path(temp) / "sibling"
+            sibling.mkdir()
+            projects = Path(temp) / "projects"
+            projects.mkdir()
+            multi_root = projects / "multi-root.json"
+            multi_root.write_text(json.dumps({
+                "id": "multi-root-project",
+                "name": "multi-root",
+                "projectResources": {"resources": [
+                    {"gitFolder": {"folderUri": sibling.resolve().as_uri()}},
+                    {"gitFolder": {"folderUri": workspace.resolve().as_uri()}}]},
+            }), encoding="utf-8")
+
+            self.assertEqual(ensure_antigravity_project(workspace, projects), "multi-root-project")
+            self.assertEqual(list(projects.glob("*.json")), [multi_root])
+
+    def test_antigravity_project_registration_reuses_uri_written_with_localhost_host(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = init_git_repo(Path(temp) / "consumer")
+            projects = Path(temp) / "projects"
+            projects.mkdir()
+            localhost = projects / "localhost.json"
+            localhost.write_text(json.dumps({
+                "id": "localhost-project",
+                "name": "consumer",
+                "projectResources": {"resources": [
+                    {"gitFolder": {"folderUri": workspace.resolve().as_uri().replace("file://", "file://localhost")}}]},
+            }), encoding="utf-8")
+
+            self.assertEqual(ensure_antigravity_project(workspace, projects), "localhost-project")
+            self.assertEqual(list(projects.glob("*.json")), [localhost])
+
+    def test_antigravity_project_registration_conflict_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace_a = init_git_repo(Path(temp) / "consumer_a")
+            workspace_b = init_git_repo(Path(temp) / "consumer_b")
+            projects = Path(temp) / "projects"
+            project_id = ensure_antigravity_project(workspace_b, projects)
+            config = projects / f"{project_id}.json"
+            conflicting = {
+                "id": project_id,
+                "name": "consumer_a",
+                "projectResources": {"resources": [
+                    {"gitFolder": {"folderUri": workspace_a.resolve().as_uri()}}]},
+            }
+            config.write_text(json.dumps(conflicting), encoding="utf-8")
+
+            with self.assertRaises(ValueError):
+                ensure_antigravity_project(workspace_b, projects)
+            self.assertEqual(json.loads(config.read_text(encoding="utf-8")), conflicting)
 
     def test_workspace_guard_blocks_direct_push_without_tracked_changes(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -776,7 +1045,8 @@ class AdapterTests(unittest.TestCase):
                 return SimpleNamespace(returncode=0, stdout=json.dumps({"conversation_id": CONVERSATION_ID}))
             local = {"database_path": str(Path(temp)/"db.sqlite"), "workspace": str(workspace), "owner_id": "owner",
                      "antigravity_executable": "language_server.exe", "app_gh_executable": "app-gh.exe",
-                     "app_git_push_executable": "app-git-push.exe", "github_read_token_env": "TOKEN"}
+                     "app_git_push_executable": "app-git-push.exe", "github_read_token_env": "TOKEN",
+                     "project_config_root": str(Path(temp) / "projects")}
             wired = build_runtime(MANIFEST, local, api=api, writer=MutatingWriter(api), runner=runner)
             self.assertIsInstance(wired.lifecycle, LifecycleDriver)
             result = wired.core.dispatch_initial("o/r", 1, "owner")
@@ -832,7 +1102,8 @@ class AdapterTests(unittest.TestCase):
             local = {"database_path": str(Path(temp) / "runtime.sqlite"), "workspace": str(workspace),
                      "owner_id": "owner", "antigravity_executable": "language_server.exe",
                      "github_app": {"app_id": "123456", "credential_source": {
-                         "type": "windows_dpapi_file", "path": str(Path(temp) / "key.dpapi")}}}
+                         "type": "windows_dpapi_file", "path": str(Path(temp) / "key.dpapi")}},
+                     "project_config_root": str(Path(temp) / "projects")}
             provider = Provider()
             launches = []
             def agent_runner(args, **kwargs):
@@ -892,7 +1163,8 @@ class AdapterTests(unittest.TestCase):
             local = {"database_path": str(Path(temp) / "runtime.sqlite"), "workspace": str(workspace),
                      "owner_id": "worker", "antigravity_executable": "language_server.exe",
                      "github_app": {"app_id": "123456", "credential_source": {
-                         "type": "windows_dpapi_file", "path": str(Path(temp) / "key.dpapi")}}}
+                         "type": "windows_dpapi_file", "path": str(Path(temp) / "key.dpapi")}},
+                     "project_config_root": str(Path(temp) / "projects")}
             runtime = build_runtime(MANIFEST, local, api=api, writer=ClosingWriter(api),
                                     runner=agent_runner, credential_provider=Provider(), push_backend=PushBackend())
             result = runtime.core.dispatch_initial("o/r", 1, "worker")
@@ -944,7 +1216,8 @@ class AdapterTests(unittest.TestCase):
             local = {"database_path": str(Path(temp) / "runtime.sqlite"), "workspace": str(workspace),
                      "owner_id": "worker", "antigravity_executable": "language_server.exe",
                      "github_app": {"app_id": "123456", "credential_source": {
-                         "type": "windows_dpapi_file", "path": str(Path(temp) / "key.dpapi")}}}
+                         "type": "windows_dpapi_file", "path": str(Path(temp) / "key.dpapi")}},
+                     "project_config_root": str(Path(temp) / "projects")}
             runtime = build_runtime(MANIFEST, local, api=api, writer=MutatingWriter(api),
                                     runner=agent_runner, credential_provider=Provider(), push_backend=object())
             result = runtime.core.dispatch_initial("o/r", 1, "worker")
@@ -987,7 +1260,8 @@ class AdapterTests(unittest.TestCase):
                 launches.append(args[-1]); return SimpleNamespace(returncode=0, stdout=json.dumps({"conversation_id": CONVERSATION_ID}))
             local = {"database_path": str(Path(temp)/"db.sqlite"), "workspace": str(workspace), "owner_id": "owner",
                      "antigravity_executable": "language_server.exe", "app_gh_executable": "app-gh.exe",
-                     "app_git_push_executable": "app-git-push.exe", "github_read_token_env": "TOKEN"}
+                     "app_git_push_executable": "app-git-push.exe", "github_read_token_env": "TOKEN",
+                     "project_config_root": str(Path(temp) / "projects")}
             wired = build_runtime(MANIFEST, local, api, MutatingWriter(api), runner)
             self.assertEqual(wired.core.dispatch_initial("o/r", 1, "owner")["status"], "launched")
             api.issue["labels"] = [{"name": x} for x in ("changes-requested", "frozen-spec")]
@@ -1031,7 +1305,8 @@ class AdapterTests(unittest.TestCase):
                      "owner_id": "owner", "antigravity_executable": "language_server.exe",
                      "app_gh_executable": "controlled-app-gh.exe",
                      "app_git_push_executable": "controlled-app-git-push.exe",
-                     "github_read_token_env": "TOKEN"}
+                     "github_read_token_env": "TOKEN",
+                     "project_config_root": str(Path(temp) / "projects")}
             runtime = build_runtime(MANIFEST, local, api=api, runner=commands)
             initial = runtime.core.dispatch_initial("o/r", 1, "owner")
             self.assertEqual(initial["status"], "launched")
