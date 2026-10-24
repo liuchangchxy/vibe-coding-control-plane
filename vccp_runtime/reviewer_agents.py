@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -16,13 +17,44 @@ from .runtime_checkout import _SHA
 from .evidence import evaluate_runtime_evidence, parse_runtime_evidence, render_evidence_section
 
 # Each subprocess stays bounded; only confirmed max-turn terminal sessions resume.
-# Three calls maximum and the persisted 20-minute task deadline bound total work.
+# Three calls maximum and the persisted task deadline bound total work.
 MAX_REVIEWER_TURNS = 30
 MAX_REVIEWER_RESUMES = 2
 # The CLI reports turnCount=31 at a maxTurns=30 boundary. Budget two truncated
 # calls at 31 turns each, followed by one successful call of at most 30 turns.
 MAX_REVIEWER_TASK_TURNS = (MAX_REVIEWER_TURNS + 1) * MAX_REVIEWER_RESUMES + MAX_REVIEWER_TURNS
+# A whole Reviewer task is bounded in wall-clock time, never unbounded. The default is
+# generous enough for a large exact-head review (an observed real review ran ~1213s) while
+# still terminating a wedged session; a consumer may lower or raise it through the existing
+# machine-local Reviewer provider settings. A timeout is a local VCCP decision, and the SDK
+# session it cancels is torn down before the timeout surfaces (see _run_session).
+DEFAULT_REVIEWER_TIMEOUT_SECONDS = 3600
+_MAX_REVIEWER_TIMEOUT_SECONDS = 86400
 _CHECKPOINT_PREFIX = "sdk_review_checkpoint:"
+
+
+def _bounded_reviewer_timeout(value) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("reviewer_timeout_seconds must be a number of seconds")
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds <= 0 or seconds > _MAX_REVIEWER_TIMEOUT_SECONDS:
+        raise ValueError(
+            f"reviewer_timeout_seconds must be greater than 0 and at most {_MAX_REVIEWER_TIMEOUT_SECONDS}")
+    return seconds
+
+
+def reviewer_timeout_seconds(settings: dict | None) -> float:
+    """Resolve the bounded Reviewer task timeout from existing provider settings.
+
+    Reads the machine-local Reviewer provider entry, alongside the ``launch_timeout_seconds``
+    it already carries, rather than introducing a second configuration surface. A value that
+    is not a finite positive number within the hard ceiling is rejected, so a mistyped or
+    hostile setting can neither disable the bound nor overflow it.
+    """
+    if not isinstance(settings, dict):
+        return float(DEFAULT_REVIEWER_TIMEOUT_SECONDS)
+    value = settings.get("reviewer_timeout_seconds")
+    return float(DEFAULT_REVIEWER_TIMEOUT_SECONDS) if value is None else _bounded_reviewer_timeout(value)
 
 
 def _run(command, cwd=None, env=None, timeout=30):
@@ -318,14 +350,16 @@ class ClaudeAgentSDKReviewer:
     }
 
     def __init__(self, executable, api, manifest, workspace, review_root,
-                 config_root=None, sdk_query=None, evidence_receipt=None):
+                 config_root=None, sdk_query=None, evidence_receipt=None,
+                 timeout_seconds=None):
         self.api, self.manifest = api, manifest
         self.workspace = _ReviewWorkspace(workspace, review_root)
         self.task = _ReviewerTask(api, manifest, Path(__file__).resolve().parent.parent /
                                   "templates" / "reviewer-task-prompt.md", self.workspace,
                                   evidence_receipt=evidence_receipt)
         self._query = sdk_query
-        self.timeout_seconds = 1200
+        self.timeout_seconds = (float(DEFAULT_REVIEWER_TIMEOUT_SECONDS) if timeout_seconds is None
+                                else _bounded_reviewer_timeout(timeout_seconds))
 
     @staticmethod
     def _sdk():
@@ -570,12 +604,20 @@ class ClaudeAgentSDKReviewer:
                                                     execution_started=True)
                         current_session_id = result_session_id or current_session_id
 
+            async def consume_until_deadline():
+                import anyio
+                # The SDK tears its transport down inside an anyio shield, which only
+                # defers cancellation that originates from an anyio cancel scope. A raw
+                # asyncio deadline would abort close() at its first await and skip the
+                # terminate/kill escalation, leaving the CLI child alive. Cancelling
+                # through anyio lets the shielded teardown finish, so once the deadline
+                # surfaces the session it cancelled has provably ended.
+                with anyio.move_on_after(remaining) as deadline:
+                    await consume()
+                return deadline.cancel_called
+
             try:
-                asyncio.run(asyncio.wait_for(consume(), timeout=remaining))
-            except asyncio.TimeoutError:
-                raise ReviewerTaskError("claude_agent_sdk_timeout", exception_type="TimeoutError",
-                                        execution_id=current_session_id,
-                                        execution_started=execution_started) from None
+                exceeded = asyncio.run(consume_until_deadline())
             except ReviewerTaskError:
                 raise
             except Exception as error:
@@ -620,6 +662,13 @@ class ClaudeAgentSDKReviewer:
                 raise ReviewerTaskError("claude_agent_sdk_execution", exception_type=type(error).__name__,
                                         execution_id=current_session_id,
                                         execution_started=execution_started) from None
+            if exceeded:
+                # VCCP's own task deadline cancelled the session and its shielded teardown
+                # has already run, so this execution is terminal rather than of unknown
+                # state and an explicitly authorized same-head retry may safely re-run it.
+                raise ReviewerTaskError("claude_agent_sdk_timeout", exception_type="TimeoutError",
+                                        execution_id=current_session_id, terminal=True,
+                                        execution_started=execution_started)
             session_id = current_session_id
             if sdk_result is None or sdk_result.subtype != "success":
                 raise ReviewerTaskError("claude_agent_sdk_result", exception_type="ResultMessageInvalid",
@@ -658,6 +707,14 @@ class ClaudeAgentSDKReviewer:
                 and re.search(r"(?:^|\s)exception_type=ResultError(?:\s|$)", failed_outcome)):
             # Older VCCP revisions flattened ResultError into a generic exception,
             # but the SDK only raises ResultError after a terminal error result.
+            return {"status": "terminal_failed", "execution_id": failed_execution_id,
+                    "state": "failed"}
+        if (failed_outcome.startswith("sdk_execution_state_unknown:")
+                and re.search(r"(?:^|[:\s])stage=claude_agent_sdk_timeout(?:\s|$)", failed_outcome)
+                and re.search(r"(?:^|\s)exception_type=TimeoutError(?:\s|$)", failed_outcome)):
+            # VCCP's own task deadline cancelled the session. The SDK tears a cancelled
+            # session's transport down inside an anyio shield before that deadline surfaces,
+            # so the execution has ended. Older revisions recorded it as unknown.
             return {"status": "terminal_failed", "execution_id": failed_execution_id,
                     "state": "failed"}
         if failed_outcome.startswith("sdk_not_started:") and failed_execution_id is None:

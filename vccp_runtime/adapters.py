@@ -1587,7 +1587,8 @@ def build_runtime(manifest: dict, local_config: dict, api=None, writer=None,
     reviewer_settings = _configured_providers_for_role(local_config, "reviewer")
     if reviewer_settings:
         from .local_reviewer import GitHubUserReviewerProvider, LocalReviewerDriver, LocalReviewerWriter
-        from .reviewer_agents import AntigravityReviewer, ClaudeAgentSDKReviewer
+        from .reviewer_agents import (AntigravityReviewer, ClaudeAgentSDKReviewer,
+                                      reviewer_timeout_seconds)
         identity = local_config.get("reviewer_github_identity")
         if not isinstance(identity, str) or not identity.strip():
             raise ValueError("explicit local Reviewer binding requires reviewer_github_identity")
@@ -1611,6 +1612,7 @@ def build_runtime(manifest: dict, local_config: dict, api=None, writer=None,
         ) if settings.get("type") == ANTIGRAVITY_PROVIDER else reviewer_factory(
             None, api, manifest, workspace, review_root,
             evidence_receipt=core.store.evidence_receipt,
+            timeout_seconds=reviewer_timeout_seconds(settings),
         )
         user_provider = GitHubUserReviewerProvider(target_repo, identity)
         reviewer_writer = LocalReviewerWriter(user_provider, workflow, target_repo, identity, manifest)

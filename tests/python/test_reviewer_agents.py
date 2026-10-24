@@ -11,7 +11,8 @@ from unittest.mock import patch
 from vccp_runtime.adapters import ensure_antigravity_project
 from vccp_runtime.github_app import GitHubHTTPError
 from vccp_runtime.reviewer_agents import (AntigravityReviewer, ClaudeAgentSDKReviewer,
-                                          ReviewerTaskError, _decision)
+                                          DEFAULT_REVIEWER_TIMEOUT_SECONDS, ReviewerTaskError,
+                                          _decision, reviewer_timeout_seconds)
 
 
 SHA = "a" * 40
@@ -448,6 +449,30 @@ class ReviewerAgentTests(unittest.TestCase):
         self.assertEqual(evidence, {"status": "terminal_failed", "execution_id": "sdk-session",
                                     "state": "failed"})
 
+    def test_retry_session_evidence_recognizes_persisted_vccp_timeout_as_terminal(self):
+        provider = ClaudeAgentSDKReviewer(None, FakeAPI(), MANIFEST, ".", ".")
+        outcome = ("sdk_execution_state_unknown:stage=claude_agent_sdk_timeout "
+                   "endpoint=none http_status=none exception_type=TimeoutError")
+
+        evidence = provider.retry_session_evidence(
+            REPO, 7, 12, SHA, failed_execution_id="sdk-session", failed_outcome=outcome)
+
+        self.assertEqual(evidence, {"status": "terminal_failed", "execution_id": "sdk-session",
+                                    "state": "failed"})
+
+    def test_retry_session_evidence_keeps_timeouts_from_other_stages_blocked(self):
+        provider = ClaudeAgentSDKReviewer(None, FakeAPI(), MANIFEST, ".", ".")
+        for outcome in (
+                "sdk_execution_state_unknown:stage=claude_agent_sdk_execution "
+                "endpoint=none http_status=none exception_type=TimeoutError",
+                "sdk_execution_state_unknown:stage=claude_agent_sdk_timeout "
+                "endpoint=none http_status=none exception_type=ProcessError",
+                "sdk_execution_state_unknown:stage=runner_restart "
+                "endpoint=none http_status=none exception_type=ExecutionInterrupted"):
+            evidence = provider.retry_session_evidence(
+                REPO, 7, 12, SHA, failed_execution_id="sdk-session", failed_outcome=outcome)
+            self.assertEqual(evidence["status"], "unobservable", outcome)
+
     def test_retry_session_evidence_keeps_other_unknown_sdk_errors_blocked(self):
         provider = ClaudeAgentSDKReviewer(None, FakeAPI(), MANIFEST, ".", ".")
         outcome = ("sdk_execution_state_unknown:stage=claude_agent_sdk_execution "
@@ -487,19 +512,61 @@ class ReviewerAgentTests(unittest.TestCase):
         self.assertNotIn("dXNlcjpwYXNz", raised.exception.sdk_detail)
         self.assertNotIn("cookie_secret", raised.exception.sdk_detail)
 
-    def test_sdk_timeout_is_not_terminal_retry_evidence(self):
+    def test_reviewer_timeout_default_is_finite_and_replaces_the_hardcoded_value(self):
+        provider = ClaudeAgentSDKReviewer(None, FakeAPI(), MANIFEST, ".", ".")
+
+        self.assertEqual(provider.timeout_seconds, DEFAULT_REVIEWER_TIMEOUT_SECONDS)
+        self.assertEqual(DEFAULT_REVIEWER_TIMEOUT_SECONDS, 3600)
+        self.assertNotEqual(DEFAULT_REVIEWER_TIMEOUT_SECONDS, 1200)
+
+    def test_reviewer_timeout_reads_the_existing_provider_settings(self):
+        self.assertEqual(reviewer_timeout_seconds({}), DEFAULT_REVIEWER_TIMEOUT_SECONDS)
+        self.assertEqual(reviewer_timeout_seconds(None), DEFAULT_REVIEWER_TIMEOUT_SECONDS)
+        self.assertEqual(reviewer_timeout_seconds({"launch_timeout_seconds": 60}),
+                         DEFAULT_REVIEWER_TIMEOUT_SECONDS)
+        self.assertEqual(reviewer_timeout_seconds({"reviewer_timeout_seconds": 900}), 900)
+        for invalid in (0, -1, True, "600", float("inf"), float("nan"), 86401):
+            with self.assertRaises(ValueError):
+                reviewer_timeout_seconds({"reviewer_timeout_seconds": invalid})
+
+    def test_reviewer_timeout_argument_is_bounded_like_a_configured_value(self):
+        self.assertEqual(
+            ClaudeAgentSDKReviewer(None, FakeAPI(), MANIFEST, ".", ".", timeout_seconds=90).timeout_seconds, 90)
+        with self.assertRaises(ValueError):
+            ClaudeAgentSDKReviewer(None, FakeAPI(), MANIFEST, ".", ".", timeout_seconds=0)
+
+    def test_vccp_deadline_tears_down_the_session_before_reporting_timeout(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             source, head = self._repo(root)
-            module = self._sdk_module(hang=True)
+            cleanup = []
+
+            async def hanging_query(*, prompt, options):
+                yield FakeSystemMessage("sdk-session")
+                try:
+                    await asyncio.Future()
+                finally:
+                    import anyio
+                    with anyio.CancelScope(shield=True):
+                        await anyio.sleep(0.05)
+                        cleanup.append("torn_down")
+
+            module = self._sdk_module()
+            module.query = hanging_query
             provider = ClaudeAgentSDKReviewer(None, FakeAPI(head), MANIFEST,
                                                str(source), str(root / "reviews"))
-            provider.timeout_seconds = 0.01
-            with patch.dict(sys.modules, {"claude_agent_sdk": module}):
-                with self.assertRaises(Exception) as raised:
-                    provider.launch_review(REPO, 7, 12, head)
-            self.assertEqual(raised.exception.execution_id, "sdk-session")
-            self.assertFalse(raised.exception.terminal)
+            provider.timeout_seconds = 0.05
+
+            with patch.dict(sys.modules, {"claude_agent_sdk": module}), \
+                    self.assertRaises(ReviewerTaskError) as raised:
+                provider.launch_review(REPO, 7, 12, head)
+
+        self.assertEqual(cleanup, ["torn_down"])
+        self.assertEqual(raised.exception.stage, "claude_agent_sdk_timeout")
+        self.assertEqual(raised.exception.exception_type, "TimeoutError")
+        self.assertEqual(raised.exception.execution_id, "sdk-session")
+        self.assertTrue(raised.exception.execution_started)
+        self.assertTrue(raised.exception.terminal)
 
     def test_reviewer_task_rejects_changed_head_before_sdk_execution(self):
         with tempfile.TemporaryDirectory() as temp:
