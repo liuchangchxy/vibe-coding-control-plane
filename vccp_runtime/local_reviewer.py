@@ -5,6 +5,7 @@ import re
 import json
 import os
 import subprocess
+import time
 from urllib.request import Request, urlopen
 
 from .reviewer_agents import MAX_REVIEWER_RESUMES, MAX_REVIEWER_TASK_TURNS
@@ -240,8 +241,14 @@ class LocalReviewerDriver:
         self._sdk_checkpoint_cache = {}
 
     def retry_failed(self, repo: str, issue: int, pr: int, head: str,
-                     authorization_head: str):
-        """Explicitly authorize one guarded retry of a FAILED Claude execution."""
+                     authorization_head: str, confirm_execution_ended: bool = False):
+        """Explicitly authorize one guarded retry of a FAILED Claude execution.
+
+        ``confirm_execution_ended`` is the operator's attestation that the one failed
+        execution named by the ledger has ended. It is only consulted when the persisted
+        outcome cannot prove that on its own, so no other unknown execution becomes
+        retryable.
+        """
         normalized_head = head.casefold() if isinstance(head, str) else ""
         if (not normalized_head or not isinstance(authorization_head, str)
                 or authorization_head.casefold() != normalized_head
@@ -274,7 +281,18 @@ class LocalReviewerDriver:
                         else inspect_sessions(repo, issue, pr, normalized_head))
         except Exception as error:
             evidence = {"status": "unobservable", "exception_type": type(error).__name__}
-        if not self._retry_evidence_matches(evidence, record.get("execution_id")):
+        ended_attestation = None
+        if isinstance(evidence, dict) and evidence.get("status") == "unproven_termination":
+            # The outcome proves only that VCCP's own deadline fired, not that the CLI
+            # child it cancelled was torn down. Accept it solely for the execution the
+            # ledger names, and only once the operator has ended that execution and
+            # attests to it; the authorization row records which execution that was.
+            if not confirm_execution_ended:
+                return {"status": "reviewer_retry_rejected", "reason": "execution_termination_unproven",
+                        "head_sha": normalized_head,
+                        "exception_type": evidence.get("exception_type")}
+            ended_attestation = time.time()
+        elif not self._retry_evidence_matches(evidence, record.get("execution_id")):
             return {"status": "reviewer_retry_rejected", "reason": "session_evidence_present_or_unknown",
                     "head_sha": normalized_head,
                     "exception_type": evidence.get("exception_type") if isinstance(evidence, dict) else None}
@@ -289,7 +307,8 @@ class LocalReviewerDriver:
                     "head_sha": normalized_head}
         authorized = self.store.authorize_reviewer_retry(
             repo, pr, normalized_head, self.provider_key, authorization_head, operator,
-            failed_execution_id=record.get("execution_id"))
+            failed_execution_id=record.get("execution_id"),
+            execution_ended_confirmed_at=ended_attestation)
         if not authorized:
             return {"status": "reviewer_retry_rejected", "reason": "failed_state_changed",
                     "head_sha": normalized_head}
@@ -371,6 +390,20 @@ class LocalReviewerDriver:
         return (evidence.get("status") == "terminal_failed"
                 and evidence.get("state") == "failed"
                 and evidence.get("execution_id") == failed_execution_id)
+
+    def _retry_evidence_acceptable(self, evidence, failed_execution_id, execution_ended_confirmed_at):
+        """Whether persisted evidence clears this execution for an authorized retry.
+
+        An unproven VCCP timeout is accepted only for the exact execution the ledger names
+        and only when the durable authorization records that the operator ended it. Every
+        other outcome keeps the original fail-closed judgment.
+        """
+        if not isinstance(evidence, dict):
+            return False
+        if evidence.get("status") == "unproven_termination":
+            return (evidence.get("execution_id") == failed_execution_id
+                    and execution_ended_confirmed_at is not None)
+        return self._retry_evidence_matches(evidence, failed_execution_id)
 
     @staticmethod
     def _decode_sdk_checkpoint(outcome):
@@ -515,6 +548,7 @@ class LocalReviewerDriver:
                 return {"status": "reviewer_provider_mismatch", "record_provider": record.get("provider"),
                         "head_sha": head}
             if record["state"] == "RETRY_AUTHORIZED":
+                authorization = self.store.pending_reviewer_retry_authorization(repo, pr, head)
                 try:
                     if self.writer._formal_review_exists_for_head(repo, pr, head):
                         return {"status": "reviewer_retry_rejected", "reason": "formal_review_exists",
@@ -527,7 +561,9 @@ class LocalReviewerDriver:
                 except Exception:
                     return {"status": "reviewer_retry_rejected", "reason": "retry_evidence_unavailable",
                             "head_sha": head}
-                if not self._retry_evidence_matches(evidence, record.get("execution_id")):
+                if not self._retry_evidence_acceptable(
+                        evidence, record.get("execution_id"),
+                        authorization.get("execution_ended_confirmed_at") if authorization else None):
                     return {"status": "reviewer_retry_rejected", "reason": "session_evidence_present_or_unknown",
                             "head_sha": head}
                 record, claimed = self.store.claim_authorized_reviewer_retry(

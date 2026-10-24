@@ -49,6 +49,16 @@ The optional `.github/PULL_REQUEST_TEMPLATE/vccp.md` is only a reporting aid. If
 
 Use the machine-local provider bindings `reviewer_provider` and `reviewer_github_identity` (or the corresponding `deploy` flags) to select the Consumer's independent Local Reviewer. The Claude Agent SDK Reviewer reads a disposable exact-head workspace and returns a structured verdict; the VCCP Runtime validates current checks and writes the formal GitHub review. The generated `.github/vccp/reviewer-task-prompt.md` remains the managed review contract, not an instruction to create an external ChatGPT Work Task.
 
+A whole Claude Agent SDK Reviewer task is bounded in wall-clock time and never runs unbounded. Its entry in the machine-local `providers` list may carry `reviewer_timeout_seconds` alongside `launch_timeout_seconds`:
+
+```json
+ {"key": "claude_agent_sdk", "type": "claude_agent_sdk", "reviewer_timeout_seconds": 3600}
+```
+
+The default is 3600 seconds and the value must be greater than 0 and at most 86400; any other value blocks readiness rather than disabling the bound. When the deadline expires VCCP cancels the session itself and waits for the SDK's shielded teardown to terminate the CLI child, so the resulting FAILED execution is recorded as a terminal failure. An explicitly human-authorized `--retry-reviewer` at the unchanged head may therefore re-run it, subject to the same exact-head, formal-review and authorization guards as any other retry.
+
+A FAILED execution recorded by a revision before that teardown guarantee carries `sdk_execution_state_unknown` instead, because its cancellation could have skipped the terminate/kill escalation and left the CLI child alive. That outcome string is never accepted as proof on its own. To recover such an execution, end it first — stop the runtime that owns it, which reaps the child, and confirm no VCCP runtime still holds the machine lock — then re-run the same `--retry-reviewer` with `--confirm-failed-execution-ended`. The attestation is recorded against that one execution in the retry authorization ledger, so it neither travels to a different execution nor becomes blanket trust in unknown outcomes; every other unknown or interrupted outcome stays rejected.
+
 Branch protection and rulesets are read-only audited and remain an external maintainer step. Onboarding never replaces these objects. The existing Python Generic Runtime is the runtime wiring boundary; no future Dispatcher registration is required by repository onboarding.
 
 ## 4. Operational boundary

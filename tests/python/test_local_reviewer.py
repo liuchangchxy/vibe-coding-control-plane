@@ -725,6 +725,140 @@ class LocalReviewerWriterTests(unittest.TestCase):
         self.assertEqual(history[-1]["previous_execution_id"], "failed-session-id")
         self.assertIn("exception_type=ResultError", history[-1]["previous_outcome"])
 
+    def test_new_vccp_timeout_execution_can_retry_without_state_edit(self):
+        class TimeoutAgent(FakeReviewAgent):
+            retry_session_evidence = ClaudeAgentSDKReviewer.retry_session_evidence
+
+        with tempfile.TemporaryDirectory() as root:
+            store = _Store(str(Path(root) / "runtime.sqlite"))
+            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_agent_sdk", 10)
+            store.update_reviewer_execution(REPO, 12, HEAD, "RUNNING", "timed-out-session", now=11)
+            store.update_reviewer_execution(REPO, 12, HEAD, "FAILED", outcome=(
+                "sdk_terminal_failure:stage=claude_agent_sdk_timeout "
+                "endpoint=none http_status=none exception_type=TimeoutError"), now=12)
+            agent = TimeoutAgent()
+            writer = LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO,
+                                         "liuchangchxy", MANIFEST)
+
+            result = LocalReviewerDriver(store, agent, writer, "claude_agent_sdk").retry_failed(
+                REPO, 7, 12, HEAD, authorization_head=HEAD)
+
+            record = store.reviewer_execution(REPO, 12, HEAD)
+            history = store.reviewer_retry_history(REPO, 12, HEAD)
+
+        self.assertEqual(result["status"], "reviewer_running")
+        self.assertEqual(agent.launches, [(REPO, 7, 12, HEAD)])
+        self.assertEqual(record["state"], "RUNNING")
+        self.assertEqual(record["execution_id"], "review-session-1")
+        self.assertEqual(history[-1]["previous_execution_id"], "timed-out-session")
+        self.assertIsNone(history[-1]["execution_ended_confirmed_at"])
+
+    def test_legacy_unknown_timeout_retries_only_after_the_execution_is_confirmed_ended(self):
+        class TimeoutAgent(FakeReviewAgent):
+            retry_session_evidence = ClaudeAgentSDKReviewer.retry_session_evidence
+
+        def store_with_legacy_timeout(root):
+            store = _Store(str(Path(root) / "runtime.sqlite"))
+            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_agent_sdk", 10)
+            store.update_reviewer_execution(REPO, 12, HEAD, "RUNNING", "timed-out-session", now=11)
+            store.update_reviewer_execution(REPO, 12, HEAD, "FAILED", outcome=(
+                "sdk_execution_state_unknown:stage=claude_agent_sdk_timeout "
+                "endpoint=none http_status=none exception_type=TimeoutError"), now=12)
+            return store
+
+        with tempfile.TemporaryDirectory() as root:
+            store = store_with_legacy_timeout(root)
+            agent = TimeoutAgent()
+            writer = LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO,
+                                         "liuchangchxy", MANIFEST)
+
+            result = LocalReviewerDriver(store, agent, writer, "claude_agent_sdk").retry_failed(
+                REPO, 7, 12, HEAD, authorization_head=HEAD)
+
+            self.assertEqual(result["status"], "reviewer_retry_rejected")
+            self.assertEqual(result["reason"], "execution_termination_unproven")
+            self.assertEqual(result["exception_type"], "ExecutionTerminationUnproven")
+            self.assertEqual(agent.launches, [])
+            self.assertEqual(store.reviewer_retry_history(REPO, 12, HEAD), [])
+            self.assertEqual(store.reviewer_execution(REPO, 12, HEAD)["state"], "FAILED")
+
+        with tempfile.TemporaryDirectory() as root:
+            store = store_with_legacy_timeout(root)
+            agent = TimeoutAgent()
+            writer = LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO,
+                                         "liuchangchxy", MANIFEST)
+
+            result = LocalReviewerDriver(store, agent, writer, "claude_agent_sdk").retry_failed(
+                REPO, 7, 12, HEAD, authorization_head=HEAD, confirm_execution_ended=True)
+
+            record = store.reviewer_execution(REPO, 12, HEAD)
+            history = store.reviewer_retry_history(REPO, 12, HEAD)
+
+            self.assertEqual(result["status"], "reviewer_running")
+            self.assertEqual(agent.launches, [(REPO, 7, 12, HEAD)])
+            self.assertEqual(record["state"], "RUNNING")
+            self.assertEqual(record["execution_id"], "review-session-1")
+            self.assertEqual(history[-1]["previous_execution_id"], "timed-out-session")
+            self.assertIsNotNone(history[-1]["execution_ended_confirmed_at"])
+
+    def test_attested_legacy_timeout_does_not_become_blanket_trust(self):
+        class TimeoutAgent(FakeReviewAgent):
+            retry_session_evidence = ClaudeAgentSDKReviewer.retry_session_evidence
+
+        legacy_timeout = ("sdk_execution_state_unknown:stage=claude_agent_sdk_timeout "
+                          "endpoint=none http_status=none exception_type=TimeoutError")
+        with tempfile.TemporaryDirectory() as root:
+            store = _Store(str(Path(root) / "runtime.sqlite"))
+            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_agent_sdk", 10)
+            store.update_reviewer_execution(REPO, 12, HEAD, "RUNNING", "timed-out-session", now=11)
+            store.update_reviewer_execution(REPO, 12, HEAD, "FAILED", outcome=legacy_timeout, now=12)
+            agent = TimeoutAgent()
+            writer = LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO,
+                                         "liuchangchxy", MANIFEST)
+            driver = LocalReviewerDriver(store, agent, writer, "claude_agent_sdk")
+
+            self.assertEqual(driver.retry_failed(REPO, 7, 12, HEAD, authorization_head=HEAD,
+                                                 confirm_execution_ended=True)["status"],
+                             "reviewer_running")
+
+            # A later failure of the same shape is judged on its own again.
+            store.update_reviewer_execution(REPO, 12, HEAD, "FAILED", "timed-out-session",
+                                            outcome=legacy_timeout, now=20)
+            again = driver.retry_failed(REPO, 7, 12, HEAD, authorization_head=HEAD)
+
+            self.assertEqual(again["status"], "reviewer_retry_rejected")
+            self.assertEqual(again["reason"], "execution_termination_unproven")
+            self.assertEqual(agent.launches, [(REPO, 7, 12, HEAD)])
+
+    def test_timeout_without_proof_of_termination_still_blocks_retry(self):
+        class TimeoutAgent(FakeReviewAgent):
+            retry_session_evidence = ClaudeAgentSDKReviewer.retry_session_evidence
+
+        outcomes = (
+            "sdk_execution_state_unknown:stage=claude_agent_sdk_execution "
+            "endpoint=none http_status=none exception_type=TimeoutError",
+            "sdk_execution_state_unknown:stage=claude_agent_sdk_timeout "
+            "endpoint=none http_status=none exception_type=ProcessError",
+            "sdk_execution_state_unknown:stage=runner_restart",
+        )
+        for outcome in outcomes:
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as root:
+                store = _Store(str(Path(root) / "runtime.sqlite"))
+                store.claim_reviewer_execution(REPO, 12, HEAD, "claude_agent_sdk", 10)
+                store.update_reviewer_execution(REPO, 12, HEAD, "RUNNING", "possibly-running", now=11)
+                store.update_reviewer_execution(REPO, 12, HEAD, "FAILED", outcome=outcome, now=12)
+                agent = TimeoutAgent()
+                writer = LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO,
+                                             "liuchangchxy", MANIFEST)
+
+                result = LocalReviewerDriver(store, agent, writer, "claude_agent_sdk").retry_failed(
+                    REPO, 7, 12, HEAD, authorization_head=HEAD)
+
+                self.assertEqual(result["status"], "reviewer_retry_rejected")
+                self.assertEqual(result["reason"], "session_evidence_present_or_unknown")
+                self.assertEqual(agent.launches, [])
+                self.assertEqual(store.reviewer_retry_history(REPO, 12, HEAD), [])
+
     def test_retry_requires_explicit_matching_authorization_sha(self):
         with tempfile.TemporaryDirectory() as root:
             store = _Store(str(Path(root) / "runtime.sqlite"))

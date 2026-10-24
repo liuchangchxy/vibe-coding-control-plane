@@ -205,6 +205,10 @@ def main(argv=None):
     parser.add_argument("--head-sha", help="exact full PR head SHA for the selected recovery action")
     parser.add_argument("--authorize-reviewer-retry-for", metavar="SHA",
                         help="explicitly authorize retry for this exact full SHA")
+    parser.add_argument("--confirm-failed-execution-ended", action="store_true",
+                        help="attest that the failed Reviewer execution named by the ledger "
+                             "has ended; required only when its recorded outcome cannot prove "
+                             "that on its own")
     parser.add_argument("--authorize-evidence-resume-for", metavar="SHA",
                         help="explicitly authorize re-review after a missing-evidence stop "
                              "for this exact full SHA")
@@ -239,6 +243,8 @@ def main(argv=None):
           and not args.authorize_repair_continuation
           and not args.resume_review_after_evidence):
         parser.error("reviewer retry arguments require --retry-reviewer")
+    if args.confirm_failed_execution_ended and not args.retry_reviewer:
+        parser.error("--confirm-failed-execution-ended requires --retry-reviewer")
     if args.authorize_repair_continuation:
         if (args.issue is None or args.pr is None or args.head_sha is None
                 or not args.authorized_by or not re.fullmatch(r"[0-9a-fA-F]{40}", args.head_sha)
@@ -311,7 +317,8 @@ def main(argv=None):
                     parser.error("configured runtime has no Local Reviewer")
                 result = runtime.local_reviewer.retry_failed(
                     args.repo, args.issue, args.pr, args.head_sha,
-                    authorization_head=args.authorize_reviewer_retry_for)
+                    authorization_head=args.authorize_reviewer_retry_for,
+                    confirm_execution_ended=args.confirm_failed_execution_ended)
                 print(json.dumps(result, ensure_ascii=False, sort_keys=True))
                 if result.get("status") == "reviewer_running":
                     return 0

@@ -1076,11 +1076,61 @@ class AdapterTests(unittest.TestCase):
             wired = build_runtime(MANIFEST, local, api=FakeAPI(), writer=FakeWriter(),
                                   credential_provider=CredentialProvider(), push_backend=object())
 
-            from vccp_runtime.reviewer_agents import ClaudeAgentSDKReviewer
+            from vccp_runtime.reviewer_agents import (ClaudeAgentSDKReviewer,
+                                                      DEFAULT_REVIEWER_TIMEOUT_SECONDS)
             self.assertEqual(wired.router.primary, "antigravity")
             self.assertEqual(wired.local_reviewer.provider_key, "claude_agent_sdk")
             self.assertIsInstance(wired.local_reviewer.provider, ClaudeAgentSDKReviewer)
+            self.assertEqual(wired.local_reviewer.provider.timeout_seconds,
+                             DEFAULT_REVIEWER_TIMEOUT_SECONDS)
             self.assertIs(wired.lifecycle.local_reviewer, wired.local_reviewer)
+
+    def test_runtime_applies_the_configured_reviewer_timeout(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = init_git_repo(Path(temp) / "repo")
+            subprocess.run(["git", "-C", str(workspace), "remote", "add", "origin",
+                            "https://github.com/o/r.git"], check=True, capture_output=True)
+            local = {
+                "database_path": str(Path(temp) / "runtime.sqlite"), "workspace": str(workspace),
+                "owner_id": "owner", "target_repository": "o/r",
+                "github_app": {"app_id": "1", "credential_source": {"type": "test"}},
+                "providers": [
+                    {"key": "antigravity", "type": "antigravity", "executable": "language_server"},
+                    {"key": "claude_agent_sdk", "type": "claude_agent_sdk",
+                     "reviewer_timeout_seconds": 5400},
+                ],
+                "implementer_provider": "antigravity", "reviewer_provider": "claude_agent_sdk",
+                "reviewer_github_identity": "liuchangchxy",
+            }
+            class CredentialProvider:
+                api_url = "https://api.github.com"
+            wired = build_runtime(MANIFEST, local, api=FakeAPI(), writer=FakeWriter(),
+                                  credential_provider=CredentialProvider(), push_backend=object())
+
+            self.assertEqual(wired.local_reviewer.provider.timeout_seconds, 5400)
+
+    def test_runtime_rejects_an_unbounded_reviewer_timeout(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = init_git_repo(Path(temp) / "repo")
+            subprocess.run(["git", "-C", str(workspace), "remote", "add", "origin",
+                            "https://github.com/o/r.git"], check=True, capture_output=True)
+            local = {
+                "database_path": str(Path(temp) / "runtime.sqlite"), "workspace": str(workspace),
+                "owner_id": "owner", "target_repository": "o/r",
+                "github_app": {"app_id": "1", "credential_source": {"type": "test"}},
+                "providers": [
+                    {"key": "antigravity", "type": "antigravity", "executable": "language_server"},
+                    {"key": "claude_agent_sdk", "type": "claude_agent_sdk",
+                     "reviewer_timeout_seconds": 0},
+                ],
+                "implementer_provider": "antigravity", "reviewer_provider": "claude_agent_sdk",
+                "reviewer_github_identity": "liuchangchxy",
+            }
+            class CredentialProvider:
+                api_url = "https://api.github.com"
+            with self.assertRaises(ValueError):
+                build_runtime(MANIFEST, local, api=FakeAPI(), writer=FakeWriter(),
+                              credential_provider=CredentialProvider(), push_backend=object())
 
     def test_generic_app_runtime_needs_no_prebuilt_helpers_and_generates_attempt_wrappers(self):
         with tempfile.TemporaryDirectory() as temp:
