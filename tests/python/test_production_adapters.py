@@ -863,6 +863,25 @@ class AdapterTests(unittest.TestCase):
             self.assertEqual(ensure_antigravity_project(workspace, projects), "existing-project")
             self.assertEqual(list(projects.glob("*.json")), [existing])
 
+    def test_antigravity_project_registration_reuses_project_matching_a_later_resource(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = init_git_repo(Path(temp) / "consumer")
+            sibling = Path(temp) / "sibling"
+            sibling.mkdir()
+            projects = Path(temp) / "projects"
+            projects.mkdir()
+            multi_root = projects / "multi-root.json"
+            multi_root.write_text(json.dumps({
+                "id": "multi-root-project",
+                "name": "multi-root",
+                "projectResources": {"resources": [
+                    {"gitFolder": {"folderUri": sibling.resolve().as_uri()}},
+                    {"gitFolder": {"folderUri": workspace.resolve().as_uri()}}]},
+            }), encoding="utf-8")
+
+            self.assertEqual(ensure_antigravity_project(workspace, projects), "multi-root-project")
+            self.assertEqual(list(projects.glob("*.json")), [multi_root])
+
     def test_antigravity_project_registration_conflict_fails_closed(self):
         with tempfile.TemporaryDirectory() as temp:
             workspace_a = init_git_repo(Path(temp) / "consumer_a")

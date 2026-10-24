@@ -800,16 +800,21 @@ def _discover_antigravity_agentapi_environment(executable: str) -> dict[str, str
     return {"ANTIGRAVITY_LS_ADDRESS": address, "ANTIGRAVITY_CSRF_TOKEN": csrf_token}
 
 
-def _antigravity_project_workspace(data) -> Path | None:
-    """Return the local folder a persisted project is bound to, when readable."""
+def _antigravity_project_workspaces(data) -> set[Path]:
+    """Return every local folder a persisted project is bound to, when readable.
+
+    A project may carry several resources (a multi-root workspace), so the whole
+    resource list is scanned rather than only the first entry.
+    """
     if not isinstance(data, dict):
-        return None
+        return set()
     resources = data.get("projectResources")
     if not isinstance(resources, dict):
-        return None
+        return set()
     resources = resources.get("resources")
     if not isinstance(resources, list):
-        return None
+        return set()
+    folders = set()
     for resource in resources:
         if not isinstance(resource, dict):
             continue
@@ -827,10 +832,10 @@ def _antigravity_project_workspace(data) -> Path | None:
         if os.name == "nt" and len(raw_path) > 2 and raw_path[0] == "/" and raw_path[2] == ":":
             raw_path = raw_path[1:]
         try:
-            return Path(raw_path).resolve()
+            folders.add(Path(raw_path).resolve())
         except (OSError, ValueError):
             continue
-    return None
+    return folders
 
 
 def ensure_antigravity_project(workspace: str | Path, project_config_root: str | Path) -> str:
@@ -849,7 +854,7 @@ def ensure_antigravity_project(workspace: str | Path, project_config_root: str |
             current = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             continue
-        if _antigravity_project_workspace(current) != target:
+        if target not in _antigravity_project_workspaces(current):
             continue
         project_id = current.get("id") if isinstance(current, dict) else None
         if isinstance(project_id, str) and project_id:
@@ -871,7 +876,7 @@ def ensure_antigravity_project(workspace: str | Path, project_config_root: str |
             current = json.loads(config_path.read_text(encoding="utf-8"))
         except Exception:
             raise ValueError("Antigravity project config is unreadable") from None
-        if _antigravity_project_workspace(current) != target:
+        if target not in _antigravity_project_workspaces(current):
             raise ValueError("Antigravity project ID conflicts with another workspace")
         current_id = current.get("id") if isinstance(current, dict) else None
         if isinstance(current_id, str) and current_id:
