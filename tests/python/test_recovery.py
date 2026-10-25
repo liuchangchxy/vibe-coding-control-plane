@@ -65,6 +65,71 @@ class RecoveryImplementer:
         return self.activity
 
 
+class _LosingStore:
+    """Real store with a way to durably delete the claim's attempt row."""
+
+    def __init__(self, real, database_path):
+        self._real, self._db = real, str(database_path)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def _drop(self, repo, issue):
+        with closing(sqlite3.connect(self._db)) as connection:
+            connection.execute("DELETE FROM attempts WHERE repo=? AND issue_number=?", (repo, issue))
+            connection.commit()
+
+
+class UnpersistedAttemptStore(_LosingStore):
+    """Durably lose the attempt the instant the claim is told it was created.
+
+    ``create_initial_attempt`` still reports success, so the claim path believes it holds
+    an attempt whose row nothing can read back.
+    """
+
+    def create_initial_attempt(self, repo, issue, owner, ttl, recovery_timeout):
+        created = self._real.create_initial_attempt(repo, issue, owner, ttl, recovery_timeout)
+        self._drop(repo, issue)
+        return created
+
+
+class AttemptLostAfterBindingStore(_LosingStore):
+    """Lose the attempt only once its authorization binding has landed.
+
+    This is the window the claim spends between a successful bind and the coordination
+    transition: the store has already confirmed the attempt exists, so nothing but a
+    fresh check taken immediately before the transition can notice it is gone.
+    """
+
+    def bind_noop_authorization(self, attempt_id, authorized, digest, baseline):
+        bound = self._real.bind_noop_authorization(attempt_id, authorized, digest, baseline)
+        if bound:
+            row = self._real.attempt(attempt_id)
+            self._drop(row["repo"], row["issue_number"])
+        return bound
+
+
+class AttemptLostDuringTransitionWorkflow(RecoveryWorkflow):
+    """Reject the coordination transition and drop the attempt as it is attempted.
+
+    The confirmation immediately before the transition succeeds, so the claim reaches
+    ``claim_rejected`` holding an attempt that no longer exists.
+    """
+
+    def __init__(self, database_path, *snapshots):
+        super().__init__(*snapshots)
+        self.database_path = str(database_path)
+
+    def transition_coordination_state(self, repo, issue_number, expected_state, new_state,
+                                      expected_revision):
+        self.transitions.append((repo, issue_number, expected_state, new_state, expected_revision))
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            connection.execute("DELETE FROM attempts WHERE repo=? AND issue_number=?",
+                               (repo.casefold(), issue_number))
+            connection.commit()
+        return False
+
+
 class RecoveryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -639,6 +704,113 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(result["items"], [])
         self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "agent-ready")
         self.assertFalse(self.implementer.requests)
+
+    # --- the claim may only move the Issue once its own attempt is readable -----------
+    def test_normal_claim_persists_a_rereadable_attempt_before_agent_working(self):
+        observed_states = []
+        original = self.workflow.transition_coordination_state
+
+        def record_state(repo, issue_number, expected_state, new_state, expected_revision):
+            # The transition is the moment GitHub learns the Issue is claimed, so the
+            # attempt must already be durable and readable from a separate connection.
+            observed_states.append(
+                [row["phase"] for row in RuntimeCore(
+                    self.db, MANIFEST, self.workflow, self.implementer
+                ).store.attempts_for_repo("acme/alpha")])
+            return original(repo, issue_number, expected_state, new_state, expected_revision)
+
+        self.workflow.transition_coordination_state = record_state
+        result = self.start()
+
+        self.assertEqual(result["status"], "launched")
+        self.assertEqual(observed_states, [["CLAIM_INTENT"]])
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "agent-working")
+
+    def test_claim_whose_attempt_is_not_persisted_never_reaches_agent_working(self):
+        self.core.store = UnpersistedAttemptStore(self.core.store, self.db)
+
+        result = self.core.dispatch_initial("acme/alpha", 7, "owner")
+
+        self.assertEqual(result["status"], "claim_failed")
+        self.assertEqual(self.workflow.transitions, [])
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "agent-ready")
+        self.assertEqual(self.implementer.requests, [])
+
+    def test_unpersisted_claim_leaves_a_retryable_issue_and_no_orphan(self):
+        self.core.store = UnpersistedAttemptStore(self.core.store, self.db)
+        self.core.dispatch_initial("acme/alpha", 7, "owner")
+        self.core.store = self.core.store._real
+
+        # The Issue never left agent-ready, so there is no active flow for the next pass
+        # to mistake for an orphan: recovery reports nothing and terminalizes nothing.
+        reconciliation = self.core.reconcile_once("acme/alpha", "owner")
+        self.assertEqual(reconciliation["items"], [])
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "agent-ready")
+
+        # The claim was given back, so the same owner can claim the Issue on a later pass.
+        retry = self.core.dispatch_initial("acme/alpha", 7, "owner")
+        self.assertEqual(retry["status"], "launched")
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "agent-working")
+        self.assertEqual(len(self.implementer.requests), 1)
+        self.assertEqual(self.core.store.attempt(retry["attempt_id"])["phase"], "LAUNCH_CONFIRMED")
+
+    def test_attempt_lost_after_binding_never_reaches_agent_working(self):
+        # The attempt survives creation and the authorization binding, and disappears
+        # before the coordination transition. Confirming the attempt only at creation
+        # time would let this claim through and re-create issue #29.
+        self.core.store = AttemptLostAfterBindingStore(self.core.store, self.db)
+
+        result = self.core.dispatch_initial("acme/alpha", 7, "owner")
+
+        self.assertEqual(result["status"], "claim_failed")
+        self.assertEqual(result["outcome"], "attempt_not_persisted")
+        self.assertEqual(self.workflow.transitions, [])
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "agent-ready")
+        self.assertEqual(self.implementer.requests, [])
+
+    def test_workflow_change_with_a_lost_attempt_fails_without_raising(self):
+        # The workflow moved on under the claim, and the attempt is gone by the time this
+        # branch runs. Failing it must not depend on the row still being readable.
+        self.core.store = _LosingStore(self.core.store, self.db)
+        self.core.store.create_initial_attempt = self.core.store._real.create_initial_attempt
+        self.core.store.bind_noop_authorization = self.core.store._real.bind_noop_authorization
+        original = self.workflow.observe
+
+        def change_after_the_claim_reads_it(repo, issue_number):
+            current = original(repo, issue_number)
+            if self.workflow.observe_count >= 2:
+                self.workflow.states[(repo.casefold(), issue_number)] = replace(
+                    current, coordination_state="agent-working", revision="moved-on")
+                self.core.store._drop(repo, issue_number)
+            return self.workflow.states[(repo.casefold(), issue_number)]
+
+        self.workflow.observe = change_after_the_claim_reads_it
+
+        result = self.core.dispatch_initial("acme/alpha", 7, "owner")
+
+        # ``claim_failed`` alone is not enough: the pre-fix branch reported the same
+        # status while carrying the ``unknown attempt`` exception it swallowed.
+        self.assertEqual(result["status"], "claim_failed")
+        self.assertNotIn("detail", result)
+        self.assertEqual(self.workflow.transitions, [])
+        self.assertEqual(self.implementer.requests, [])
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertIsNone(connection.execute("SELECT 1 FROM leases").fetchone())
+
+    def test_rejected_transition_with_a_lost_attempt_fails_without_raising(self):
+        # The confirmation passes, the transition is refused, and the attempt is gone by
+        # the time the failure branch runs. It must release the lease, not raise.
+        self.workflow = AttemptLostDuringTransitionWorkflow(self.db, snap())
+        self.core = RuntimeCore(self.db, MANIFEST, self.workflow, self.implementer,
+                                lease_ttl_seconds=30, recovery_timeout_seconds=60)
+
+        result = self.core.dispatch_initial("acme/alpha", 7, "owner")
+
+        self.assertEqual(result["status"], "claim_failed")
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "agent-ready")
+        self.assertEqual(self.implementer.requests, [])
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertIsNone(connection.execute("SELECT 1 FROM leases").fetchone())
 
     def test_two_consumers_in_shared_db_remain_isolated_during_reconcile(self):
         self.start()
