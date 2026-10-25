@@ -399,6 +399,48 @@ class EvidenceGapRoutingTests(LifecycleCase):
         self.assertEqual(len(self.implementer.launches), launches_before)
         self.assertEqual(self.core.store.reviewer_execution(REPO, PR, HEAD)["state"], "COMPLETED")
 
+    def test_a_real_reviewer_agent_gap_routes_back_to_the_same_pr(self):
+        # The whole channel, with no hand-written ledger row: the SDK's remediation class has
+        # to survive LocalReviewerDriver and the durable replay for the routing to see it.
+        agent = FakeReviewAgent({"status": "completed", "execution_id": "sdk-session",
+                                 "event": "BLOCKED", "remediation": "agent",
+                                 "body": "The deploy step authorized by the Frozen Spec was not run."})
+        local = LocalReviewerDriver(
+            self.core.store, agent,
+            LocalReviewerWriter(FakeGitHubProvider(), self.workflow, REPO,
+                                "liuchangchxy", MANIFEST),
+            "claude_agent_sdk")
+
+        result = self.driver(local).advance_once(REPO, "owner", 100)
+
+        item = result["items"][0]
+        self.assertEqual(item["trigger"], "evidence_remediation")
+        self.assertEqual(item["status"], "launched")
+        self.assertEqual(json.loads(self.core.store.reviewer_execution(REPO, PR, HEAD)["outcome"]),
+                         {"event": "BLOCKED", "remediation": "agent",
+                          "body": "The deploy step authorized by the Frozen Spec was not run."})
+        launch = self.implementer.launches[-1]
+        self.assertEqual((launch.attempt_kind, launch.repair_cause_type),
+                         ("repair", "evidence_remediation"))
+        self.assertEqual(self.workflow.posted, [])
+
+    def test_a_real_reviewer_agent_human_gap_still_stops_for_a_human(self):
+        agent = FakeReviewAgent({"status": "completed", "execution_id": "sdk-session",
+                                 "event": "BLOCKED", "remediation": "human",
+                                 "body": "Needs a maintainer credential."})
+        local = LocalReviewerDriver(
+            self.core.store, agent,
+            LocalReviewerWriter(FakeGitHubProvider(), self.workflow, REPO,
+                                "liuchangchxy", MANIFEST),
+            "claude_agent_sdk")
+        launches_before = len(self.implementer.launches)
+
+        result = self.driver(local).advance_once(REPO, "owner", 100)
+
+        self.assertEqual(result["items"][0]["status"], "needs-human")
+        self.assertEqual(len(self.implementer.launches), launches_before)
+        self.assertEqual(len(self.workflow.posted), 1)
+
     def test_unclassified_gap_is_not_guessed_as_agent_work(self):
         # Even with a durable agent-classified cause at this head, a decision that arrives
         # without its own class is not promoted into automated work.
