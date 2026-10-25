@@ -311,6 +311,121 @@ class LocalReviewerWriterTests(unittest.TestCase):
                              for call in provider.calls), 1)
         self.assertEqual(record["state"], "DECIDED")
 
+    def test_a_launched_agent_remediation_reaches_the_decision_and_the_durable_ledger(self):
+        # The SDK decision carries `remediation`, but the driver used to rebuild the result
+        # from event/body alone. Every agent-classified evidence gap therefore arrived
+        # unclassified and was routed to a human instead of back to the same PR.
+        with tempfile.TemporaryDirectory() as root:
+            store = _Store(str(Path(root) / "runtime.sqlite"))
+            agent = FakeReviewAgent(execution={
+                "status": "completed", "execution_id": "sdk-session-id",
+                "event": "BLOCKED", "body": "The authorized deploy was never run.",
+                "remediation": "agent"})
+            writer = LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO,
+                                         "liuchangchxy", MANIFEST)
+            submitted = []
+            driver = LocalReviewerDriver(store, agent, writer, "claude_agent_sdk")
+            original = driver._submit_decision
+            driver._submit_decision = lambda repo, issue, pr, head, result: submitted.append(
+                dict(result)) or original(repo, issue, pr, head, result)
+
+            result = driver.advance(REPO, 7, 12, HEAD)
+            record = store.reviewer_execution(REPO, 12, HEAD)
+
+        self.assertEqual(result["status"], "reviewer_insufficient_evidence")
+        self.assertEqual(result["remediation"], "agent")
+        self.assertEqual(submitted[0]["remediation"], "agent")
+        self.assertEqual(json.loads(record["outcome"]),
+                         {"event": "BLOCKED", "body": "The authorized deploy was never run.",
+                          "remediation": "agent"})
+
+    def test_a_resumed_agent_remediation_survives_the_checkpoint_replay(self):
+        class ResumableAgent(FakeReviewAgent):
+            def resume_review(self, repo, issue, pr, head, session_id, resume_count,
+                              total_turns, started_at, *, on_checkpoint=None):
+                decision = {"event": "BLOCKED", "body": "The deploy step was not run.",
+                            "remediation": "agent"}
+                on_checkpoint({"phase": "completed", "session_id": session_id,
+                               "resume_count": resume_count, "total_turns": total_turns,
+                               "result": decision})
+                return {"status": "completed", "execution_id": session_id, **decision}
+
+        with tempfile.TemporaryDirectory() as root:
+            database = str(Path(root) / "runtime.sqlite")
+            store = _Store(database)
+            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_agent_sdk", now=100)
+            checkpoint = {"phase": "resume_ready", "session_id": "sdk-session",
+                          "resume_count": 1, "total_turns": 30}
+            store.update_reviewer_execution(
+                REPO, 12, HEAD, "RUNNING", "sdk-session",
+                "sdk_review_checkpoint:" + json.dumps(checkpoint, separators=(",", ":")), now=110)
+            writer = LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO,
+                                         "liuchangchxy", MANIFEST)
+
+            result = LocalReviewerDriver(_Store(database), ResumableAgent(), writer,
+                                         "claude_agent_sdk").advance(REPO, 7, 12, HEAD)
+            record = _Store(database).reviewer_execution(REPO, 12, HEAD)
+
+        self.assertEqual(result["status"], "reviewer_insufficient_evidence")
+        self.assertEqual(result["remediation"], "agent")
+        self.assertEqual(json.loads(record["outcome"]),
+                         {"event": "BLOCKED", "body": "The deploy step was not run.",
+                          "remediation": "agent"})
+
+    def test_a_completed_checkpoint_replay_keeps_the_agent_remediation(self):
+        class ResumableAgent(FakeReviewAgent):
+            def resume_review(self, *args, **kwargs):
+                raise AssertionError("a completed checkpoint must be replayed, not resumed")
+
+        with tempfile.TemporaryDirectory() as root:
+            store = _Store(str(Path(root) / "runtime.sqlite"))
+            store.claim_reviewer_execution(REPO, 12, HEAD, "claude_agent_sdk", now=100)
+            checkpoint = {"phase": "completed", "session_id": "sdk-session",
+                          "resume_count": 1, "total_turns": 42,
+                          "result": {"event": "BLOCKED", "body": "Still missing evidence.",
+                                     "remediation": "agent"}}
+            store.update_reviewer_execution(
+                REPO, 12, HEAD, "RUNNING", "sdk-session",
+                "sdk_review_checkpoint:" + json.dumps(checkpoint, separators=(",", ":")), now=110)
+            writer = LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO,
+                                         "liuchangchxy", MANIFEST)
+
+            result = LocalReviewerDriver(store, ResumableAgent(), writer,
+                                         "claude_agent_sdk").advance(REPO, 7, 12, HEAD)
+
+        self.assertEqual(result["remediation"], "agent")
+
+    def test_a_human_remediation_is_not_promoted_to_agent_work(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = _Store(str(Path(root) / "runtime.sqlite"))
+            agent = FakeReviewAgent(execution={
+                "status": "completed", "execution_id": "sdk-session-id",
+                "event": "BLOCKED", "body": "Needs a maintainer credential.",
+                "remediation": "human"})
+            writer = LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO,
+                                         "liuchangchxy", MANIFEST)
+
+            result = LocalReviewerDriver(store, agent, writer, "claude_agent_sdk").advance(
+                REPO, 7, 12, HEAD)
+
+        self.assertEqual(result["status"], "reviewer_insufficient_evidence")
+        self.assertEqual(result["remediation"], "human")
+
+    def test_a_gap_without_a_remediation_class_is_still_not_agent_work(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = _Store(str(Path(root) / "runtime.sqlite"))
+            agent = FakeReviewAgent(execution={
+                "status": "completed", "execution_id": "sdk-session-id",
+                "event": "BLOCKED", "body": "Evidence gap of unknown ownership."})
+            writer = LocalReviewerWriter(FakeProvider(), FakeWorkflow(), REPO,
+                                         "liuchangchxy", MANIFEST)
+
+            result = LocalReviewerDriver(store, agent, writer, "claude_agent_sdk").advance(
+                REPO, 7, 12, HEAD)
+
+        self.assertEqual(result["status"], "reviewer_insufficient_evidence")
+        self.assertIsNone(result["remediation"])
+
     def test_runner_restart_fails_closed_for_active_unknown_sdk_checkpoint(self):
         class ResumableAgent(FakeReviewAgent):
             def __init__(self): super().__init__(); self.resumes = []

@@ -517,7 +517,7 @@ class LocalReviewerDriver:
             self.store.update_reviewer_execution(repo, pr, head, "FAILED", execution_id=session_id,
                                                  outcome="sdk_terminal_failure:resume_result_invalid")
             return {"status": "reviewer_result_unavailable", "head_sha": head}
-        result = {"event": execution.get("event"), "body": execution.get("body")}
+        result = self._decision_result(execution)
         self.store.update_reviewer_execution(
             repo, pr, head, "COMPLETED", session_id,
             json.dumps(result, ensure_ascii=False, separators=(",", ":")))
@@ -681,7 +681,7 @@ class LocalReviewerDriver:
             return {"status": "reviewer_launch_unobservable", "head_sha": head, "detail": diagnostic}
         execution_id = str(execution["execution_id"])
         if execution.get("status") == "completed" and self.provider_key == "claude_agent_sdk":
-            result = {"event": execution.get("event"), "body": execution.get("body")}
+            result = self._decision_result(execution)
             self.store.update_reviewer_execution(
                 repo, pr, head, "COMPLETED", execution_id,
                 outcome=json.dumps(result, ensure_ascii=False, separators=(",", ":")))
@@ -706,6 +706,19 @@ class LocalReviewerDriver:
         if isinstance(sdk_detail, str) and sdk_detail:
             diagnostic += " sdk_detail=" + sdk_detail
         return diagnostic
+
+    @staticmethod
+    def _decision_result(execution: dict) -> dict:
+        # The provider's completed decision must reach `_submit_decision` intact. Rebuilding
+        # it from event/body alone silently dropped `remediation`, so every INSUFFICIENT_EVIDENCE
+        # gap was read as unclassified and routed to a human even when the Reviewer had said
+        # the Implementer could close it. An absent class stays absent and is still defaulted
+        # in the human direction by the caller.
+        result = {"event": execution.get("event"), "body": execution.get("body")}
+        remediation = execution.get("remediation")
+        if remediation is not None:
+            result["remediation"] = remediation
+        return result
 
     def _submit_decision(self, repo, issue, pr, head, result):
         event, body = result.get("event"), result.get("body")
