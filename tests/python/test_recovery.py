@@ -65,12 +65,8 @@ class RecoveryImplementer:
         return self.activity
 
 
-class UnpersistedAttemptStore:
-    """Durably lose the claim's own attempt row, the way issue #29's ledger did.
-
-    ``create_initial_attempt`` still reports success, so the claim path believes it holds
-    an attempt whose row nothing can read back. Every other store operation is the real one.
-    """
+class _LosingStore:
+    """Real store with a way to durably delete the claim's attempt row."""
 
     def __init__(self, real, database_path):
         self._real, self._db = real, str(database_path)
@@ -78,12 +74,39 @@ class UnpersistedAttemptStore:
     def __getattr__(self, name):
         return getattr(self._real, name)
 
-    def create_initial_attempt(self, repo, issue, owner, ttl, recovery_timeout):
-        created = self._real.create_initial_attempt(repo, issue, owner, ttl, recovery_timeout)
+    def _drop(self, repo, issue):
         with closing(sqlite3.connect(self._db)) as connection:
             connection.execute("DELETE FROM attempts WHERE repo=? AND issue_number=?", (repo, issue))
             connection.commit()
+
+
+class UnpersistedAttemptStore(_LosingStore):
+    """Durably lose the attempt the instant the claim is told it was created.
+
+    ``create_initial_attempt`` still reports success, so the claim path believes it holds
+    an attempt whose row nothing can read back.
+    """
+
+    def create_initial_attempt(self, repo, issue, owner, ttl, recovery_timeout):
+        created = self._real.create_initial_attempt(repo, issue, owner, ttl, recovery_timeout)
+        self._drop(repo, issue)
         return created
+
+
+class AttemptLostAfterBindingStore(_LosingStore):
+    """Lose the attempt only once its authorization binding has landed.
+
+    This is the window the claim spends between a successful bind and the coordination
+    transition: the store has already confirmed the attempt exists, so nothing but a
+    fresh check taken immediately before the transition can notice it is gone.
+    """
+
+    def bind_noop_authorization(self, attempt_id, authorized, digest, baseline):
+        bound = self._real.bind_noop_authorization(attempt_id, authorized, digest, baseline)
+        if bound:
+            row = self._real.attempt(attempt_id)
+            self._drop(row["repo"], row["issue_number"])
+        return bound
 
 
 class RecoveryTests(unittest.TestCase):
@@ -709,6 +732,20 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "agent-working")
         self.assertEqual(len(self.implementer.requests), 1)
         self.assertEqual(self.core.store.attempt(retry["attempt_id"])["phase"], "LAUNCH_CONFIRMED")
+
+    def test_attempt_lost_after_binding_never_reaches_agent_working(self):
+        # The attempt survives creation and the authorization binding, and disappears
+        # before the coordination transition. Confirming the attempt only at creation
+        # time would let this claim through and re-create issue #29.
+        self.core.store = AttemptLostAfterBindingStore(self.core.store, self.db)
+
+        result = self.core.dispatch_initial("acme/alpha", 7, "owner")
+
+        self.assertEqual(result["status"], "claim_failed")
+        self.assertEqual(result["outcome"], "attempt_not_persisted")
+        self.assertEqual(self.workflow.transitions, [])
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "agent-ready")
+        self.assertEqual(self.implementer.requests, [])
 
     def test_two_consumers_in_shared_db_remain_isolated_during_reconcile(self):
         self.start()

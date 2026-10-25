@@ -655,27 +655,31 @@ class _Store:
             connection.commit()
             return bound
 
-    def confirmed_initial_attempt(self, attempt_id: str, repo: str, issue: int):
+    def confirmed_initial_attempt(self, attempt_id: str, repo: str, issue: int, token: str,
+                                  authorized: bool):
         """Re-read a just-created initial attempt through a fresh connection.
 
         Returns the durable row only when the exact attempt this claim created is
-        readable again, still owns the claim phase, and belongs to this repository and
-        Issue. ``None`` means the claim was never persisted, so it must not be allowed
-        to consume the Issue's coordination label.
+        readable again, is still the claim's own ``CLAIM_INTENT`` row for this repository
+        and Issue, still carries this claim's lease, and its authorization binding landed.
+        ``None`` means the claim is not provably durable, so it must not be allowed to
+        consume the Issue's coordination label.
         """
         row = self.attempt(attempt_id)
         if (row is None or row["repo"] != repo or row["issue_number"] != issue
-                or row["kind"] != "initial_dispatch" or row["phase"] != "CLAIM_INTENT"):
+                or row["kind"] != "initial_dispatch" or row["phase"] != "CLAIM_INTENT"
+                or row["lease_token"] != token
+                or row["no_change_authorized"] != int(authorized)):
             return None
         return row
 
-    def abandon_unconfirmed_initial(self, attempt_id: str, repo: str, issue: int, token: str,
-                                    now: float | None = None):
-        """Give back a claim whose initial attempt could not be confirmed as persisted.
+    def fail_initial_claim(self, attempt_id: str, repo: str, issue: int, token: str,
+                           outcome: str, now: float | None = None):
+        """Fail a claim that must not progress, and always give its lease back.
 
-        The Issue has not moved to agent-working, so nothing on GitHub changes: the
-        half-written attempt is failed, and the claim's lease is released either way so
-        the same owner can claim the Issue again on the next pass.
+        Tolerates an unreadable attempt row: this is the path taken precisely when the
+        row may be gone, so it must never raise on that case. The Issue itself has not
+        moved, so no GitHub state needs restoring.
         """
         delivered = time.time() if now is None else float(now)
         connection = self.transaction()
@@ -683,9 +687,9 @@ class _Store:
             row = connection.execute("SELECT 1 FROM attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
             if row is not None:
                 connection.execute(
-                    "UPDATE attempts SET phase='CLAIM_FAILED',launch_outcome='attempt_not_persisted',"
-                    "updated_at=?,phase_entered_at=?,deadline_at=NULL WHERE attempt_id=?",
-                    (delivered, delivered, attempt_id),
+                    "UPDATE attempts SET phase='CLAIM_FAILED',launch_outcome=?,updated_at=?,"
+                    "phase_entered_at=?,deadline_at=NULL WHERE attempt_id=?",
+                    (outcome, delivered, delivered, attempt_id),
                 )
             connection.execute("DELETE FROM leases WHERE repo=? AND issue_number=? AND token=?",
                                (repo, issue, token))
@@ -2270,19 +2274,11 @@ class RuntimeCore:
         if created is None:
             return {"status": reason}
         attempt_id, token = created
-        # The claim owns this Issue from here on, but GitHub must not learn that until the
-        # attempt that authorizes the work is provably on disk. agent-working with no
-        # readable attempt is exactly the state the next reconcile pass can only report as
-        # an orphan, so an unconfirmed claim is given back while the Issue is still
-        # agent-ready, which is the one state the runtime can claim again from.
-        if self.store.confirmed_initial_attempt(attempt_id, repo_key, issue_number) is None:
-            self.store.abandon_unconfirmed_initial(attempt_id, repo_key, issue_number, token)
-            return {"status": "claim_failed", "outcome": "attempt_not_persisted",
-                    "attempt_id": attempt_id}
         baseline = self._workspace_baseline(self.workspace_path)
         if not self.store.bind_noop_authorization(attempt_id, observed.allow_no_change,
                                                   observed.frozen_spec_digest, baseline):
-            self.store.mark_phase(attempt_id, "CLAIM_FAILED", outcome="authorization_binding_failed")
+            self.store.fail_initial_claim(attempt_id, repo_key, issue_number, token,
+                                          "authorization_binding_failed")
             return {"status": "claim_failed", "attempt_id": attempt_id}
 
         try:
@@ -2292,11 +2288,29 @@ class RuntimeCore:
                     or fresh.frozen_spec_digest != observed.frozen_spec_digest):
                 self.store.mark_phase(attempt_id, "CLAIM_FAILED", outcome="workflow_changed")
                 return {"status": "claim_failed", "attempt_id": attempt_id}
+        except Exception as error:
+            self.store.fail_initial_claim(attempt_id, repo_key, issue_number, token, "claim_error")
+            return {"status": "claim_failed", "attempt_id": attempt_id, "detail": str(error)}
+
+        # This is the last check before GitHub learns the Issue is claimed, and it runs
+        # after the authorization binding and the final observation, so nothing between
+        # creating the attempt and this point can leave the Issue agent-working without
+        # an attempt that reads back. agent-working with no readable attempt is exactly
+        # the state the next reconcile pass can only report as an orphan, so an
+        # unconfirmed claim is given back while the Issue is still agent-ready, the one
+        # state the runtime can claim it from again.
+        if self.store.confirmed_initial_attempt(attempt_id, repo_key, issue_number, token,
+                                                observed.allow_no_change) is None:
+            self.store.fail_initial_claim(attempt_id, repo_key, issue_number, token,
+                                          "attempt_not_persisted")
+            return {"status": "claim_failed", "outcome": "attempt_not_persisted",
+                    "attempt_id": attempt_id}
+        try:
             transitioned = self.workflow.transition_coordination_state(
                 repo_key, issue_number, "agent-ready", "agent-working", fresh.revision
             )
         except Exception as error:
-            self.store.mark_phase(attempt_id, "CLAIM_FAILED", outcome="claim_error")
+            self.store.fail_initial_claim(attempt_id, repo_key, issue_number, token, "claim_error")
             return {"status": "claim_failed", "attempt_id": attempt_id, "detail": str(error)}
         if not transitioned:
             self.store.mark_phase(attempt_id, "CLAIM_FAILED", outcome="claim_rejected")
