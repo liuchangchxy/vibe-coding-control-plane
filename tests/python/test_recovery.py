@@ -109,6 +109,27 @@ class AttemptLostAfterBindingStore(_LosingStore):
         return bound
 
 
+class AttemptLostDuringTransitionWorkflow(RecoveryWorkflow):
+    """Reject the coordination transition and drop the attempt as it is attempted.
+
+    The confirmation immediately before the transition succeeds, so the claim reaches
+    ``claim_rejected`` holding an attempt that no longer exists.
+    """
+
+    def __init__(self, database_path, *snapshots):
+        super().__init__(*snapshots)
+        self.database_path = str(database_path)
+
+    def transition_coordination_state(self, repo, issue_number, expected_state, new_state,
+                                      expected_revision):
+        self.transitions.append((repo, issue_number, expected_state, new_state, expected_revision))
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            connection.execute("DELETE FROM attempts WHERE repo=? AND issue_number=?",
+                               (repo.casefold(), issue_number))
+            connection.commit()
+        return False
+
+
 class RecoveryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -746,6 +767,50 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.workflow.transitions, [])
         self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "agent-ready")
         self.assertEqual(self.implementer.requests, [])
+
+    def test_workflow_change_with_a_lost_attempt_fails_without_raising(self):
+        # The workflow moved on under the claim, and the attempt is gone by the time this
+        # branch runs. Failing it must not depend on the row still being readable.
+        self.core.store = _LosingStore(self.core.store, self.db)
+        self.core.store.create_initial_attempt = self.core.store._real.create_initial_attempt
+        self.core.store.bind_noop_authorization = self.core.store._real.bind_noop_authorization
+        original = self.workflow.observe
+
+        def change_after_the_claim_reads_it(repo, issue_number):
+            current = original(repo, issue_number)
+            if self.workflow.observe_count >= 2:
+                self.workflow.states[(repo.casefold(), issue_number)] = replace(
+                    current, coordination_state="agent-working", revision="moved-on")
+                self.core.store._drop(repo, issue_number)
+            return self.workflow.states[(repo.casefold(), issue_number)]
+
+        self.workflow.observe = change_after_the_claim_reads_it
+
+        result = self.core.dispatch_initial("acme/alpha", 7, "owner")
+
+        # ``claim_failed`` alone is not enough: the pre-fix branch reported the same
+        # status while carrying the ``unknown attempt`` exception it swallowed.
+        self.assertEqual(result["status"], "claim_failed")
+        self.assertNotIn("detail", result)
+        self.assertEqual(self.workflow.transitions, [])
+        self.assertEqual(self.implementer.requests, [])
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertIsNone(connection.execute("SELECT 1 FROM leases").fetchone())
+
+    def test_rejected_transition_with_a_lost_attempt_fails_without_raising(self):
+        # The confirmation passes, the transition is refused, and the attempt is gone by
+        # the time the failure branch runs. It must release the lease, not raise.
+        self.workflow = AttemptLostDuringTransitionWorkflow(self.db, snap())
+        self.core = RuntimeCore(self.db, MANIFEST, self.workflow, self.implementer,
+                                lease_ttl_seconds=30, recovery_timeout_seconds=60)
+
+        result = self.core.dispatch_initial("acme/alpha", 7, "owner")
+
+        self.assertEqual(result["status"], "claim_failed")
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "agent-ready")
+        self.assertEqual(self.implementer.requests, [])
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertIsNone(connection.execute("SELECT 1 FROM leases").fetchone())
 
     def test_two_consumers_in_shared_db_remain_isolated_during_reconcile(self):
         self.start()

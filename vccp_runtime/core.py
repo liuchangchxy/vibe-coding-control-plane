@@ -2286,7 +2286,8 @@ class RuntimeCore:
             if (not self._eligible_initial(fresh, repo_key, issue_number)
                     or fresh.allow_no_change != observed.allow_no_change
                     or fresh.frozen_spec_digest != observed.frozen_spec_digest):
-                self.store.mark_phase(attempt_id, "CLAIM_FAILED", outcome="workflow_changed")
+                self.store.fail_initial_claim(attempt_id, repo_key, issue_number, token,
+                                              "workflow_changed")
                 return {"status": "claim_failed", "attempt_id": attempt_id}
         except Exception as error:
             self.store.fail_initial_claim(attempt_id, repo_key, issue_number, token, "claim_error")
@@ -2313,7 +2314,8 @@ class RuntimeCore:
             self.store.fail_initial_claim(attempt_id, repo_key, issue_number, token, "claim_error")
             return {"status": "claim_failed", "attempt_id": attempt_id, "detail": str(error)}
         if not transitioned:
-            self.store.mark_phase(attempt_id, "CLAIM_FAILED", outcome="claim_rejected")
+            self.store.fail_initial_claim(attempt_id, repo_key, issue_number, token,
+                                          "claim_rejected")
             return {"status": "claim_failed", "attempt_id": attempt_id}
 
         self.store.mark_phase(attempt_id, "CLAIMED", recovery_timeout=self.recovery_timeout_seconds)
