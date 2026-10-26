@@ -6,7 +6,8 @@ from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 
-from vccp_runtime.core import (LaunchDisposition, LaunchResult, RepairCandidate, RuntimeCore,
+from vccp_runtime.core import (MAX_AUTOMATED_REPAIRS, LaunchDisposition, LaunchResult, RepairCandidate,
+                               RuntimeCore,
                                WorkflowSnapshot)
 
 
@@ -27,6 +28,8 @@ class RecoveryWorkflow:
         self.transitions = []
         self.observe_count = 0
         self.observe_hook = None
+        # Refuse the next transition while reporting the state it would have reached.
+        self.partial_transition = False
 
     def observe(self, repo, issue_number):
         self.observe_count += 1
@@ -44,6 +47,10 @@ class RecoveryWorkflow:
         current = self.states[key]
         self.transitions.append((repo, issue_number, expected_state, new_state, expected_revision))
         if current.coordination_state != expected_state or current.revision != expected_revision:
+            return False
+        if self.partial_transition:
+            self.states[key] = replace(current, coordination_state="invalid",
+                                       revision=f"{current.revision}-removed")
             return False
         terminal = (new_state,) if new_state in {"infra-blocked", "needs-human"} else ()
         self.states[key] = replace(current, coordination_state=new_state,
@@ -130,6 +137,34 @@ class AttemptLostDuringTransitionWorkflow(RecoveryWorkflow):
         return False
 
 
+class LabelWriteLostAfterRemoveWorkflow(RecoveryWorkflow):
+    """Land the label removal but refuse the add, as a failed GitHub write does.
+
+    ``replace_labels`` deletes the old coordination label and then posts the new one as
+    two separate calls, so a refusal in between leaves the Issue carrying no active
+    coordination label at all. The transition correctly reports failure, but the Issue
+    is no longer in the state the failed claim is allowed to assume.
+    """
+
+    def __init__(self, *snapshots):
+        super().__init__(*snapshots)
+        self.lose_label_write = False
+
+    def transition_coordination_state(self, repo, issue_number, expected_state, new_state,
+                                      expected_revision):
+        key = (repo.casefold(), issue_number)
+        current = self.states[key]
+        self.transitions.append((repo, issue_number, expected_state, new_state, expected_revision))
+        if not self.lose_label_write:
+            return super().transition_coordination_state(repo, issue_number, expected_state,
+                                                         new_state, expected_revision)
+        if current.coordination_state != expected_state or current.revision != expected_revision:
+            return False
+        self.states[key] = replace(current, coordination_state="invalid",
+                                   revision=f"{current.revision}-removed")
+        return False
+
+
 class RecoveryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -175,6 +210,173 @@ class RecoveryTests(unittest.TestCase):
         result = self.core.dispatch_repair(candidate)
         self.assertEqual(result["phase"], "LAUNCH_CONFIRMED")
         return result
+
+    def _rejected_repair_candidate(self, review_id="555"):
+        """Put the flow one reviewer rejection away from an admissible repair."""
+        self.start()
+        self.add_pr()
+        self.set_snapshot(replace(
+            self.workflow.observe("acme/alpha", 7), coordination_state="changes-requested",
+            revision="review-1", formal_review_state="CHANGES_REQUESTED",
+            formal_review_id=review_id, formal_review_head_sha=SHA, formal_review_body="findings"))
+        return RepairCandidate("acme/alpha", 7, 44, SHA, BRANCH, "reviewer_rejection", review_id, "owner")
+
+    def test_claim_rejected_repair_can_be_admitted_again_at_the_same_head(self):
+        # A claim refused by the coordination transition holds no lease, no execution and
+        # no pushed commit, so the cause is still unrepaired at this exact head. Reporting
+        # the next attempt as a duplicate would replay the failed claim forever and the
+        # Issue could never be repaired again without a new commit.
+        candidate = self._rejected_repair_candidate()
+        self.workflow.partial_transition = True
+        first = self.core.dispatch_repair(candidate)
+        self.assertEqual(first["status"], "claim_failed")
+        self.assertEqual(self.core.store.attempt(first["attempt_id"])["phase"], "CLAIM_FAILED")
+        self.assertEqual(len(self.implementer.requests), 1)
+
+        # The Issue is back in changes-requested, as a recovery restore leaves it.
+        self.workflow.partial_transition = False
+        self.set_snapshot(replace(self.workflow.observe("acme/alpha", 7),
+                                  coordination_state="changes-requested", revision="review-2"))
+        second = self.core.dispatch_repair(candidate)
+
+        self.assertEqual(second["status"], "launched")
+        self.assertEqual(second["attempt_id"], first["attempt_id"])
+        self.assertEqual(second["ordinal"], 1)
+        self.assertEqual(len(self.implementer.requests), 2)
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "agent-working")
+        # The retry must not consume a second slot of the automation budget.
+        self.assertEqual(self.core.store.flow("acme/alpha", 7)["repair_count"], 1)
+
+    def test_claim_rejected_repair_retry_releases_the_lease_when_another_owner_holds_it(self):
+        # The retry reuses the failed row, so it must take the lease through the same
+        # owner-checked acquisition every other claim uses instead of assuming it is free.
+        candidate = self._rejected_repair_candidate()
+        self.workflow.partial_transition = True
+        self.core.dispatch_repair(candidate)
+        self.workflow.partial_transition = False
+        self.set_snapshot(replace(self.workflow.observe("acme/alpha", 7),
+                                  coordination_state="changes-requested", revision="review-2"))
+        with closing(sqlite3.connect(self.db)) as connection:
+            connection.execute("INSERT INTO leases(repo,issue_number,owner_id,token,expires_at) "
+                               "VALUES(?,?,?,?,?)", ("acme/alpha", 7, "other-owner", "t", time.time() + 600))
+            connection.commit()
+
+        result = self.core.dispatch_repair(candidate)
+
+        self.assertEqual(result["status"], "lease_held")
+        self.assertEqual(len(self.implementer.requests), 1)
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "changes-requested")
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertIsNotNone(connection.execute(
+                "SELECT 1 FROM leases WHERE repo=? AND issue_number=? AND owner_id='other-owner'",
+                ("acme/alpha", 7)).fetchone())
+
+    def test_reviewer_rejection_claim_is_not_consumed_by_a_failed_label_remove(self):
+        # ``replace_labels`` removes the old coordination label and posts the new one as
+        # two calls, so a refusal in between leaves the Issue with no active label. The
+        # transition reports that, and the claim must give its attempt and lease back
+        # rather than stay CLAIM_FAILED holding a key that blocks the same head forever.
+        self.workflow = LabelWriteLostAfterRemoveWorkflow(snap())
+        self.core = RuntimeCore(self.db, MANIFEST, self.workflow, self.implementer,
+                                lease_ttl_seconds=30, recovery_timeout_seconds=60)
+        candidate = self._rejected_repair_candidate()
+        self.workflow.lose_label_write = True
+
+        result = self.core.dispatch_repair(candidate)
+
+        self.assertEqual(result["status"], "claim_failed")
+        row = self.core.store.attempt(result["attempt_id"])
+        self.assertEqual((row["phase"], row["launch_outcome"]), ("CLAIM_FAILED", "claim_rejected"))
+        self.assertEqual(len(self.implementer.requests), 1)
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertIsNone(connection.execute("SELECT 1 FROM leases").fetchone())
+        # The failed claim left the Issue without any coordination label, which is the
+        # state a later pass must be able to recover from: the row it can still re-admit.
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "invalid")
+
+        # Recovery restores changes-requested at the same head, and the cause is still
+        # unrepaired, so the very same claim has to be admittable again.
+        self.workflow.lose_label_write = False
+        self.set_snapshot(replace(self.workflow.observe("acme/alpha", 7),
+                                  coordination_state="changes-requested", revision="review-2"))
+        retried = self.core.dispatch_repair(candidate)
+
+        self.assertEqual(retried["status"], "launched")
+        self.assertEqual(retried["attempt_id"], result["attempt_id"])
+        self.assertEqual(self.workflow.observe("acme/alpha", 7).coordination_state, "agent-working")
+
+    def test_launch_not_started_repair_is_reused_instead_of_reported_as_duplicate(self):
+        # ``LAUNCH_NOT_STARTED`` is the same evidence as ``CLAIM_FAILED``: the launch was
+        # proven not to have begun, so the row still holds nothing worth preserving.
+        candidate = self._rejected_repair_candidate()
+        self.workflow.partial_transition = True
+        first = self.core.dispatch_repair(candidate)
+        self.core.store.mark_phase(first["attempt_id"], "LAUNCH_NOT_STARTED", outcome="not_started")
+        self.workflow.partial_transition = False
+        self.set_snapshot(replace(self.workflow.observe("acme/alpha", 7),
+                                  coordination_state="changes-requested", revision="review-2"))
+
+        second = self.core.dispatch_repair(candidate)
+
+        self.assertEqual(second["status"], "launched")
+        self.assertEqual(second["attempt_id"], first["attempt_id"])
+
+    def test_repair_that_already_launched_is_still_reported_as_duplicate(self):
+        # The reuse above must stay fenced to claims that never launched: a row that
+        # reached an execution is real work and must never be replayed.
+        candidate = self._rejected_repair_candidate()
+        self.workflow.partial_transition = False
+        launched = self.core.dispatch_repair(candidate)
+        self.assertEqual(launched["status"], "launched")
+
+        self.set_snapshot(replace(self.workflow.observe("acme/alpha", 7),
+                                  coordination_state="changes-requested", revision="review-2"))
+        again = self.core.dispatch_repair(candidate)
+
+        self.assertEqual(again["status"], "duplicate")
+        self.assertEqual(again["attempt_id"], launched["attempt_id"])
+        self.assertEqual(len(self.implementer.requests), 2)
+
+    def test_failed_claim_that_recorded_an_execution_is_never_reused(self):
+        # A failed phase alone does not prove nothing ran: only a row with no execution
+        # may be replayed, so an attempt that recorded one stays a duplicate forever.
+        candidate = self._rejected_repair_candidate()
+        self.workflow.partial_transition = True
+        first = self.core.dispatch_repair(candidate)
+        self.assertEqual(first["status"], "claim_failed")
+        self.core.store.mark_phase(first["attempt_id"], "CLAIM_FAILED",
+                                   outcome="claim_rejected", execution_id="exec-1")
+        self.workflow.partial_transition = False
+        self.set_snapshot(replace(self.workflow.observe("acme/alpha", 7),
+                                  coordination_state="changes-requested", revision="review-2"))
+
+        again = self.core.dispatch_repair(candidate)
+
+        self.assertEqual(again["status"], "duplicate")
+        self.assertEqual(len(self.implementer.requests), 1)
+        self.assertEqual(self.core.store.attempt(first["attempt_id"])["execution_id"], "exec-1")
+
+    def test_reusable_failed_claim_still_stops_at_budget_exhaustion(self):
+        # Reuse must never be a way around the budget: the exhaustion check runs first,
+        # so a refused claim at an exhausted per-cause budget stops for a human.
+        candidate = self._rejected_repair_candidate()
+        self.workflow.partial_transition = True
+        first = self.core.dispatch_repair(candidate)
+        self.assertEqual(first["status"], "claim_failed")
+        self.workflow.partial_transition = False
+        with closing(sqlite3.connect(self.db)) as connection:
+            connection.execute("UPDATE flows SET repair_count=? WHERE repo=? AND issue_number=?",
+                               (MAX_AUTOMATED_REPAIRS, "acme/alpha", 7))
+            connection.commit()
+        self.set_snapshot(replace(self.workflow.observe("acme/alpha", 7),
+                                  coordination_state="changes-requested", revision="review-2"))
+
+        result = self.core.dispatch_repair(candidate)
+
+        self.assertEqual(result["status"], "budget_exhausted")
+        self.assertTrue(result["needs_human"])
+        self.assertEqual(len(self.implementer.requests), 1)
+        self.assertEqual(self.core.store.attempt(first["attempt_id"])["phase"], "CLAIM_FAILED")
 
     def test_restart_repair_with_unchanged_head_waits_without_relaunch(self):
         self._start_repair()

@@ -477,6 +477,51 @@ class AdapterTests(unittest.TestCase):
                                    "--remove-label", "agent-ready", "--add-label", "agent-working"])
         with self.assertRaises(ValueError): GitHubAppWriter("gh")
 
+    def test_provider_writer_adds_before_removing_so_the_issue_is_never_unlabelled(self):
+        # GitHub exposes no atomic label replace. Removing the old coordination label first
+        # left the Issue with no coordination label at all whenever the add failed, which
+        # no claim may assume: the Issue drops out of both active and ready discovery.
+        calls = []
+        labels = [{"name": "agent-ready"}, {"name": "frozen-spec"}]
+        class Provider:
+            api_url = "https://api.github.com"
+            def request(self, method, path, repo, body=None):
+                calls.append((method, path, body))
+                if method == "POST":
+                    labels.extend({"name": name} for name in body["labels"])
+                    return 200, {}
+                if method == "DELETE":
+                    name = path.rsplit("/", 1)[-1]
+                    labels[:] = [item for item in labels if item["name"] != name]
+                    return 204, None
+                return 200, {"number": 3, "repository_url": "https://api.github.com/repos/o/r",
+                             "labels": list(labels)}
+        writer = GitHubAppWriter(credential_provider=Provider(), target_repository="o/r",
+                                 allowed_labels={"agent-ready", "agent-working"})
+
+        self.assertTrue(writer.replace_labels("o/r", 3, ["agent-ready"], ["agent-working"]))
+
+        writes = [call for call in calls if call[0] != "GET"]
+        self.assertEqual(writes[0][0], "POST")
+        self.assertEqual(writes[0][2], {"labels": ["agent-working"]})
+        self.assertEqual([call[0] for call in writes[1:]], ["DELETE"])
+
+    def test_failed_add_leaves_the_existing_coordination_label_in_place(self):
+        calls = []
+        class Provider:
+            api_url = "https://api.github.com"
+            def request(self, method, path, repo, body=None):
+                calls.append((method, path))
+                if method == "POST":
+                    return 422, {"message": "Validation Failed"}
+                return 200, {"number": 3, "repository_url": "https://api.github.com/repos/o/r",
+                             "labels": [{"name": "changes-requested"}]}
+        writer = GitHubAppWriter(credential_provider=Provider(), target_repository="o/r",
+                                 allowed_labels={"changes-requested", "agent-working"})
+
+        self.assertFalse(writer.replace_labels("o/r", 3, ["changes-requested"], ["agent-working"]))
+        self.assertEqual([method for method, _ in calls if method != "GET"], ["POST"])
+
     def test_antigravity_tristate_and_secret_stripping(self):
         with tempfile.TemporaryDirectory() as temp:
             workspace = init_git_repo(Path(temp) / "repo")
