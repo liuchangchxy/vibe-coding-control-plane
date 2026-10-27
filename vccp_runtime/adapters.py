@@ -202,13 +202,26 @@ class GitHubAppWriter:
                 before = {item.get("name") for item in current.get("labels", []) if isinstance(item, dict)}
                 if not set(remove).issubset(before):
                     return False
-                for label in remove:
-                    code, _ = self.provider.request("DELETE", f"{path}/labels/{quote(label, safe='')}", repo)
-                    if code not in (200, 204, 404):
-                        return False
+                # GitHub has no atomic label replace, and adding before removing keeps the
+                # Issue carrying at least one coordination label throughout. Removing first
+                # left an Issue with no coordination label at all whenever the add failed,
+                # which is a state no claim may assume: the Issue disappears from both
+                # active and ready discovery and cannot be restored without a human.
+                added = False
                 if add:
                     code, _ = self.provider.request("POST", f"{path}/labels", repo, {"labels": add})
                     if code not in (200, 201):
+                        return False
+                    added = True
+                for label in remove:
+                    code, _ = self.provider.request("DELETE", f"{path}/labels/{quote(label, safe='')}", repo)
+                    if code not in (200, 204, 404):
+                        if added:
+                            # Put the Issue back in the state the caller found it, so a
+                            # failed transition leaves nothing for recovery to untangle.
+                            for label in add:
+                                self.provider.request(
+                                    "DELETE", f"{path}/labels/{quote(label, safe='')}", repo)
                         return False
                 verified_status, verified = self.provider.request("GET", path, repo)
                 if verified_status != 200 or verified.get("number") != issue:

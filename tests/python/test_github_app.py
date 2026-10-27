@@ -326,7 +326,9 @@ class GitHubAppWriterTests(unittest.TestCase):
         self.assertTrue(self.writer.replace_labels(REPO, 7, ["agent-ready"], ["agent-working"]))
         self.assertEqual(self.transport.issue_labels, {"agent-working"})
         methods = [call[0] for call in self.transport.calls if "/issues/7" in call[1]]
-        self.assertEqual(methods, ["GET", "DELETE", "POST", "GET"])
+        # The add lands before the remove so the Issue never carries zero coordination
+        # labels: a failed add under the old order stranded it in exactly that state.
+        self.assertEqual(methods, ["GET", "POST", "DELETE", "GET"])
 
     def test_writer_rejects_wrong_repo_and_unsupported_label_before_request(self):
         before = len(self.transport.calls)

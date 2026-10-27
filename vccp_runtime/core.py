@@ -964,9 +964,21 @@ class _Store:
             ).fetchone()
             key = base_key
             duplicate = connection.execute(
-                "SELECT attempt_id, phase, repair_ordinal FROM attempts WHERE repair_key=?", (key,)
+                "SELECT attempt_id, phase, repair_ordinal, execution_id, cause_type, cause_id "
+                "FROM attempts WHERE repair_key=?", (key,)
             ).fetchone()
-            if duplicate:
+            # A claim that provably never launched holds nothing worth preserving: no
+            # lease, no execution, no pushed commit. The key names the exact PR head, so
+            # while that head is unchanged this is the same cause still unrepaired.
+            # Reporting it as a duplicate would replay the failed claim forever and the
+            # head could never be repaired again. Every admission gate below still runs
+            # before the row is reused, and the reuse keeps its ordinal and its budget slot.
+            reusable = bool(duplicate
+                            and duplicate["phase"] in {"CLAIM_FAILED", "LAUNCH_NOT_STARTED"}
+                            and not duplicate["execution_id"]
+                            and duplicate["cause_type"] == candidate.cause_type
+                            and duplicate["cause_id"] == candidate.cause_id)
+            if duplicate and not reusable:
                 connection.commit()
                 return {"status": "duplicate", "attempt_id": duplicate["attempt_id"], "ordinal": duplicate["repair_ordinal"]}
             flow = connection.execute(
@@ -1056,8 +1068,23 @@ class _Store:
             if token is None:
                 connection.commit()
                 return {"status": "lease_held"}
-            attempt_id = str(uuid4())
             now = time.time()
+            if reusable:
+                # Reuse the row the failed claim left behind instead of inserting a second
+                # attempt under the same key. The ordinal and the recorded repair count stay
+                # as they are, so a refused claim never consumes another budget slot.
+                connection.execute(
+                    "UPDATE attempts SET phase='CLAIM_INTENT',owner_id=?,lease_token=?,"
+                    "launch_outcome=NULL,execution_id=NULL,implementer_provider=NULL,"
+                    "updated_at=?,phase_entered_at=?,deadline_at=? WHERE attempt_id=?",
+                    (candidate.owner_id, token, now, now, now + recovery_timeout,
+                     duplicate["attempt_id"]),
+                )
+                connection.commit()
+                return {"status": "admitted", "attempt_id": duplicate["attempt_id"],
+                        "ordinal": duplicate["repair_ordinal"], "repair_key": key,
+                        "lease_token": token, "retried": True}
+            attempt_id = str(uuid4())
             connection.execute(
                 "INSERT INTO attempts(attempt_id,repo,issue_number,owner_id,lease_token,kind,cause_type,cause_id,"
                 "repair_key,repair_ordinal,expected_head_sha,pr_number,branch,phase,created_at,updated_at,"
